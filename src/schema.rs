@@ -347,7 +347,7 @@ pub fn generate() -> Value {
                 "mutating": false,
                 "args": [
                     {"name": "--period", "type": "string", "required": false, "description": "Accounting period (e.g. 2025-Q1)."},
-                    {"name": "--bank-account", "type": "string", "required": false, "description": "Bank GL account(s), comma-separated or repeated. Defaults to the administration's bank_accounts, else 11001 (nl) or 550000 (be)."}
+                    {"name": "--bank-account", "type": "string[]", "required": false, "description": "Bank GL account(s); repeat the flag or comma-separate values. Defaults to the administration's bank_accounts, else 11001 (nl) or 550000 (be)."}
                 ],
                 "output_fields": [
                     {"name": "date", "type": "string"},
@@ -843,5 +843,50 @@ mod tests {
             with_output_fields > 0,
             "at least some commands must have output_fields"
         );
+    }
+
+    /// Every repeatable or delimited clap flag is declared as an array type
+    /// (`"string[]"`), which is how clispec v0.3 marks a multi-value argument.
+    #[test]
+    fn multi_value_flags_are_declared_as_arrays() {
+        use clap::{ArgAction, CommandFactory};
+
+        fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<(String, String)>) {
+            for arg in cmd.get_arguments() {
+                if arg.is_global_set() || arg.get_long().is_none() {
+                    continue;
+                }
+                let multi = matches!(arg.get_action(), ArgAction::Append)
+                    || arg.get_value_delimiter().is_some();
+                if multi {
+                    out.push((path.to_string(), format!("--{}", arg.get_long().unwrap())));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                let name = if path.is_empty() {
+                    sub.get_name().to_string()
+                } else {
+                    format!("{path} {}", sub.get_name())
+                };
+                walk(sub, &name, out);
+            }
+        }
+
+        let mut multi = Vec::new();
+        walk(&crate::cli::Cli::command(), "", &mut multi);
+        assert!(!multi.is_empty(), "expected at least --bank-account");
+
+        let schema = generate();
+        let commands = schema["commands"].as_array().unwrap();
+        for (command, flag) in multi {
+            let Some(cmd) = commands.iter().find(|c| c["name"] == command.as_str()) else {
+                continue;
+            };
+            let arg = cmd["args"]
+                .as_array()
+                .and_then(|args| args.iter().find(|a| a["name"] == flag.as_str()))
+                .unwrap_or_else(|| panic!("{command}: {flag} missing from schema"));
+            assert_eq!(arg["type"], "string[]", "{command} {flag}");
+        }
     }
 }
