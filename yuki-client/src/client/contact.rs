@@ -46,13 +46,13 @@ impl ContactClient {
     /// such as a local mock. The service path is appended to `api_root`.
     #[must_use]
     pub fn with_api_root(mut self, api_root: &str) -> Self {
-        self.soap.base_url = service_url(api_root, SERVICE);
+        self.soap.retarget(api_root, SERVICE);
         self
     }
 
     /// The endpoint this client posts to.
     pub fn base_url(&self) -> &str {
-        &self.soap.base_url
+        self.soap.base_url()
     }
 
     fn require_session(&self) -> Result<&str, YukiError> {
