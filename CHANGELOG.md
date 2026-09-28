@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.13](https://github.com/rvben/yuki-cli/compare/v0.1.12...v0.1.13) - 2026-09-28
+
+### Fixed
+
+- **deps**: update quick-xml to 0.42 for RUSTSEC-2026-0194 and RUSTSEC-2026-0195 ([39dd114](https://github.com/rvben/yuki-cli/commit/39dd114dc3775bcf1874d4bfef09c41479af8a02))
+- **deps**: update rustls to 0.23.45 for RUSTSEC-2026-0285 ([766d56d](https://github.com/rvben/yuki-cli/commit/766d56d23ab0c8904c67670d9eb2f32849580c20))
+
 ## [0.1.12](https://github.com/rvben/yuki-cli/compare/v0.1.11...v0.1.12) - 2026-09-03
 
 ### Added

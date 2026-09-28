@@ -3,7 +3,7 @@ members = ["yuki-client"]
 
 [package]
 name = "yuki-cli"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 rust-version = "1.90"
 description = "CLI client for the Yuki bookkeeping SOAP API"
