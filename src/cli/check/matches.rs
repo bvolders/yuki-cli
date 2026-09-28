@@ -446,7 +446,15 @@ fn closest(mut pool: Vec<(i64, usize)>) -> Vec<usize> {
 ///   marketplace order split per seller): `high` when all are the payment's
 ///   supplier, `medium` when some are, never when the payment names none of
 ///   them; a payment naming nobody adds up only same-day invoices, as `low`.
-fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> {
+///
+/// Only invoices and payments still `free` take part, so that a later round
+/// draws the [`GROUP_CANDIDATES`] from what earlier rounds left.
+fn candidates(
+    invoices: &[OpenInvoice],
+    payments: &[Payment],
+    free_invoice: &[bool],
+    free_payment: &[bool],
+) -> Vec<Candidate> {
     let names: Vec<String> = invoices
         .iter()
         .map(|i| normalize_name(&i.contact))
@@ -454,9 +462,22 @@ fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> 
     let days = |i: usize, p: usize| days_apart(&invoices[i].date, &payments[p].date);
     let mut found = Vec::new();
 
-    for (i, invoice) in invoices.iter().enumerate() {
+    let free_invoices = || {
+        invoices
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| free_invoice[*i])
+    };
+    let free_payments = || {
+        payments
+            .iter()
+            .enumerate()
+            .filter(|(p, _)| free_payment[*p])
+    };
+
+    for (i, invoice) in free_invoices() {
         let mut split_pool = Vec::new();
-        for (p, payment) in payments.iter().enumerate() {
+        for (p, payment) in free_payments() {
             let d = days(i, p);
             let relation = name_relation(payment, &names[i]);
             let fx_close = invoice.fx
@@ -504,11 +525,9 @@ fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> 
         }
     }
 
-    for (p, payment) in payments.iter().enumerate() {
+    for (p, payment) in free_payments() {
         let pool = closest(
-            invoices
-                .iter()
-                .enumerate()
+            free_invoices()
                 .filter(|(i, invoice)| {
                     invoice.open < payment.amount
                         && match name_relation(payment, &names[*i]) {
@@ -550,39 +569,52 @@ fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> 
 /// Every invoice is settled at most once too. Greedy: strongest confidence
 /// first; within it an exact amount before an FX one and the fewest items
 /// (an exact 1:1 before any sum), then closest in date, then invoice and
-/// payment order, so the result depends on nothing but the input.
+/// payment order, so the result depends on nothing but the input. Repeated
+/// over what is left until a round pairs nothing more.
 pub(super) fn suggest(invoices: &[OpenInvoice], payments: &[Payment]) -> Matches {
-    let mut found = candidates(invoices, payments);
-    let items = |c: &Candidate| c.payments.len() + c.invoices.len();
-    found.sort_by(|a, b| {
-        b.confidence
-            .cmp(&a.confidence)
-            .then(a.fx.cmp(&b.fx))
-            .then(items(a).cmp(&items(b)))
-            .then(a.days.cmp(&b.days))
-            .then(a.invoices.cmp(&b.invoices))
-            .then(a.payments.cmp(&b.payments))
-    });
     let mut suggestions: Vec<Option<Suggestion>> = vec![None; invoices.len()];
     let mut used = vec![false; payments.len()];
-    for c in found {
-        if c.invoices.iter().any(|&i| suggestions[i].is_some())
-            || c.payments.iter().any(|&p| used[p])
-        {
-            continue;
+    // Sums only look at the closest few items, so on a busy day a payment can
+    // miss its invoices behind others; once a round has paired what it could,
+    // draw the candidates again from what is left.
+    loop {
+        let free: Vec<bool> = suggestions.iter().map(Option::is_none).collect();
+        let unused: Vec<bool> = used.iter().map(|u| !u).collect();
+        let mut found = candidates(invoices, payments, &free, &unused);
+        let items = |c: &Candidate| c.payments.len() + c.invoices.len();
+        found.sort_by(|a, b| {
+            b.confidence
+                .cmp(&a.confidence)
+                .then(a.fx.cmp(&b.fx))
+                .then(items(a).cmp(&items(b)))
+                .then(a.days.cmp(&b.days))
+                .then(a.invoices.cmp(&b.invoices))
+                .then(a.payments.cmp(&b.payments))
+        });
+        let mut paired = false;
+        for c in found {
+            if c.invoices.iter().any(|&i| suggestions[i].is_some())
+                || c.payments.iter().any(|&p| used[p])
+            {
+                continue;
+            }
+            paired = true;
+            for &p in &c.payments {
+                used[p] = true;
+            }
+            let suggestion = Suggestion {
+                payments: c.payments,
+                invoices: c.invoices,
+                confidence: c.confidence,
+                days: c.days,
+                fx: c.fx,
+            };
+            for &i in &suggestion.invoices {
+                suggestions[i] = Some(suggestion.clone());
+            }
         }
-        for &p in &c.payments {
-            used[p] = true;
-        }
-        let suggestion = Suggestion {
-            payments: c.payments,
-            invoices: c.invoices,
-            confidence: c.confidence,
-            days: c.days,
-            fx: c.fx,
-        };
-        for &i in &suggestion.invoices {
-            suggestions[i] = Some(suggestion.clone());
+        if !paired {
+            break;
         }
     }
     let unused = (0..payments.len()).filter(|&p| !used[p]).collect();

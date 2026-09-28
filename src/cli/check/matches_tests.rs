@@ -607,3 +607,28 @@ fn an_invoice_booked_as_paid_by_card_is_card_even_for_a_new_supplier() {
         "invoice payment method Creditcard: no bank line to match"
     );
 }
+
+#[test]
+fn a_busy_day_still_reaches_invoices_beyond_the_first_candidates() {
+    // Fourteen invoices of one supplier on one day. p1 adds up the first two;
+    // p2 the last two, which are not among the first GROUP_CANDIDATES. Once
+    // p1 took its invoices, p2's candidates are drawn again from what is left.
+    let mut invoices: Vec<OpenInvoice> = (0..14)
+        .map(|k| invoice("Supplier M", "2026-06-03", &format!("5.{k:02}")))
+        .collect();
+    invoices[0] = invoice("Supplier M", "2026-06-03", "1.10");
+    invoices[1] = invoice("Supplier M", "2026-06-03", "2.20");
+    invoices[12] = invoice("Supplier M", "2026-06-03", "3.40");
+    invoices[13] = invoice("Supplier M", "2026-06-03", "4.30");
+    let payments = vec![
+        payment("p1", "2026-06-03", "3.30", Some("Supplier M")),
+        payment("p2", "2026-06-03", "7.70", Some("Supplier M")),
+    ];
+    const { assert!(GROUP_CANDIDATES < 13) };
+    let result = suggest(&invoices, &payments);
+    let p2 = result.suggestions[13]
+        .as_ref()
+        .expect("p2 settles 12 and 13");
+    assert_eq!(p2.payments, vec![1]);
+    assert_eq!(p2.invoices, vec![12, 13]);
+}
