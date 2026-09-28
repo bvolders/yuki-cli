@@ -114,7 +114,7 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
 
     let mut contacts = Vec::new();
     let mut in_contact = false;
-    let mut current_field = String::new();
+    let mut field: Option<String> = None;
     let mut contact = Contact {
         id: String::new(),
         name: String::new(),
@@ -148,7 +148,7 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
                         }
                     }
                     "Type" | "Name" | "Country" | "IsSupplier" | "IsCustomer" if in_contact => {
-                        current_field = local;
+                        field = Some(local);
                     }
                     _ => {}
                 }
@@ -159,15 +159,20 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
                 match local {
                     "Type" | "Name" | "Country" | "IsSupplier" | "IsCustomer" => {
                         let text = content.take();
-                        match current_field.as_str() {
-                            "Type" => contact.contact_type = text,
-                            "Name" => contact.name = text,
-                            "Country" => contact.country = text,
-                            "IsSupplier" => contact.is_supplier = text.eq_ignore_ascii_case("true"),
-                            "IsCustomer" => contact.is_customer = text.eq_ignore_ascii_case("true"),
-                            _ => {}
+                        if let Some(f) = field.take() {
+                            match f.as_str() {
+                                "Type" => contact.contact_type = text,
+                                "Name" => contact.name = text,
+                                "Country" => contact.country = text,
+                                "IsSupplier" => {
+                                    contact.is_supplier = text.eq_ignore_ascii_case("true")
+                                }
+                                "IsCustomer" => {
+                                    contact.is_customer = text.eq_ignore_ascii_case("true")
+                                }
+                                _ => {}
+                            }
                         }
-                        current_field.clear();
                     }
                     "Contact" => {
                         if !contact.id.is_empty() {
@@ -180,7 +185,7 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(YukiError::Xml(e.to_string())),
-            Ok(ref event) => content.push_if(in_contact && !current_field.is_empty(), event)?,
+            Ok(ref event) => content.push_if(field.is_some(), event)?,
         }
         buf.clear();
     }
