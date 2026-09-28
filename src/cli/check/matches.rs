@@ -6,9 +6,9 @@
 //! amounts, creditors ledger and filters of `check unmatched`.
 
 use super::unmatched::{
-    Cents, CreditorLedger, LOOKBACK_MONTHS, OwnTransfers, UnmatchedRules, UnmatchedSetup,
-    bank_counterparty, bank_counterparty_name, entry_key, gl_entries, match_creditor_ledger,
-    normalize_name, normalized_names_match,
+    Cents, CreditorLedger, LOOKBACK_MONTHS, LedgerPayment, OwnTransfers, UnmatchedRules,
+    UnmatchedSetup, bank_counterparty, bank_counterparty_name, entry_key, gl_entries,
+    match_creditor_ledger, normalize_name, normalized_names_match,
 };
 use crate::cli::setup_domain;
 use crate::client::accounting::{GlTransactionWithContact, OutstandingItem, TransactionType};
@@ -293,22 +293,30 @@ pub(super) fn collect(
     }
 
     // What the bank lines did not claim: paid from an account not scanned.
-    let mut ledger_only: Vec<Payment> = ledger
+    let unclaimed: Vec<(String, Cents, LedgerPayment)> = ledger
         .payments
         .into_iter()
         .filter(|((date, _), _)| day(date) >= from)
         .flat_map(|((date, amount), list)| {
             list.into_iter()
-                .filter(|p| !p.covered)
-                .map(move |p| Payment {
-                    id: p.id,
-                    date: day(&date).to_string(),
-                    amount,
-                    bank: ledger_account.to_string(),
-                    counterparty: p.contact.clone(),
-                    supplier: Some(p.contact),
-                    on_ledger: true,
-                })
+                .map(move |p| (day(&date).to_string(), amount, p))
+        })
+        .collect();
+    let mut elsewhere: Vec<String> = unclaimed
+        .iter()
+        .map(|(_, _, p)| normalize_name(&p.contact))
+        .collect();
+    let mut ledger_only: Vec<Payment> = unclaimed
+        .into_iter()
+        .filter(|(_, _, p)| !p.covered)
+        .map(|(date, amount, p)| Payment {
+            id: p.id,
+            date,
+            amount,
+            bank: ledger_account.to_string(),
+            counterparty: p.contact.clone(),
+            supplier: Some(p.contact),
+            on_ledger: true,
         })
         .collect();
     ledger_only.sort_by(|a, b| {
@@ -320,11 +328,16 @@ pub(super) fn collect(
         ))
     });
     payments.extend(ledger_only);
-    bank_suppliers.sort();
-    bank_suppliers.dedup();
+    for names in [&mut bank_suppliers, &mut elsewhere] {
+        names.sort();
+        names.dedup();
+    }
     Collected {
         payments,
-        bank_suppliers,
+        paid: PaidVia {
+            bank: bank_suppliers,
+            elsewhere,
+        },
     }
 }
 
@@ -332,10 +345,19 @@ pub(super) fn collect(
 pub(super) struct Collected {
     /// Candidate payments.
     pub(super) payments: Vec<Payment>,
-    /// Every supplier (normalized) a scanned bank account paid in the window,
-    /// candidate or not. An open invoice of a supplier missing here was
-    /// probably paid by credit card, whose purchases have no bank line.
-    pub(super) bank_suppliers: Vec<String>,
+    /// Who was paid how in the window, candidate or not.
+    pub(super) paid: PaidVia,
+}
+
+/// Suppliers (normalized) paid in the window, by where the money went out.
+/// Evidence for an open invoice no payment matches.
+#[derive(Debug, Default)]
+pub(super) struct PaidVia {
+    /// Paid from a scanned bank account.
+    pub(super) bank: Vec<String>,
+    /// Paid according to the creditors account, but from an account that is
+    /// not scanned (in practice a credit card, settled in one monthly line).
+    pub(super) elsewhere: Vec<String>,
 }
 
 /// How a payment's supplier relates to an invoice's.
@@ -590,14 +612,18 @@ fn reason(s: &Suggestion, payments: &[Payment]) -> String {
     }
 }
 
-/// Table rows, one per open invoice. One without a candidate is `card` when
-/// its supplier is missing from `bank_suppliers` (never paid from a scanned
-/// bank account), else `none`.
+/// Table rows, one per open invoice. One without a candidate says what is
+/// known about how its supplier is paid ([`PaidVia`]): `card` when the
+/// supplier was paid from an account not scanned (no bank line to match),
+/// else `none` when it was paid from a scanned bank account (so the missing
+/// payment would show: probably unpaid), else `unseen`: no payment to it in
+/// the window at all, which is a new supplier as often as a nameless card
+/// payment or direct debit.
 pub(super) fn rows_for(
     invoices: &[OpenInvoice],
     payments: &[Payment],
     matches: &Matches,
-    bank_suppliers: &[String],
+    paid: &PaidVia,
 ) -> (Vec<String>, Vec<Vec<String>>) {
     let headers = [
         "Supplier",
@@ -650,13 +676,19 @@ pub(super) fn rows_for(
                 }
                 None => {
                     let name = normalize_name(&invoice.contact);
-                    let from_bank = bank_suppliers
-                        .iter()
-                        .any(|b| normalized_names_match(b, &name));
-                    let (status, why) = if from_bank {
+                    let among = |names: &[String]| names.iter().any(|n| normalized_names_match(n, &name));
+                    let (status, why) = if among(&paid.elsewhere) {
+                        (
+                            "card",
+                            "paid from an account not scanned before (card?): no bank line to match",
+                        )
+                    } else if among(&paid.bank) {
                         ("none", "no candidate payment: probably unpaid")
                     } else {
-                        ("card", "probably paid by card: no bank line to match")
+                        (
+                            "unseen",
+                            "no payment to this supplier seen: new supplier, or a nameless card payment or direct debit",
+                        )
                     };
                     row.extend([status, "", "", "", "", "", why].map(str::to_string));
                 }
@@ -728,7 +760,7 @@ pub async fn matches(
         None => (
             Collected {
                 payments: Vec::new(),
-                bank_suppliers: Vec::new(),
+                paid: PaidVia::default(),
             },
             None,
         ),
@@ -799,7 +831,7 @@ pub async fn matches(
 
     let payments = collected.payments;
     let result = suggest(&invoices, &payments);
-    let (headers, mut rows) = rows_for(&invoices, &payments, &result, &collected.bank_suppliers);
+    let (headers, mut rows) = rows_for(&invoices, &payments, &result, &collected.paid);
     if !quiet {
         eprintln!("API calls made: {calls}");
         let count = |label: &str| rows.iter().filter(|r| r[3] == label).count();
@@ -807,13 +839,14 @@ pub async fn matches(
             format!(" (payments {} to {})", w.payments_from, w.to)
         });
         eprintln!(
-            "{} open invoices{window}: {} high, {} medium, {} low; no candidate: {} probably paid by card, {} probably unpaid",
+            "{} open invoices{window}: {} high, {} medium, {} low; no candidate: {} paid by card before, {} probably unpaid, {} supplier never seen paid",
             invoices.len(),
             count("high"),
             count("medium"),
             count("low"),
             count("card"),
             count("none"),
+            count("unseen"),
         );
     }
     if unallocated {

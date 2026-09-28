@@ -351,8 +351,9 @@ transfers, ignored descriptions and no-document bookings are skipped as in
 | `high` | same amount and supplier, at most 30 days apart; or one payment to a supplier adding up several of its invoices (within 7 days) |
 | `medium` | same amount and supplier, 31 to 90 days apart; several supplier payments adding up to one invoice; or one payment adding up invoices of several suppliers (the payment's supplier within 7 days, or any supplier dated that day, as with a marketplace order invoiced per seller) |
 | `low` | same amount, the payment names no supplier, at most 30 days apart |
-| `card` | no candidate, and the supplier was never paid from a scanned bank account in the window: probably paid by credit card, whose purchases have no bank line |
-| `none` | no candidate payment: probably unpaid |
+| `card` | no candidate, and the supplier ledger shows the supplier paid in the window from an account that is not scanned (in practice the credit card, whose purchases have no bank line of their own) |
+| `none` | no candidate, but the supplier was paid from a scanned bank account in the window, so its payment would show: probably unpaid |
+| `unseen` | no candidate, and no payment to the supplier at all in the window: a new supplier, or one paid by a card payment or direct debit whose bank line names nobody. Not evidence of either card or unpaid |
 
 Amounts must match to the cent; sums add up to four items. The exception is an
 invoice of a supplier outside the euro area (the open item carries the

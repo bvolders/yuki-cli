@@ -302,8 +302,11 @@ fn rows_list_every_invoice_and_optionally_unallocated_payments() {
         payment("p2", "2026-05-02", "12.00", Some("Supplier Z")),
     ];
     let result = suggest(&invoices, &payments);
-    let paid_from_bank = vec![normalize_name("Supplier H")];
-    let (headers, rows) = rows_for(&invoices, &payments, &result, &paid_from_bank);
+    let paid = PaidVia {
+        bank: vec![normalize_name("Supplier H")],
+        elsewhere: Vec::new(),
+    };
+    let (headers, rows) = rows_for(&invoices, &payments, &result, &paid);
     assert_eq!(headers[0], "Supplier");
     assert_eq!(rows.len(), 2);
     let conf = headers.iter().position(|h| h == "Confidence").unwrap();
@@ -320,7 +323,7 @@ fn rows_with(
     payments: &[Payment],
     result: &Matches,
 ) -> (Vec<String>, Vec<Vec<String>>) {
-    let mut rows = rows_for(invoices, payments, result, &[]);
+    let mut rows = rows_for(invoices, payments, result, &PaidVia::default());
     unallocated_rows(payments, result, &mut rows.1);
     rows
 }
@@ -368,7 +371,7 @@ fn one_payment_adding_up_invoices_of_mixed_suppliers_is_medium() {
         assert_eq!(s.invoices, vec![1, 2]);
     }
     assert!(result.unused.is_empty());
-    let (headers, rows) = rows_for(&invoices, &payments, &result, &[]);
+    let (headers, rows) = rows_for(&invoices, &payments, &result, &PaidVia::default());
     let reason = headers.iter().position(|h| h == "Reason").unwrap();
     assert!(rows[1][reason].starts_with("one payment adds up 2 invoices of several suppliers"));
     assert!(rows[0][reason].starts_with("one payment adds up 3 invoices of the supplier"));
@@ -395,7 +398,7 @@ fn a_foreign_invoice_matches_a_supplier_payment_within_the_fx_tolerance_as_mediu
     let s = result.suggestions[0].as_ref().unwrap();
     assert_eq!(s.confidence, Confidence::Medium);
     assert!(s.fx);
-    let (headers, rows) = rows_for(&invoices, &payments, &result, &[]);
+    let (headers, rows) = rows_for(&invoices, &payments, &result, &PaidVia::default());
     let reason = headers.iter().position(|h| h == "Reason").unwrap();
     assert!(rows[0][reason].starts_with("FX:"), "{}", rows[0][reason]);
 }
@@ -424,22 +427,65 @@ fn euro_invoices_stay_exact() {
 }
 
 #[test]
-fn an_unpaid_invoice_of_a_supplier_never_paid_from_the_bank_is_probably_paid_by_card() {
+fn card_needs_evidence_and_a_supplier_never_seen_is_no_bank_line_seen() {
     let invoices = vec![
-        invoice("Card Supplier", "2026-09-07", "17.22"),
+        invoice("Card Supplier", "2026-09-07", "17.40"),
         invoice("Bank Supplier", "2026-09-07", "50.00"),
+        invoice("New Supplier", "2026-09-07", "12.10"),
     ];
     let result = suggest(&invoices, &[]);
-    let bank_suppliers = vec![normalize_name("Bank Supplier BV")];
-    let (headers, rows) = rows_for(&invoices, &[], &result, &bank_suppliers);
+    let paid = PaidVia {
+        bank: vec![normalize_name("Bank Supplier BV")],
+        elsewhere: vec![normalize_name("Card Supplier")],
+    };
+    let (headers, rows) = rows_for(&invoices, &[], &result, &paid);
     let conf = headers.iter().position(|h| h == "Confidence").unwrap();
     let reason = headers.iter().position(|h| h == "Reason").unwrap();
     assert_eq!(rows[0][conf], "card");
     assert_eq!(
         rows[0][reason],
-        "probably paid by card: no bank line to match"
+        "paid from an account not scanned before (card?): no bank line to match"
     );
     assert_eq!(rows[1][conf], "none");
+    assert_eq!(rows[1][reason], "no candidate payment: probably unpaid");
+    // Neither paid from the bank nor elsewhere in the window: a first invoice,
+    // or paid by a direct debit or card whose bank line names nobody. Not
+    // card, and not "probably unpaid" either.
+    assert_eq!(rows[2][conf], "unseen");
+    assert_eq!(
+        rows[2][reason],
+        "no payment to this supplier seen: new supplier, or a nameless card payment or direct debit"
+    );
+}
+
+#[test]
+fn collect_records_suppliers_paid_from_an_account_not_scanned() {
+    // Supplier U's payments reach the creditors account but no scanned bank
+    // line carries them: paid from elsewhere (a credit card). Covered or not,
+    // both count; one before the window does not.
+    let ledger_entries = vec![
+        ledger_line("9", "i1", "2026-05-01", "-20.00", "Supplier U"),
+        ledger_line("0", "l1", "2026-05-02", "20.00", "Supplier U"),
+        ledger_line("0", "l2", "2026-06-25", "30.00", "Supplier U"),
+        ledger_line("0", "l3", "2026-01-05", "30.00", "Supplier W"),
+        ledger_line("9", "i2", "2026-05-31", "-9.40", "Supplier T"),
+        ledger_line("0", "l4", "2026-06-01", "9.40", "Supplier T"),
+    ];
+    let banks = vec![(
+        "550000".to_string(),
+        vec![tx("b1", "2026-06-01", "-9.40", CODA_CARD, "")],
+    )];
+    let ledger = match_creditor_ledger(&ledger_entries, "2026-03-01");
+    let collected = collect(
+        &banks,
+        ledger,
+        &[],
+        &UnmatchedRules::default(),
+        "2026-03-01",
+        "440000",
+    );
+    assert_eq!(collected.paid.bank, vec!["supplier t".to_string()]);
+    assert_eq!(collected.paid.elsewhere, vec!["supplier u".to_string()]);
 }
 
 #[test]
@@ -464,5 +510,6 @@ fn collect_payments_records_every_supplier_paid_from_the_bank() {
         "440000",
     );
     assert!(collected.payments.is_empty());
-    assert_eq!(collected.bank_suppliers, vec!["supplier t".to_string()]);
+    assert_eq!(collected.paid.bank, vec!["supplier t".to_string()]);
+    assert!(collected.paid.elsewhere.is_empty());
 }
