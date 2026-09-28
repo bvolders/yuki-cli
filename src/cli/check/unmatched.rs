@@ -537,10 +537,16 @@ fn find_unmatched(
     }
     // Normalized archive contact names catch batched or split charges where the
     // amount differs but the supplier is known.
+    //
+    // Each name is normalized twice on purpose: the matcher has always compared
+    // against the normalized form of the already-normalized name, and
+    // normalize_name is not idempotent ("Foo (via) Bar" -> "foo via bar" ->
+    // "foo"). Doing both passes here keeps those matches while normalizing
+    // each name once per run rather than once per bank line.
     let archive_names: HashSet<String> = archive_docs
         .iter()
         .filter(|d| !d.contact_name.is_empty())
-        .map(|d| normalize_name(&d.contact_name))
+        .map(|d| normalize_name(&normalize_name(&d.contact_name)))
         .filter(|n| !n.is_empty())
         .collect();
     let ignore_desc: Vec<String> = rules
@@ -1199,6 +1205,27 @@ mod tests {
             &be_rules(),
         );
         assert_eq!(ids(&found), ["p"]);
+    }
+
+    #[test]
+    fn find_unmatched_archive_name_fallback_compares_as_before_the_refactor() {
+        // The archive names were normalized twice before comparing, and
+        // normalize_name is not idempotent: "Foo (via) Bar" becomes
+        // "foo via bar", then "foo", which matches the bank's "Foo Bar".
+        let sepa = "/TRTP/SEPA/CNTP/NL00TEST0000000000/TESTNL2A/Foo Bar/REMI/x";
+        let banks = vec![(
+            "11001".to_string(),
+            vec![tx("by-name", "2025-03-03", "-9.99", sepa, "")],
+        )];
+        let found = find_unmatched(
+            &banks,
+            CreditorLedger::default(),
+            &[],
+            &[],
+            &[doc("12.00", "Foo (via) Bar")],
+            &UnmatchedRules::default(),
+        );
+        assert!(found.is_empty(), "{:?}", ids(&found));
     }
 
     #[test]
