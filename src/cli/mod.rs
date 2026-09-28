@@ -10,6 +10,8 @@ pub mod projects;
 pub mod upload;
 pub mod vat;
 
+use std::ffi::OsString;
+
 use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{CommandFactory, Parser, Subcommand};
 
@@ -92,34 +94,53 @@ pub struct RunEndpoint {
 impl Cli {
     /// The flags, each falling back to its environment variable.
     pub fn run_endpoint(&self) -> Result<RunEndpoint, clap::Error> {
-        self.run_endpoint_with(|name| std::env::var(name).ok())
+        self.run_endpoint_with(|name| std::env::var_os(name))
     }
 
     /// [`Cli::run_endpoint`] over an explicit environment lookup.
     ///
     /// A set `YUKI_REGION` must be `nl` or `be`, exactly as the flag, and a bad
-    /// value is a usage error like a bad flag.
+    /// value is a usage error like a bad flag. A variable that is not valid
+    /// UTF-8 is a usage error too, as it was while clap read these variables,
+    /// rather than being silently treated as unset.
     pub fn run_endpoint_with(
         &self,
-        env: impl Fn(&str) -> Option<String>,
+        env: impl Fn(&str) -> Option<OsString>,
     ) -> Result<RunEndpoint, clap::Error> {
-        let region = match (self.region, env("YUKI_REGION")) {
-            (Some(region), _) => Some(region),
-            (None, Some(value)) if REGIONS.contains(&value.as_str()) => {
-                Some(value.parse().expect("REGIONS holds only parseable regions"))
-            }
-            (None, Some(value)) => {
-                return Err(Self::command().error(
-                    clap::error::ErrorKind::InvalidValue,
-                    format!("invalid value '{value}' for YUKI_REGION [possible values: nl, be]"),
-                ));
-            }
-            (None, None) => None,
+        let var = |name: &str| -> Result<Option<String>, clap::Error> {
+            env(name)
+                .map(|value| {
+                    value.into_string().map_err(|_| {
+                        Self::command().error(
+                            clap::error::ErrorKind::InvalidUtf8,
+                            format!("{name} is not valid UTF-8"),
+                        )
+                    })
+                })
+                .transpose()
+        };
+        // The environment is read only when the flag is absent, as clap did.
+        let region = match self.region {
+            Some(region) => Some(region),
+            None => match var("YUKI_REGION")? {
+                Some(value) if REGIONS.contains(&value.as_str()) => {
+                    Some(value.parse().expect("REGIONS holds only parseable regions"))
+                }
+                Some(value) => {
+                    return Err(Self::command().error(
+                        clap::error::ErrorKind::InvalidValue,
+                        format!(
+                            "invalid value '{value}' for YUKI_REGION [possible values: nl, be]"
+                        ),
+                    ));
+                }
+                None => None,
+            },
         };
         let base_url = self
             .base_url
             .clone()
-            .or_else(|| env("YUKI_BASE_URL"))
+            .map_or_else(|| var("YUKI_BASE_URL"), |url| Ok(Some(url)))?
             .filter(|u| !u.trim().is_empty());
         Ok(RunEndpoint { region, base_url })
     }
@@ -589,13 +610,14 @@ mod tests {
     use super::*;
 
     fn endpoint(args: &[&str], env: &[(&str, &str)]) -> Result<RunEndpoint, clap::Error> {
+        let env: Vec<(&str, OsString)> = env.iter().map(|(k, v)| (*k, (*v).into())).collect();
+        endpoint_os(args, &env)
+    }
+
+    fn endpoint_os(args: &[&str], env: &[(&str, OsString)]) -> Result<RunEndpoint, clap::Error> {
         Cli::try_parse_from(args)
             .expect("parses")
-            .run_endpoint_with(|name| {
-                env.iter()
-                    .find(|(k, _)| *k == name)
-                    .map(|(_, v)| v.to_string())
-            })
+            .run_endpoint_with(|name| env.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone()))
     }
 
     #[test]
@@ -631,6 +653,21 @@ mod tests {
         for bad in ["", "BE", "de"] {
             let err = endpoint(&["yuki", "init"], &[("YUKI_REGION", bad)]).unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad:?}");
+        }
+    }
+
+    /// A non-UTF-8 value is a usage error (exit 2), as it was when clap read
+    /// the variables, not silently treated as unset.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_endpoint_variable_is_a_usage_error() {
+        use std::os::unix::ffi::OsStringExt;
+        for name in ["YUKI_REGION", "YUKI_BASE_URL"] {
+            let env = [(name, OsString::from_vec(vec![b'b', 0xff]))];
+            let err = endpoint_os(&["yuki", "init"], &env).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidUtf8, "{name}");
+            assert_eq!(err.exit_code(), 2, "{name}");
+            assert!(err.to_string().contains(name), "{name}: {err}");
         }
     }
 }
