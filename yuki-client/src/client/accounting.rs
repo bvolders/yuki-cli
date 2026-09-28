@@ -26,6 +26,9 @@ pub struct OutstandingItem {
     pub open_amount: String,
     /// The contact's country code (e.g. `BE`, `US`); empty when not set.
     pub country: String,
+    /// The payment method booked on the item (e.g. `Creditcard`); empty when
+    /// not set.
+    pub payment_method: String,
 }
 
 /// A general ledger transaction.
@@ -679,7 +682,7 @@ impl AccountingClient {
                             current = OutstandingItem::default();
                         }
                         "Contact" | "ContactName" | "Description" | "Date" | "Amount"
-                        | "OriginalAmount" | "OpenAmount" | "Country"
+                        | "OriginalAmount" | "OpenAmount" | "Country" | "PaymentMethod"
                             if in_item =>
                         {
                             field = Some(local);
@@ -691,7 +694,7 @@ impl AccountingClient {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "Contact" | "ContactName" | "Description" | "Date" | "Amount"
-                        | "OriginalAmount" | "OpenAmount" | "Country" => {
+                        | "OriginalAmount" | "OpenAmount" | "Country" | "PaymentMethod" => {
                             let text = content.take();
                             if let Some(f) = field.take() {
                                 match f.as_str() {
@@ -701,6 +704,7 @@ impl AccountingClient {
                                     "Amount" | "OriginalAmount" => current.amount = text,
                                     "OpenAmount" => current.open_amount = text,
                                     "Country" => current.country = text,
+                                    "PaymentMethod" => current.payment_method = text,
                                     _ => {}
                                 }
                             }

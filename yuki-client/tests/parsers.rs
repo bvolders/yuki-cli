@@ -481,8 +481,8 @@ fn parses_the_supplier_country_of_outstanding_items() {
         <Item ID="item-1">
           <Date>2026-09-07</Date>
           <Contact>Hosting Inc</Contact>
-          <OpenAmount>17.22</OpenAmount>
-          <OriginalAmount>17.22</OriginalAmount>
+          <OpenAmount>16.40</OpenAmount>
+          <OriginalAmount>16.40</OriginalAmount>
           <Type ID="2">Aankoopfactuur</Type>
           <PaymentMethod>Creditcard</PaymentMethod>
           <Postcode />
@@ -495,7 +495,8 @@ fn parses_the_supplier_country_of_outstanding_items() {
     let items =
         AccountingClient::parse_outstanding_items(xml, "OutstandingCreditorItemsResult").unwrap();
     assert_eq!(items[0].country, "US");
-    assert_eq!(items[0].open_amount, "17.22");
+    assert_eq!(items[0].open_amount, "16.40");
+    assert_eq!(items[0].payment_method, "Creditcard");
 }
 
 #[test]

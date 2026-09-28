@@ -46,6 +46,7 @@ fn item(contact: &str, date: &str, open: &str) -> OutstandingItem {
         amount: open.into(),
         open_amount: open.into(),
         country: "BE".into(),
+        ..Default::default()
     }
 }
 
@@ -589,4 +590,20 @@ fn among_equal_confidence_one_to_one_matches_the_closest_date_wins() {
     let result = suggest(&invoices, &payments);
     assert!(result.suggestions[0].is_none());
     assert_eq!(result.suggestions[1].as_ref().unwrap().days, 5);
+}
+
+#[test]
+fn an_invoice_booked_as_paid_by_card_is_card_even_for_a_new_supplier() {
+    let mut paid_by_card = item("New Supplier", "2026-09-07", "12.10");
+    paid_by_card.payment_method = "Creditcard".into();
+    let invoices = vec![OpenInvoice::from_item(&paid_by_card).unwrap()];
+    let result = suggest(&invoices, &[]);
+    let (headers, rows) = rows_for(&invoices, &[], &result, &PaidVia::default());
+    let conf = headers.iter().position(|h| h == "Confidence").unwrap();
+    let reason = headers.iter().position(|h| h == "Reason").unwrap();
+    assert_eq!(rows[0][conf], "card");
+    assert_eq!(
+        rows[0][reason],
+        "invoice payment method Creditcard: no bank line to match"
+    );
 }

@@ -78,6 +78,9 @@ pub(super) struct OpenInvoice {
     pub(super) open: Cents,
     /// Probably not in euro (a supplier outside the euro area).
     pub(super) fx: bool,
+    /// The payment method booked on the invoice when it names a card
+    /// (`Creditcard`), else empty.
+    pub(super) card_method: String,
 }
 
 impl OpenInvoice {
@@ -92,6 +95,15 @@ impl OpenInvoice {
             fx: {
                 let country = item.country.trim().to_ascii_uppercase();
                 !country.is_empty() && !EURO_COUNTRIES.contains(&country.as_str())
+            },
+            card_method: {
+                let method = item.payment_method.trim();
+                let lower = method.to_lowercase();
+                if lower.contains("card") || lower.contains("kaart") || lower.contains("carte") {
+                    method.to_string()
+                } else {
+                    String::new()
+                }
             },
         })
     }
@@ -625,12 +637,12 @@ fn reason(s: &Suggestion, payments: &[Payment]) -> String {
 }
 
 /// Table rows, one per open invoice. One without a candidate says what is
-/// known about how its supplier is paid ([`PaidVia`]): `card` when the
-/// supplier was paid from an account not scanned (no bank line to match),
-/// else `none` when it was paid from a scanned bank account (so the missing
-/// payment would show: probably unpaid), else `unseen`: no payment to it in
-/// the window at all, which is a new supplier as often as a nameless card
-/// payment or direct debit.
+/// known about how it is paid: `card` when the invoice's payment method is a
+/// card or its supplier was paid from an account not scanned ([`PaidVia`]),
+/// both leaving no bank line to match; else `none` when the supplier was paid
+/// from a scanned bank account (so the payment would show: probably unpaid);
+/// else `unseen`: no payment to it in the window at all, which is a new
+/// supplier as often as a nameless card payment or direct debit.
 pub(super) fn rows_for(
     invoices: &[OpenInvoice],
     payments: &[Payment],
@@ -689,20 +701,32 @@ pub(super) fn rows_for(
                 None => {
                     let name = normalize_name(&invoice.contact);
                     let among = |names: &[String]| names.iter().any(|n| normalized_names_match(n, &name));
-                    let (status, why) = if among(&paid.elsewhere) {
+                    let (status, why) = if !invoice.card_method.is_empty() {
                         (
                             "card",
-                            "paid from an account not scanned before (card?): no bank line to match",
+                            format!(
+                                "invoice payment method {}: no bank line to match",
+                                invoice.card_method
+                            ),
+                        )
+                    } else if among(&paid.elsewhere) {
+                        (
+                            "card",
+                            "paid from an account not scanned before (card?): no bank line to match"
+                                .to_string(),
                         )
                     } else if among(&paid.bank) {
-                        ("none", "no candidate payment: probably unpaid")
+                        ("none", "no candidate payment: probably unpaid".to_string())
                     } else {
                         (
                             "unseen",
-                            "no payment to this supplier seen: new supplier, or a nameless card payment or direct debit",
+                            "no payment to this supplier seen: new supplier, or a nameless card payment or direct debit"
+                                .to_string(),
                         )
                     };
-                    row.extend([status, "", "", "", "", "", why].map(str::to_string));
+                    row.push(status.to_string());
+                    row.extend(std::iter::repeat_n(String::new(), 5));
+                    row.push(why);
                 }
             }
             row
