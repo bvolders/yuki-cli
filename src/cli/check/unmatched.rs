@@ -886,10 +886,15 @@ const LEGAL_SUFFIXES: &[&str] = &[
     "commv", "commva", "vof",
 ];
 
+/// Web domain endings dropped from a word by [`normalize_name`].
+const WEB_DOMAINS: &[&str] = &[
+    ".com", ".be", ".nl", ".eu", ".net", ".org", ".io", ".de", ".fr", ".co.uk",
+];
+
 /// Normalize a company name for fuzzy matching.
 ///
-/// Lowercases the name, removes "via ..." suffixes, treats `, ( ) - /` as word
-/// breaks, drops dots, and removes legal-form words ("B.V.", "NV", "SRL",
+/// Lowercases the name, removes "via ..." suffixes and web domain endings
+/// ("Shop.com"), treats `, ( ) - /` as word breaks, drops dots, and removes legal-form words ("B.V.", "NV", "SRL",
 /// "Comm.V", ...), including spaced spellings such as "B. V." or "Comm. V.".
 /// Suffixes are removed as whole words only, so a name that merely contains
 /// "sa" or "nv" is left intact.
@@ -901,6 +906,18 @@ pub(super) fn normalize_name(name: &str) -> String {
     let lower = name.trim().to_lowercase();
     // Remove "via ..." suffix (e.g. "Vimexx via Mollie" -> "vimexx")
     let base = lower.split(" via ").next().unwrap_or(&lower);
+    // "Shop.com" is the shop: drop a web domain ending before the dots go,
+    // or it would glue on as "shopcom".
+    let base = base
+        .split_whitespace()
+        .map(|word| {
+            WEB_DOMAINS
+                .iter()
+                .find_map(|d| word.strip_suffix(d).filter(|w| !w.is_empty()))
+                .unwrap_or(word)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let cleaned = base
         .replace('.', "")
         .replace([',', '(', ')', '-', '/'], " ");
@@ -933,16 +950,37 @@ pub(super) fn normalize_name(name: &str) -> String {
 
 /// Check whether two company names refer to the same entity.
 ///
-/// Returns true if one normalized name contains the other, allowing for
-/// abbreviations or partial matches.
+/// See [`normalized_names_match`].
 #[cfg(test)]
 fn names_match(bank_name: &str, archive_name: &str) -> bool {
     normalized_names_match(&normalize_name(bank_name), &normalize_name(archive_name))
 }
 
-/// [`names_match`] over names already passed through [`normalize_name`].
+/// Shortest word that can tie two different names together on its own.
+const MIN_NAME_WORD: usize = 3;
+
+/// Whether two names already passed through [`normalize_name`] are the same
+/// supplier: equal, or every word of the one with fewer words is a whole word
+/// of the other and at least one of those words has [`MIN_NAME_WORD`] letters.
+///
+/// Whole words, not substrings: "ing" must not match "bookings online".
 pub(super) fn normalized_names_match(a: &str, b: &str) -> bool {
-    !a.is_empty() && !b.is_empty() && (a.contains(b) || b.contains(a))
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let words = |s: &'_ str| -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (a, b) = (words(a), words(b));
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    short.iter().any(|w| w.chars().count() >= MIN_NAME_WORD)
+        && short.iter().all(|w| long.contains(w))
 }
 
 #[cfg(test)]
@@ -987,9 +1025,35 @@ mod tests {
     }
 
     #[test]
-    fn names_match_bidirectional_substring() {
+    fn names_match_when_every_word_of_the_shorter_name_is_in_the_other() {
         assert!(names_match("Hetzner Online GmbH", "Hetzner"));
         assert!(names_match("Hetzner", "Hetzner Online GmbH"));
+        assert!(names_match("Online Hetzner", "Hetzner Online GmbH"));
+    }
+
+    #[test]
+    fn names_match_on_whole_words_not_substrings() {
+        // "ing" is inside "bookings": no match.
+        assert!(!names_match("ING", "Bookings Online"));
+        assert!(!names_match("Bookings Online", "ING"));
+        assert!(names_match("ING", "ING Belgie"));
+        assert!(!names_match("Supplier A", "Supplier B"));
+        assert!(!names_match("Pay", "Paypal Europe"));
+    }
+
+    #[test]
+    fn names_match_needs_a_real_word_unless_equal() {
+        // Two-letter words alone are too weak to tie names together...
+        assert!(!names_match("AB", "AB Example Trading"));
+        assert!(!names_match("A B", "A B C"));
+        // ...but a name always matches itself.
+        assert!(names_match("AB", "ab"));
+    }
+
+    #[test]
+    fn names_match_ignores_a_web_domain_suffix() {
+        assert!(names_match("Marketplace.com", "Marketplace NV"));
+        assert_eq!(normalize_name("Marketplace.com"), "marketplace");
     }
 
     #[test]

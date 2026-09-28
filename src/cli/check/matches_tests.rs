@@ -513,3 +513,12 @@ fn collect_payments_records_every_supplier_paid_from_the_bank() {
     assert_eq!(collected.paid.bank, vec!["supplier t".to_string()]);
     assert!(collected.paid.elsewhere.is_empty());
 }
+
+#[test]
+fn a_supplier_name_inside_another_word_is_not_the_same_supplier() {
+    // "ING" is a substring of "Bookings Online", not the same supplier: the
+    // same amount makes it no candidate, certainly not `high`.
+    let invoices = vec![invoice("Bookings Online", "2026-06-10", "31.40")];
+    let payments = vec![payment("p1", "2026-06-11", "31.40", Some("ING"))];
+    assert_eq!(confidence_of(&suggest(&invoices, &payments), 0), None);
+}
