@@ -109,7 +109,7 @@ yuki upload file invoice.pdf --folder inkoop --amount 7.28 --remarks "Hetzner ho
 
 ```sh
 yuki vat returns                          # List all VAT return periods
-yuki vat returns --year 2025              # Filter by year
+yuki vat returns 2025                     # Filter by year
 yuki vat codes                            # List active VAT codes
 
 yuki invoices list --invoice-type purchase # Outstanding purchase invoices
