@@ -230,6 +230,11 @@ struct UnmatchedDebit {
 }
 
 /// An amount in whole cents, so amounts compare exactly and key maps directly.
+///
+/// Assumes the API sends at most two decimals, which Yuki does. An amount
+/// with more is rounded per amount, half away from zero (`1.005` may land on
+/// either cent through its `f64` form), where the code before `Cents` compared
+/// `{:.2}`-formatted strings; the two can differ only on such amounts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Cents(i64);
 
