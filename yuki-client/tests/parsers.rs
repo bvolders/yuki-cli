@@ -1,4 +1,4 @@
-use yuki_client::client::accounting::AccountingClient;
+use yuki_client::client::accounting::{AccountingClient, TransactionType};
 use yuki_client::client::accounting_info::AccountingInfoClient;
 use yuki_client::client::archive::ArchiveClient;
 use yuki_client::client::contact::parse_contacts;
@@ -90,7 +90,7 @@ fn parses_gl_transactions_with_contact() {
     assert_eq!(txs[0].contact_name, "Hetzner Online GmbH");
     assert_eq!(txs[0].amount, "-7.28");
     assert_eq!(txs[1].contact_name, "");
-    assert_eq!(txs[0].transaction_type, "", "absent means unknown");
+    assert_eq!(txs[0].transaction_type, None, "absent means unknown");
 }
 
 /// Belgian (CODA) bank lines: no contact on an unprocessed line, and a GL code in
@@ -119,8 +119,8 @@ fn parses_gl_transactions_with_contact_from_a_belgian_bank_account() {
     assert_eq!(txs[1].contact_name, "657100");
     assert_eq!(txs[1].amount, "-4.56");
     // The journal type separates bank lines from purchase documents.
-    assert_eq!(txs[0].transaction_type, "0");
-    assert_eq!(txs[1].transaction_type, "10");
+    assert_eq!(txs[0].transaction_type, Some(TransactionType::Bank));
+    assert_eq!(txs[1].transaction_type, Some(TransactionType::Bank));
     assert_eq!(txs[0].file_name, "");
     assert_eq!(txs[1].file_name, "Example & Co - 0001.pdf");
 }
@@ -486,4 +486,22 @@ fn parses_start_balances_with_account_id_fields() {
     assert_eq!(balances[0].description, "Inventaris en inrichting");
     assert_eq!(balances[1].gl_account_code, "20200");
     assert_eq!(balances[1].description, "RC Ruben Jongejan");
+}
+
+#[test]
+fn transaction_type_codes_map_to_journals() {
+    assert_eq!(
+        TransactionType::from_code(" 9 "),
+        Some(TransactionType::Purchase)
+    );
+    assert_eq!(TransactionType::from_code("0"), Some(TransactionType::Bank));
+    assert_eq!(
+        TransactionType::from_code("10"),
+        Some(TransactionType::Bank)
+    );
+    assert_eq!(
+        TransactionType::from_code("42"),
+        Some(TransactionType::Unknown("42".into()))
+    );
+    assert_eq!(TransactionType::from_code(""), None);
 }

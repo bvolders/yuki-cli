@@ -45,13 +45,43 @@ pub struct GlTransactionWithContact {
     pub gl_account: String,
     pub amount: String,
     pub contact_name: String,
-    /// Yuki's `TransactionType`: the kind of journal the line came from, e.g.
-    /// `9` for a purchase invoice or credit note and `0`/`10` for bank lines
-    /// (as observed on Yuki Belgium). Empty when the response has none.
-    pub transaction_type: String,
+    /// Yuki's `TransactionType`: the kind of journal the line came from.
+    /// `None` when the response has none.
+    pub transaction_type: Option<TransactionType>,
     /// Name of the document (e.g. the invoice PDF) the line is linked to;
     /// empty for a line without one.
     pub file_name: String,
+}
+
+/// Yuki's `TransactionType` code on a GL line: the journal it came from.
+///
+/// Yuki does not document the codes; the mapping below is as observed on
+/// Yuki Belgium:
+///
+/// | code | variant | lines |
+/// |------|---------|-------|
+/// | `9`  | [`Purchase`](Self::Purchase) | purchase invoices and credit notes |
+/// | `0`  | [`Bank`](Self::Bank) | bank lines |
+/// | `10` | [`Bank`](Self::Bank) | bank payments Yuki linked to an invoice |
+///
+/// Any other code is kept verbatim as [`Unknown`](Self::Unknown).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionType {
+    Purchase,
+    Bank,
+    Unknown(String),
+}
+
+impl TransactionType {
+    /// Parse a `TransactionType` value; `None` when it is empty.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code.trim() {
+            "" => None,
+            "9" => Some(Self::Purchase),
+            "0" | "10" => Some(Self::Bank),
+            other => Some(Self::Unknown(other.to_string())),
+        }
+    }
 }
 
 /// A general ledger account balance as of a date, from `GLAccountBalance`.
@@ -514,7 +544,9 @@ impl AccountingClient {
                                     "Amount" => current.amount = text,
                                     "GLAccountCode" => current.gl_account = text,
                                     "Contact" | "ContactName" => current.contact_name = text,
-                                    "TransactionType" => current.transaction_type = text,
+                                    "TransactionType" => {
+                                        current.transaction_type = TransactionType::from_code(&text)
+                                    }
                                     "FileName" => current.file_name = text,
                                     _ => {}
                                 }

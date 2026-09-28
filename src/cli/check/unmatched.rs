@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use super::resolve_period;
 use crate::cli::setup_domain;
 use crate::client::Region;
-use crate::client::accounting::{GlTransactionWithContact, OutstandingItem};
+use crate::client::accounting::{GlTransactionWithContact, OutstandingItem, TransactionType};
 use crate::client::archive::{ArchiveClient, ArchiveDocument};
 use crate::config::Config;
 use crate::error::YukiError;
@@ -214,10 +214,6 @@ impl Pool {
     }
 }
 
-/// `TransactionType` of a purchase invoice or credit note on the creditors
-/// account (Yuki Belgium). Bank and card lines carry other types (`0`, `10`).
-const PURCHASE_TRANSACTION_TYPE: &str = "9";
-
 /// What a line on the creditors control account is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreditorLine {
@@ -243,14 +239,17 @@ impl CreditorLine {
     fn of(tx: &GlTransactionWithContact, amount: f64) -> Self {
         let credit = amount < 0.0;
         let document = !tx.file_name.trim().is_empty();
-        match tx.transaction_type.trim() {
-            "" if credit => Self::Invoice,
-            "" => Self::Payment,
-            PURCHASE_TRANSACTION_TYPE if credit => Self::Invoice,
-            PURCHASE_TRANSACTION_TYPE => Self::CreditNote,
-            _ if credit && document => Self::Invoice,
-            _ if credit => Self::Refund,
-            _ => Self::Payment,
+        match &tx.transaction_type {
+            None if credit => Self::Invoice,
+            None => Self::Payment,
+            Some(TransactionType::Purchase) if credit => Self::Invoice,
+            Some(TransactionType::Purchase) => Self::CreditNote,
+            // Bank lines, and any journal we do not know, by sign and document.
+            Some(TransactionType::Bank | TransactionType::Unknown(_)) => match (credit, document) {
+                (true, true) => Self::Invoice,
+                (true, false) => Self::Refund,
+                (false, _) => Self::Payment,
+            },
         }
     }
 }
@@ -836,7 +835,7 @@ mod tests {
             gl_account: String::new(),
             amount: amount.into(),
             contact_name: contact.into(),
-            transaction_type: String::new(),
+            transaction_type: None,
             file_name: String::new(),
         }
     }
@@ -844,7 +843,7 @@ mod tests {
     /// A creditors-account line with its journal type: "9" for a purchase
     /// document, "0" for a bank line.
     fn typed(kind: &str, mut t: GlTransactionWithContact) -> GlTransactionWithContact {
-        t.transaction_type = kind.into();
+        t.transaction_type = TransactionType::from_code(kind);
         t
     }
 
