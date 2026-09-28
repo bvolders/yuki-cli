@@ -691,6 +691,12 @@ pub async fn unmatched(
     }
     let admin_id = target.admin_id;
     // The Accounting session works on the archive too, saving an Authenticate.
+    // It also carries SetCurrentDomain(target.domain_id), so the archive is
+    // searched in the target administration's domain, deliberately: the
+    // documents must belong to the administration whose bank lines are being
+    // checked. A fresh Archive session (as `documents` and `upload` use) would
+    // search the key's default domain instead, which differs for a key that
+    // reaches several domains.
     let session = accounting
         .session_id()
         .ok_or_else(|| YukiError::AuthFailed("no session after authenticating".into()))?;

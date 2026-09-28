@@ -279,7 +279,10 @@ period, so an invoice already paid cannot cover a later payment. A bank line
 booked straight to a GL account is skipped only when that account never has a
 document (`no_document_accounts`, default `65`: interest, bank costs `657xxx`,
 exchange differences); one booked straight to any other account, such as a
-`6xxxxx` expense, is reported. All of it can be tuned per administration:
+`6xxxxx` expense, is reported. The archive is searched in the administration's
+own domain (the session that ran `SetCurrentDomain`), whereas `documents` and
+`upload` use the API key's default domain. All of it can be tuned per
+administration:
 
 ```toml
 [administrations.example_bv]
