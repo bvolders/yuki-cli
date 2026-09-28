@@ -225,26 +225,72 @@ struct UnmatchedDebit {
     description: String,
 }
 
-/// Canonical cent string of an amount, e.g. `"-7.3"` -> `"-7.30"`.
-fn cents(amount: &str) -> Option<String> {
-    amount.trim().parse::<f64>().ok().map(|a| format!("{a:.2}"))
+/// An amount in whole cents, so amounts compare exactly and key maps directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Cents(i64);
+
+impl Cents {
+    const ZERO: Self = Self(0);
+
+    /// Parse an API amount such as `"-7.3"`, rounded to the cent.
+    fn parse(amount: &str) -> Option<Self> {
+        let value = amount
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|a| a.is_finite())?;
+        Some(Self((value * 100.0).round() as i64))
+    }
+
+    fn abs(self) -> Self {
+        Self(self.0.abs())
+    }
 }
 
-/// Key under which a bank debit and its ledger counter-entry meet.
-fn entry_key(date: &str, abs_amount: &str) -> String {
-    format!("{date}|{abs_amount}")
+impl std::ops::Neg for Cents {
+    type Output = Self;
+    fn neg(self) -> Self {
+        Self(-self.0)
+    }
+}
+
+impl std::iter::Sum for Cents {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        Self(iter.map(|c| c.0).sum())
+    }
+}
+
+impl std::fmt::Display for Cents {
+    /// Two decimals with a dot, as the API writes amounts: `-7.30`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign = if self.0 < 0 { "-" } else { "" };
+        let abs = self.0.unsigned_abs();
+        write!(f, "{sign}{}.{:02}", abs / 100, abs % 100)
+    }
+}
+
+/// Date and amount, under which a bank debit and its ledger counter-entry meet.
+type EntryKey = (String, Cents);
+
+fn entry_key(date: &str, amount: Cents) -> EntryKey {
+    (date.to_string(), amount)
 }
 
 /// A multiset of keys that each match at most once.
-#[derive(Default)]
-struct Pool(HashMap<String, usize>);
+struct Pool<K>(HashMap<K, usize>);
 
-impl Pool {
-    fn add(&mut self, key: String) {
+impl<K> Default for Pool<K> {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl<K: std::hash::Hash + Eq> Pool<K> {
+    fn add(&mut self, key: K) {
         *self.0.entry(key).or_insert(0) += 1;
     }
 
-    fn take(&mut self, key: &str) -> bool {
+    fn take(&mut self, key: &K) -> bool {
         match self.0.get_mut(key) {
             Some(c) if *c > 0 => {
                 *c -= 1;
@@ -277,8 +323,8 @@ impl CreditorLine {
     /// more (rounding, exchange rate), so it counts with the invoice rather
     /// than as a refund. Bank-type debits stay payments even with a document:
     /// Yuki links real payments (type `10`, "Betaling: Factuur van ...") too.
-    fn of(tx: &GlTransactionWithContact, amount: f64) -> Self {
-        let credit = amount < 0.0;
+    fn of(tx: &GlTransactionWithContact, amount: Cents) -> Self {
+        let credit = amount < Cents::ZERO;
         let document = !tx.file_name.trim().is_empty();
         match &tx.transaction_type {
             None if credit => Self::Invoice,
@@ -308,7 +354,7 @@ struct LedgerPayment {
 struct CreditorLedger {
     /// Supplier payments by date and amount ([`entry_key`]). Several payments
     /// can share a key, so every one is kept.
-    payments: HashMap<String, Vec<LedgerPayment>>,
+    payments: HashMap<EntryKey, Vec<LedgerPayment>>,
 }
 
 impl CreditorLedger {
@@ -319,7 +365,7 @@ impl CreditorLedger {
     /// amount, so among equal candidates this prefers the supplier the bank
     /// names, then a covered payment (leaving the uncovered one for another
     /// bank line), then the first in supplier-name order.
-    fn claim(&mut self, key: &str, hint: &str) -> Option<LedgerPayment> {
+    fn claim(&mut self, key: &EntryKey, hint: &str) -> Option<LedgerPayment> {
         let list = self.payments.get_mut(key)?;
         let hint = normalize_name(hint);
         let index = list
@@ -332,16 +378,16 @@ impl CreditorLedger {
 }
 
 /// Take up to `amount` from `invoices`, oldest first.
-fn consume_fifo(invoices: &mut Vec<(&str, f64)>, amount: f64) {
-    let mut due = amount;
+fn consume_fifo(invoices: &mut Vec<(&str, Cents)>, amount: Cents) {
+    let mut due = amount.0;
     invoices.retain_mut(|(_, open)| {
-        if due <= 0.005 {
+        if due <= 0 {
             return true;
         }
-        let used = open.min(due);
+        let used = open.0.min(due);
         due -= used;
-        *open -= used;
-        *open > 0.005
+        open.0 -= used;
+        open.0 > 0
     });
 }
 
@@ -362,15 +408,15 @@ fn match_creditor_ledger(
     entries: &[GlTransactionWithContact],
     period_start: &str,
 ) -> CreditorLedger {
-    let mut invoices: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
-    let mut credit_notes: Vec<(&str, f64)> = Vec::new();
-    let mut payments: Vec<(&GlTransactionWithContact, f64)> = Vec::new();
+    let mut invoices: HashMap<&str, Vec<(&str, Cents)>> = HashMap::new();
+    let mut credit_notes: Vec<(&str, Cents)> = Vec::new();
+    let mut payments: Vec<(&GlTransactionWithContact, Cents)> = Vec::new();
     for tx in entries {
-        let Ok(amount) = tx.amount.trim().parse::<f64>() else {
+        let Some(amount) = Cents::parse(&tx.amount) else {
             continue;
         };
         let contact = tx.contact_name.as_str();
-        if contact.is_empty() || is_gl_code(contact) || amount == 0.0 {
+        if contact.is_empty() || is_gl_code(contact) || amount == Cents::ZERO {
             continue;
         }
         match CreditorLine::of(tx, amount) {
@@ -387,10 +433,9 @@ fn match_creditor_ledger(
         list.sort_by(|a, b| a.0.cmp(b.0));
     }
 
-    let same = |a: f64, b: f64| (a - b).abs() < 0.005;
     for (contact, amount) in credit_notes {
         let list = invoices.entry(contact).or_default();
-        match list.iter().position(|(_, inv)| same(*inv, amount)) {
+        match list.iter().position(|(_, inv)| *inv == amount) {
             Some(i) => {
                 list.remove(i);
             }
@@ -404,16 +449,16 @@ fn match_creditor_ledger(
     let mut covered = vec![false; payments.len()];
     for (i, (tx, amount)) in payments.iter().enumerate() {
         let list = invoices.entry(tx.contact_name.as_str()).or_default();
-        if let Some(j) = list.iter().position(|(_, inv)| same(*inv, *amount)) {
+        if let Some(j) = list.iter().position(|(_, inv)| inv == amount) {
             list.remove(j);
             covered[i] = true;
             continue;
         }
-        let left: f64 = list.iter().map(|(_, inv)| inv).sum();
+        let left: Cents = list.iter().map(|(_, inv)| *inv).sum();
         if tx.date.as_str() < period_start {
             // Outside the period nothing is reported; it only uses up invoices.
             consume_fifo(list, *amount);
-        } else if left + 0.005 >= *amount {
+        } else if left >= *amount {
             consume_fifo(list, *amount);
             covered[i] = true;
         }
@@ -423,7 +468,7 @@ fn match_creditor_ledger(
     for ((tx, amount), covered) in payments.into_iter().zip(covered) {
         ledger
             .payments
-            .entry(entry_key(&tx.date, &format!("{amount:.2}")))
+            .entry(entry_key(&tx.date, amount))
             .or_default()
             .push(LedgerPayment {
                 contact: tx.contact_name.clone(),
@@ -461,29 +506,29 @@ fn find_unmatched(
 ) -> Vec<UnmatchedDebit> {
     let mut transfers = Pool::default();
     for tx in transfer_entries {
-        if let Some(a) = cents(&tx.amount).filter(|a| !a.starts_with('-')) {
-            transfers.add(entry_key(&tx.date, &a));
+        if let Some(a) = Cents::parse(&tx.amount).filter(|a| *a >= Cents::ZERO) {
+            transfers.add(entry_key(&tx.date, a));
         }
     }
     // Credits on the other scanned bank accounts are own transfers too.
     let mut bank_credits = Pool::default();
     for (account, txs) in banks {
         for tx in txs {
-            if let Some(a) = cents(&tx.amount).filter(|a| !a.starts_with('-') && a != "0.00") {
-                bank_credits.add(format!("{account}|{}", entry_key(&tx.date, &a)));
+            if let Some(a) = Cents::parse(&tx.amount).filter(|a| *a > Cents::ZERO) {
+                bank_credits.add((account.as_str(), entry_key(&tx.date, a)));
             }
         }
     }
     let mut creditor_pool = Pool::default();
     for item in creditor_items {
-        creditor_pool.add(item.open_amount.trim().to_string());
+        if let Some(open) = Cents::parse(&item.open_amount) {
+            creditor_pool.add(open);
+        }
     }
     let mut archive_pool = Pool::default();
     for doc in archive_docs {
-        if let Ok(amt) = doc.amount.trim().parse::<f64>()
-            && amt > 0.0
-        {
-            archive_pool.add(format!("{amt:.2}"));
+        if let Some(amount) = Cents::parse(&doc.amount).filter(|a| *a > Cents::ZERO) {
+            archive_pool.add(amount);
         }
     }
     // Normalized archive contact names catch batched or split charges where the
@@ -503,13 +548,12 @@ fn find_unmatched(
     let mut unmatched = Vec::new();
     for (account, txs) in banks {
         for tx in txs {
-            let amount: f64 = tx.amount.trim().parse().unwrap_or(0.0);
-            if amount >= 0.0 {
-                // Only debits (payments out) are relevant.
+            // Only debits (payments out) are relevant.
+            let Some(amount) = Cents::parse(&tx.amount).filter(|a| *a < Cents::ZERO) else {
                 continue;
-            }
-            let abs_amount = format!("{:.2}", amount.abs());
-            let key = entry_key(&tx.date, &abs_amount);
+            };
+            let abs_amount = amount.abs();
+            let key = entry_key(&tx.date, abs_amount);
 
             // The supplier the bank names: the API contact when it is a name,
             // else the description. Picks among equal ledger payments.
@@ -523,9 +567,9 @@ fn find_unmatched(
             if ledger_payment.as_ref().is_some_and(|p| p.covered) || transfers.take(&key) {
                 continue;
             }
-            let own_transfer = banks
-                .iter()
-                .any(|(other, _)| other != account && bank_credits.take(&format!("{other}|{key}")));
+            let own_transfer = banks.iter().any(|(other, _)| {
+                other != account && bank_credits.take(&(other.as_str(), key.clone()))
+            });
             if own_transfer {
                 continue;
             }
@@ -577,7 +621,7 @@ fn find_unmatched(
                 bank_account: account.clone(),
                 id: tx.id.clone(),
                 date: tx.date.clone(),
-                amount: format!("-{abs_amount}"),
+                amount: amount.to_string(),
                 counterparty,
                 description: tx.description.clone(),
             });
@@ -905,10 +949,24 @@ mod tests {
         }
     }
 
+    fn key(date: &str, amount: &str) -> EntryKey {
+        entry_key(date, Cents::parse(amount).unwrap())
+    }
+
+    #[test]
+    fn cents_parse_and_print_like_the_api() {
+        assert_eq!(Cents::parse(" -7.3 "), Some(Cents(-730)));
+        assert_eq!(Cents::parse("144.25"), Some(Cents(14425)));
+        assert_eq!(Cents::parse("x"), None);
+        assert_eq!(Cents(-730).to_string(), "-7.30");
+        assert_eq!(Cents(5).to_string(), "0.05");
+        assert_eq!(Cents(-5).to_string(), "-0.05");
+    }
+
     /// Whether the ledger shows the payment of `amount` on `date` as covered.
     fn covered(ledger: &mut CreditorLedger, date: &str, amount: &str) -> bool {
         ledger
-            .claim(&entry_key(date, amount), "")
+            .claim(&key(date, amount), "")
             .is_some_and(|p| p.covered)
     }
 
@@ -1002,7 +1060,7 @@ mod tests {
         let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
         assert!(covered(&mut ledger, "2026-07-02", "50.00"));
         assert!(covered(&mut ledger, "2026-07-05", "25.00"));
-        let open = ledger.claim(&entry_key("2026-07-06", "30.00"), "").unwrap();
+        let open = ledger.claim(&key("2026-07-06", "30.00"), "").unwrap();
         assert!(!open.covered);
         assert_eq!(open.contact, "Supplier C");
     }
@@ -1326,14 +1384,10 @@ mod tests {
         ];
         let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
         assert!(covered(&mut ledger, "2026-07-03", "70.00"));
-        let p2 = ledger.claim(&entry_key("2026-07-08", "40.00"), "").unwrap();
+        let p2 = ledger.claim(&key("2026-07-08", "40.00"), "").unwrap();
         assert!(!p2.covered);
         assert_eq!(p2.contact, "Supplier C");
-        assert!(
-            ledger
-                .claim(&entry_key("2026-07-08", "40.00"), "")
-                .is_none()
-        );
+        assert!(ledger.claim(&key("2026-07-08", "40.00"), "").is_none());
     }
 
     #[test]
