@@ -7,10 +7,29 @@ use yuki_client::client::sales::SalesClient;
 use yuki_client::client::vat::VatClient;
 
 #[test]
-fn region_defaults_to_the_netherlands() {
+fn an_unspecified_region_falls_back_to_the_netherlands() {
+    // Legacy fallback for callers and configurations that predate regions.
     assert_eq!(Region::default(), Region::Nl);
     assert_eq!(Region::Nl.api_root(), "https://api.yukiworks.nl/ws");
     assert_eq!(Region::Be.api_root(), "https://api.yukiworks.be/ws");
+}
+
+#[test]
+fn every_region_is_listed_once_and_describes_itself() {
+    let codes: Vec<&str> = Region::ALL.iter().map(|r| r.as_str()).collect();
+    assert_eq!(codes, ["nl", "be"]);
+    for region in Region::ALL {
+        assert_eq!(region.as_str().parse::<Region>(), Ok(region));
+        assert_eq!(Region::from_api_root(region.api_root()), Some(region));
+        assert_eq!(
+            region.api_root(),
+            format!("https://{}/ws", region.host()),
+            "{region}"
+        );
+    }
+    assert_eq!(Region::Be.host(), "api.yukiworks.be");
+    assert_eq!(Region::Be.country(), "Belgium");
+    assert_eq!(Region::Nl.country(), "Netherlands");
 }
 
 #[test]

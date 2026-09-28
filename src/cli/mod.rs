@@ -59,13 +59,14 @@ pub struct Cli {
     #[arg(long = "yes", short = 'y', global = true)]
     pub yes: bool,
 
-    /// Yuki deployment: nl (api.yukiworks.nl, default) or be (api.yukiworks.be).
-    /// Overrides the configured region for this run; `yuki init` stores it.
-    /// YUKI_REGION does the same when the flag is absent, but is never stored.
+    /// Yuki deployment, e.g. be (api.yukiworks.be) or nl (api.yukiworks.nl).
+    /// `yuki init` detects it from the key when omitted, and stores it.
+    /// Overrides the configured region for this run. YUKI_REGION does the
+    /// same when the flag is absent, but is never stored.
     #[arg(
         long,
         global = true,
-        value_parser = PossibleValuesParser::new(REGIONS)
+        value_parser = PossibleValuesParser::new(Region::codes())
             .map(|s| s.parse::<Region>().expect("validated by PossibleValuesParser")),
     )]
     pub region: Option<Region>,
@@ -78,9 +79,6 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 }
-
-/// Values `--region` and `YUKI_REGION` accept.
-const REGIONS: [&str; 2] = ["nl", "be"];
 
 /// The endpoint requested for this run, before the configuration is consulted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,17 +121,15 @@ impl Cli {
         let region = match self.region {
             Some(region) => Some(region),
             None => match var("YUKI_REGION")? {
-                Some(value) if REGIONS.contains(&value.as_str()) => {
-                    Some(value.parse().expect("REGIONS holds only parseable regions"))
-                }
-                Some(value) => {
-                    return Err(Self::command().error(
+                Some(value) => Some(Region::from_code(&value).ok_or_else(|| {
+                    Self::command().error(
                         clap::error::ErrorKind::InvalidValue,
                         format!(
-                            "invalid value '{value}' for YUKI_REGION [possible values: nl, be]"
+                            "invalid value '{value}' for YUKI_REGION [possible values: {}]",
+                            Region::codes().join(", ")
                         ),
-                    ));
-                }
+                    )
+                })?),
                 None => None,
             },
         };
@@ -149,6 +145,9 @@ impl Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Initialize yuki configuration for this machine.
+    ///
+    /// The key's region is detected by trying it on every known Yuki host,
+    /// unless --region or --base-url is given, and recorded in the config.
     Init {
         /// API key (skips interactive prompt if provided).
         #[arg(long)]

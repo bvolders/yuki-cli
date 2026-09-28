@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use crate::client::Region;
+
 pub fn generate() -> Value {
     let mut schema = json!({
         "clispec": "0.3",
@@ -34,8 +36,8 @@ pub fn generate() -> Value {
             {
                 "name": "--region",
                 "type": "string",
-                "description": "Yuki deployment (env: YUKI_REGION). Overrides the configured region for this run; init stores it only when passed as a flag.",
-                "enum": ["nl", "be"]
+                "description": "Yuki deployment (env: YUKI_REGION). init detects it from the key when omitted and stores it; otherwise it overrides the configured region for this run, and init stores it only when passed as a flag.",
+                "enum": Region::codes()
             },
             {
                 "name": "--base-url",
@@ -408,7 +410,7 @@ pub fn generate() -> Value {
             },
             {
                 "name": "init",
-                "description": "Initialize yuki configuration for this machine. An access key reaches only the administrations it was created inside, so a second administration needs its own key added with --add.",
+                "description": "Initialize yuki configuration for this machine. The key's region is detected by trying it on every known Yuki host, unless --region or --base-url is given, and recorded. An access key reaches only the administrations it was created inside, so a second administration needs its own key added with --add.",
                 "mutating": true,
                 "args": [
                     {"name": "--api-key", "type": "string", "required": false, "description": "API key (skips interactive prompt if provided)."},
