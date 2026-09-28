@@ -235,6 +235,7 @@ pub fn config_show(config: &Config, format: Option<&str>, quiet: bool) {
                     "domain_id": entry.domain_id,
                     "configured": !api_key.is_empty(),
                     "credential_source": credential_source,
+                    "api_root": config.api_root(Some(entry)),
                 }),
             )
         })
@@ -280,8 +281,9 @@ pub async fn doctor(
             "no API key for administration profile {name}; run 'yuki auth login'"
         )));
     }
+    let api_root = config.api_root(Some(entry));
     if !offline {
-        let mut client = AccountingClient::new();
+        let mut client = AccountingClient::new().with_api_root(api_root);
         client.authenticate(api_key).await?;
         client.set_current_domain(&entry.domain_id).await?;
     }
@@ -289,10 +291,11 @@ pub async fn doctor(
         {"name": "configuration", "ok": true, "detail": Config::default_path()},
         {"name": "profile", "ok": true, "detail": name},
         {"name": "credentials", "ok": true, "detail": credential_source},
+        {"name": "endpoint", "ok": true, "detail": api_root},
         {"name": "authentication", "ok": true, "detail": if offline { "network check skipped" } else { "Yuki session and administration verified" }},
     ]);
     let human = format!(
-        "Yuki connection{}\n  ✓ configuration\n  ✓ profile         {name}\n  ✓ credentials     {credential_source}\n  ✓ authentication  {}",
+        "Yuki connection{}\n  ✓ configuration\n  ✓ profile         {name}\n  ✓ credentials     {credential_source}\n  ✓ endpoint        {api_root}\n  ✓ authentication  {}",
         if offline { " (offline)" } else { "" },
         if offline {
             "network check skipped"

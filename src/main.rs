@@ -3,13 +3,13 @@ use std::process;
 
 use clap::{CommandFactory, Parser};
 use owo_colors::OwoColorize;
-use yuki_cli::cli::Cli;
 use yuki_cli::cli::Commands;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
-    DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, UploadCommands,
-    VatCommands,
+    DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, SalesCommands,
+    UploadCommands, VatCommands,
 };
+use yuki_cli::cli::{Cli, RunEndpoint};
 use yuki_cli::config::Config;
 use yuki_cli::error::YukiError;
 use yuki_cli::output::{ListOptions, format_error_json, is_tty};
@@ -66,26 +66,29 @@ impl AppError {
     }
 }
 
+/// Print a usage error the way clap does, plus the structured envelope, and exit.
+fn exit_with_usage_error(e: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    // Help and version are informational exits, not errors.
+    // Print them normally and exit without an error envelope.
+    if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        let _ = e.print();
+        process::exit(0);
+    }
+    // Print clap's formatted error message to stderr, then the structured envelope.
+    eprintln!("{e}");
+    eprintln!("{}", format_error_json(&e.to_string(), "error"));
+    process::exit(e.exit_code());
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(e) => {
-            use clap::error::ErrorKind;
-            // Help and version are informational exits, not errors.
-            // Print them normally and exit without an error envelope.
-            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
-                let _ = e.print();
-                process::exit(0);
-            }
-            // Print clap's formatted error message to stderr, then the structured envelope.
-            eprintln!("{e}");
-            eprintln!("{}", format_error_json(&e.to_string(), "error"));
-            process::exit(e.exit_code());
-        }
-    };
+    let cli = Cli::try_parse().unwrap_or_else(|e| exit_with_usage_error(e));
+    let endpoint = cli
+        .run_endpoint()
+        .unwrap_or_else(|e| exit_with_usage_error(e));
 
-    if let Err(err) = run(cli).await {
+    if let Err(err) = run(cli, endpoint).await {
         let code = err.exit_code();
         let kind = err.kind();
         // On TTY: print a human-friendly prefix first, then the structured error.
@@ -98,8 +101,16 @@ async fn main() {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), AppError> {
+async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
     let format = cli.output.as_deref();
+    let RunEndpoint { region, base_url } = endpoint;
+    // Only a typed --region is ever persisted; YUKI_REGION is for this run.
+    let region_flag = cli.region;
+    let load = || -> Result<Config, YukiError> {
+        let mut config = Config::load()?;
+        config.override_endpoint(region, base_url.as_deref());
+        Ok(config)
+    };
 
     match cli.command {
         Commands::Init {
@@ -111,6 +122,9 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 api_key.as_deref(),
                 default_admin.as_deref().or(cli.admin.as_deref()),
                 add,
+                region,
+                region_flag,
+                base_url.as_deref(),
             )
             .await?;
         }
@@ -125,11 +139,14 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     api_key.as_deref(),
                     default_admin.as_deref().or(cli.admin.as_deref()),
                     add,
+                    region,
+                    region_flag,
+                    base_url.as_deref(),
                 )
                 .await?;
             }
             AuthCommands::Status { offline } => {
-                let config = Config::load()?;
+                let config = load()?;
                 yuki_cli::cli::account::auth_status(
                     &config,
                     cli.admin.as_deref(),
@@ -140,7 +157,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 .await?;
             }
             AuthCommands::Logout => {
-                let mut config = Config::load()?;
+                let mut config = load()?;
                 yuki_cli::cli::account::auth_logout(
                     &mut config,
                     cli.admin.as_deref(),
@@ -151,7 +168,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         },
 
         Commands::Profile { command } => {
-            let mut config = Config::load()?;
+            let mut config = load()?;
             match command {
                 ProfileCommands::List => {
                     yuki_cli::cli::account::profile_list(&config, format, cli.quiet);
@@ -172,7 +189,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 
         Commands::Config { command } => match command {
             ConfigCommands::Show => {
-                let config = Config::load()?;
+                let config = load()?;
                 yuki_cli::cli::account::config_show(&config, format, cli.quiet);
             }
             ConfigCommands::Path => {
@@ -181,7 +198,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         },
 
         Commands::Doctor { offline } => {
-            let config = Config::load()?;
+            let config = load()?;
             yuki_cli::cli::account::doctor(
                 &config,
                 cli.admin.as_deref(),
@@ -193,7 +210,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Admin { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             match command {
                 AdminCommands::List {
                     local,
@@ -221,7 +238,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Vat { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 VatCommands::Returns { year } => {
@@ -234,7 +251,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Contacts { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 ContactCommands::Search { query } => {
@@ -263,7 +280,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Accounts { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 AccountCommands::Balance { account, period } => {
@@ -312,7 +329,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Projects { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 ProjectCommands::List => {
@@ -337,7 +354,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Invoices { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 InvoiceCommands::List {
@@ -361,8 +378,20 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     )
                     .await?;
                 }
-                InvoiceCommands::Show { id } => {
-                    yuki_cli::cli::invoices::show(&config, admin, &id, format).await?;
+                InvoiceCommands::Show {
+                    id,
+                    account,
+                    period,
+                } => {
+                    yuki_cli::cli::invoices::show(
+                        &config,
+                        admin,
+                        &id,
+                        &account,
+                        period.as_deref(),
+                        format,
+                    )
+                    .await?;
                 }
                 InvoiceCommands::Document { id } => {
                     yuki_cli::cli::invoices::document(&config, admin, &id, format).await?;
@@ -370,8 +399,32 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             }
         }
 
-        Commands::Documents { command } => {
+        Commands::Sales { command } => {
             let config = Config::load()?;
+            let admin = cli.admin.as_deref();
+            match command {
+                SalesCommands::Items {
+                    limit,
+                    offset,
+                    fields,
+                } => {
+                    yuki_cli::cli::sales::items(
+                        &config,
+                        admin,
+                        format,
+                        ListOptions {
+                            limit,
+                            offset,
+                            fields: fields.as_deref(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        Commands::Documents { command } => {
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 DocumentCommands::List {
@@ -417,7 +470,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Check { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 CheckCommands::Btw { period } => {
@@ -459,7 +512,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 
         Commands::Capabilities => {
             let value = serde_json::json!({
-                "areas": ["administrations", "vat", "contacts", "accounts", "projects", "invoices", "documents", "checks", "uploads"],
+                "areas": ["administrations", "vat", "contacts", "accounts", "projects", "invoices", "sales", "documents", "checks", "uploads"],
                 "structured_output": true,
                 "daily_api_limit": 1000
             });
@@ -473,13 +526,13 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 );
             } else {
                 println!(
-                    "API areas: administrations, VAT, contacts, accounts, projects, invoices, documents, checks, uploads\nDaily API limit: 1000"
+                    "API areas: administrations, VAT, contacts, accounts, projects, invoices, sales, documents, checks, uploads\nDaily API limit: 1000"
                 );
             }
         }
 
         Commands::Upload { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 UploadCommands::File {

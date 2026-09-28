@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::client::Region;
 use crate::error::YukiError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +26,53 @@ pub struct AdminEntry {
     /// `api_key` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+
+    /// Yuki deployment this administration lives on. Recorded by
+    /// `yuki init --add` (detected from the key, or `--region`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<Region>,
+
+    /// Bank GL accounts `check unmatched` scans when `--bank-account` is not
+    /// given, e.g. `["550002", "550003"]`. Empty means the region default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bank_accounts: Vec<String>,
+
+    /// Creditors control accounts (e.g. `440000`) `check unmatched` reads to
+    /// learn who a bank payment went to and whether a purchase invoice of that
+    /// supplier covers it. Absent means the region default; empty turns it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creditor_accounts: Option<Vec<String>>,
+
+    /// Internal-transfer accounts (e.g. `580000`): a bank debit with a same-day,
+    /// same-amount counter-entry here needs no invoice. Absent means the region
+    /// default; empty turns it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_accounts: Option<Vec<String>>,
+
+    /// Description patterns (case-insensitive substrings of the full bank
+    /// description, which includes the bank's transaction type) that
+    /// `check unmatched` skips: loans, salaries, tax payments and the like.
+    /// Absent means the region default; an empty list switches it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmatched_ignore_descriptions: Option<Vec<String>>,
+
+    /// GL account prefixes (e.g. `657` for bank costs) that never come with a
+    /// document: a bank line booked straight to one needs no invoice, so
+    /// `check unmatched` skips it. A line booked straight to any other account
+    /// is reported. Absent means the region default (be: `65`, financial
+    /// charges); an empty list reports every GL-booked line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_document_accounts: Option<Vec<String>>,
+    /// API root for a deployment outside the known regions, recorded by
+    /// `yuki init --add` when the key was verified against a URL the user gave.
+    /// Beats the administration's `region`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// Per-administration settings this build does not know about, kept
+    /// verbatim so an older or newer `yuki` never drops them on save.
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 impl AdminEntry {
@@ -34,6 +82,14 @@ impl AdminEntry {
             admin_id: admin_id.into(),
             name: None,
             api_key: None,
+            region: None,
+            bank_accounts: Vec::new(),
+            creditor_accounts: None,
+            transfer_accounts: None,
+            unmatched_ignore_descriptions: None,
+            no_document_accounts: None,
+            base_url: None,
+            extra: toml::Table::new(),
         }
     }
 
@@ -47,6 +103,25 @@ impl AdminEntry {
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self
+    }
+
+    /// Fold a freshly discovered entry for the same administration into this one.
+    ///
+    /// Discovery only knows identifiers, the display name and (for `--add`) the
+    /// key and the endpoint it was found on; everything else the user
+    /// configured survives. An endpoint, when known, replaces both the stored
+    /// region and URL, so a stale one of the two cannot win over it.
+    pub fn refresh(&mut self, discovered: AdminEntry) {
+        self.domain_id = discovered.domain_id;
+        self.admin_id = discovered.admin_id;
+        if discovered.name.is_some() {
+            self.name = discovered.name;
+        }
+        self.api_key = discovered.api_key;
+        if discovered.region.is_some() || discovered.base_url.is_some() {
+            self.region = discovered.region;
+            self.base_url = discovered.base_url;
+        }
     }
 }
 
@@ -63,12 +138,15 @@ pub struct Target<'a> {
     pub domain_id: &'a str,
     pub admin_id: &'a str,
     pub api_key: &'a str,
+    /// API root the key is valid on, e.g. `https://api.yukiworks.be/ws`.
+    pub api_root: &'a str,
 }
 
 /// A distinct access key, with the administrations configured to use it.
 #[derive(Debug, Clone)]
 pub struct AccessKey<'a> {
     pub api_key: &'a str,
+    pub api_root: &'a str,
     pub admins: Vec<&'a str>,
 }
 
@@ -82,6 +160,37 @@ pub struct Config {
     /// Matched case-insensitively as substrings against the counterparty name.
     #[serde(default)]
     pub unmatched_ignore: Vec<String>,
+    /// Yuki deployment for administrations that do not name their own.
+    /// `yuki init` records it, detected from the key or given as `--region`.
+    /// Absent only in configurations written before init recorded it; those
+    /// fall back to the Netherlands, the one host that existed then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<Region>,
+    /// Full API root (e.g. `https://api.yukiworks.be/ws`) that overrides every
+    /// region. An escape hatch for new deployments and local mocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Endpoint from `--region`/`--base-url` or `YUKI_REGION`/`YUKI_BASE_URL`.
+    /// Wins over everything in the file and is never written back to it.
+    #[serde(skip)]
+    pub endpoint_override: Option<EndpointOverride>,
+}
+
+/// A run-scoped endpoint: where to send requests and, when known, which
+/// country's conventions apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointOverride {
+    pub api_root: String,
+    /// The region given explicitly, or implied by a URL that is a known
+    /// deployment's root. `None` for a proxy or mock URL.
+    pub region: Option<Region>,
+}
+
+/// The resolved endpoint for one administration or key; see [`Config::endpoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Endpoint<'a> {
+    pub api_root: &'a str,
+    pub region: Region,
 }
 
 impl Config {
@@ -149,6 +258,73 @@ impl Config {
         }
     }
 
+    /// Apply `--region`/`--base-url` (or their environment variables) for this run.
+    /// A base URL beats a region for the endpoint; the region, when given, still
+    /// decides the country conventions.
+    pub fn override_endpoint(&mut self, region: Option<Region>, base_url: Option<&str>) {
+        let url = base_url.map(str::trim).filter(|u| !u.is_empty());
+        self.endpoint_override = match (url, region) {
+            (Some(url), region) => Some(EndpointOverride {
+                api_root: url.to_string(),
+                region: region.or_else(|| Region::from_api_root(url)),
+            }),
+            (None, Some(region)) => Some(EndpointOverride {
+                api_root: region.api_root().to_string(),
+                region: Some(region),
+            }),
+            (None, None) => None,
+        };
+    }
+
+    /// Where requests for `entry` (or the shared key, when `None`) go, and
+    /// which country's conventions (chart of accounts, bank formats) apply.
+    ///
+    /// Layers, highest first:
+    /// 1. the runtime override (`--base-url`/`--region` or their env vars), for
+    ///    every administration and every key alike;
+    /// 2. the administration's own `base_url`;
+    /// 3. the administration's own `region`;
+    /// 4. the top-level `base_url`;
+    /// 5. the top-level `region`;
+    /// 6. the Netherlands, as the legacy fallback for a configuration that
+    ///    predates recorded regions.
+    ///
+    /// The API root comes from the first layer present. The region comes from
+    /// the first layer that names one: a URL that is not a known deployment's
+    /// root (a proxy, a mock) says nothing about the country and is skipped.
+    /// A saved top-level `base_url` replaces the default endpoint only, so it
+    /// cannot pull an administration that names its own endpoint elsewhere.
+    pub fn endpoint<'a>(&'a self, entry: Option<&'a AdminEntry>) -> Endpoint<'a> {
+        let region_layer = |r: Region| (r.api_root(), Some(r));
+        let url_layer = |url: &'a str| (url, Region::from_api_root(url));
+        let layers = [
+            self.endpoint_override
+                .as_ref()
+                .map(|o| (o.api_root.as_str(), o.region)),
+            entry.and_then(|e| e.base_url.as_deref()).map(url_layer),
+            entry.and_then(|e| e.region).map(region_layer),
+            self.base_url.as_deref().map(url_layer),
+            self.region.map(region_layer),
+            Some(region_layer(Region::default())),
+        ];
+        let mut present = layers.into_iter().flatten();
+        let (api_root, region) = present.next().expect("the default layer is present");
+        let region = region
+            .or_else(|| present.find_map(|(_, region)| region))
+            .unwrap_or_default();
+        Endpoint { api_root, region }
+    }
+
+    /// API root for `entry`; see [`Config::endpoint`].
+    pub fn api_root<'a>(&'a self, entry: Option<&'a AdminEntry>) -> &'a str {
+        self.endpoint(entry).api_root
+    }
+
+    /// Region for `entry`; see [`Config::endpoint`].
+    pub fn region(&self, entry: Option<&AdminEntry>) -> Region {
+        self.endpoint(entry).region
+    }
+
     /// Resolve the administration a command should run against.
     ///
     /// Falls back to the shared `api_key` when the administration has no key of its
@@ -174,6 +350,7 @@ impl Config {
             domain_id: &entry.domain_id,
             admin_id: &entry.admin_id,
             api_key,
+            api_root: self.api_root(Some(entry)),
         })
     }
 
@@ -188,6 +365,7 @@ impl Config {
         if !self.api_key.is_empty() {
             keys.push(AccessKey {
                 api_key: &self.api_key,
+                api_root: self.api_root(None),
                 admins: Vec::new(),
             });
         }
@@ -201,6 +379,7 @@ impl Config {
                 Some(existing) => existing.admins.push(name.as_str()),
                 None => keys.push(AccessKey {
                     api_key,
+                    api_root: self.api_root(Some(entry)),
                     admins: vec![name.as_str()],
                 }),
             }
@@ -237,10 +416,15 @@ impl Config {
             if api_key != self.api_key {
                 entry.api_key = Some(api_key.to_string());
             }
-            if self.administrations.insert(name.clone(), entry).is_some() {
-                updated.push(name);
-            } else {
-                added.push(name);
+            match self.administrations.get_mut(&name) {
+                Some(existing) => {
+                    existing.refresh(entry);
+                    updated.push(name);
+                }
+                None => {
+                    self.administrations.insert(name.clone(), entry);
+                    added.push(name);
+                }
             }
         }
 

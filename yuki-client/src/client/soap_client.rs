@@ -4,7 +4,7 @@ use reqwest::Client;
 
 use crate::error::YukiError;
 
-use super::{local_name, unescape_text};
+use super::{ElementText, local_name, service_url};
 
 const YUKI_NS: &str = "http://www.theyukicompany.com/";
 const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -63,7 +63,7 @@ impl SoapEnvelope {
 /// HTTP transport client for the Yuki SOAP API.
 pub struct SoapClient {
     http: Client,
-    pub(super) base_url: String,
+    base_url: String,
     pub(super) session_id: Option<String>,
 }
 
@@ -92,6 +92,17 @@ impl SoapClient {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Point this transport at `service` (e.g. `Accounting.asmx`) under
+    /// `api_root`, such as `Region::Be.api_root()` or a local mock.
+    pub fn retarget(&mut self, api_root: &str, service: &str) {
+        self.base_url = service_url(api_root, service);
+    }
+
+    /// The endpoint this transport posts to.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Build the SOAPAction header value for a given operation.
@@ -164,9 +175,9 @@ impl SoapClient {
         }
 
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut inside_target = false;
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -178,25 +189,20 @@ impl SoapClient {
                         inside_target = true;
                     }
                 }
-                Ok(Event::Text(ref e)) if inside_target => {
-                    let text = unescape_text(e)
-                        .map_err(|e| YukiError::Xml(e.to_string()))?
-                        .trim()
-                        .to_string();
-                    if !text.is_empty() {
-                        return Ok(text);
-                    }
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
                     if local == result_tag {
                         inside_target = false;
+                        let text = content.take();
+                        if !text.is_empty() {
+                            return Ok(text);
+                        }
                     }
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(inside_target, event)?,
             }
             buf.clear();
         }
@@ -211,13 +217,13 @@ impl SoapClient {
     /// Returns `None` if no fault is present.
     pub fn parse_soap_fault(xml: &str) -> Option<YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut in_fault = false;
         let mut in_faultcode = false;
         let mut in_faultstring = false;
         let mut faultcode = String::new();
         let mut faultstring = String::new();
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -232,19 +238,18 @@ impl SoapClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if in_faultcode {
-                        faultcode = unescape_text(e).unwrap_or_default().trim().to_string();
-                    } else if in_faultstring {
-                        faultstring = unescape_text(e).unwrap_or_default().trim().to_string();
-                    }
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
                     match local {
-                        "faultcode" => in_faultcode = false,
-                        "faultstring" => in_faultstring = false,
+                        "faultcode" if in_faultcode => {
+                            in_faultcode = false;
+                            faultcode = content.take();
+                        }
+                        "faultstring" if in_faultstring => {
+                            in_faultstring = false;
+                            faultstring = content.take();
+                        }
                         "Fault" => {
                             if !faultstring.is_empty() {
                                 let msg_lower = faultstring.to_lowercase();
@@ -266,7 +271,7 @@ impl SoapClient {
                     }
                 }
                 Ok(Event::Eof) | Err(_) => break,
-                _ => {}
+                Ok(ref event) => content.push_lossy_if(in_faultcode || in_faultstring, event),
             }
             buf.clear();
         }

@@ -1,3 +1,4 @@
+use yuki_cli::client::Region;
 use yuki_cli::config::{AdminEntry, Config};
 
 /// Build a config from a shared key, a default administration, and entries.
@@ -14,6 +15,9 @@ fn config_with(
             .map(|(name, entry)| (name.to_string(), entry))
             .collect(),
         unmatched_ignore: Vec::new(),
+        region: None,
+        base_url: None,
+        endpoint_override: None,
     }
 }
 
@@ -360,6 +364,20 @@ fn merge_administrations_updates_in_place_when_the_name_is_the_same_administrati
 }
 
 #[test]
+fn merge_administrations_keeps_user_written_unmatched_settings() {
+    let mut existing = AdminEntry::new("uuid-a", "admin-a");
+    existing.bank_accounts = vec!["550002".into()];
+    existing.creditor_accounts = Some(Vec::new());
+    let mut config = config_with("key", "co_a", [("co_a", existing)]);
+
+    config.merge_administrations([("co_a", AdminEntry::new("uuid-a", "admin-a"))], "key");
+
+    let entry = &config.administrations["co_a"];
+    assert_eq!(entry.bank_accounts, ["550002"]);
+    assert_eq!(entry.creditor_accounts.as_deref(), Some(&[][..]));
+}
+
+#[test]
 fn merge_administrations_preserves_existing_entries() {
     // The defect this guards: `yuki init` replaced the whole map, so re-running it
     // with a second key dropped every administration the first key had reached.
@@ -473,4 +491,376 @@ admin_id = "admin-1"
 
     let config = Config::load_from(&path).unwrap();
     assert!(config.unmatched_ignore.is_empty());
+}
+
+#[test]
+fn loads_per_administration_unmatched_settings() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+api_key = "test-key"
+default_admin = "co"
+region = "be"
+
+[administrations.co]
+domain_id = "uuid-1"
+admin_id = "admin-1"
+bank_accounts = ["550002", "550003"]
+creditor_accounts = ["440000"]
+transfer_accounts = []
+unmatched_ignore_descriptions = ["Huur"]
+
+[administrations.other]
+domain_id = "uuid-2"
+admin_id = "admin-2"
+region = "nl"
+"#,
+    )
+    .unwrap();
+
+    let config = Config::load_from(&path).unwrap();
+    let co = &config.administrations["co"];
+    assert_eq!(co.bank_accounts, ["550002", "550003"]);
+    assert_eq!(
+        co.creditor_accounts.as_deref(),
+        Some(&["440000".to_string()][..])
+    );
+    assert_eq!(co.transfer_accounts.as_deref(), Some(&[][..]));
+    assert_eq!(
+        co.unmatched_ignore_descriptions.as_deref(),
+        Some(&["Huur".to_string()][..])
+    );
+    assert_eq!(config.region(Some(co)), Region::Be);
+
+    let other = &config.administrations["other"];
+    assert!(other.bank_accounts.is_empty());
+    assert!(other.creditor_accounts.is_none());
+    assert_eq!(config.region(Some(other)), Region::Nl);
+}
+
+#[test]
+fn a_legacy_config_without_region_falls_back_to_the_netherlands() {
+    let config = config_with("key", "a", [("a", AdminEntry::new("d", "x"))]);
+    let target = config.target(None).unwrap();
+    assert_eq!(target.api_root, "https://api.yukiworks.nl/ws");
+}
+
+#[test]
+fn loads_top_level_and_per_administration_regions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+api_key = "shared-key"
+default_admin = "brussels"
+region = "be"
+
+[administrations.brussels]
+domain_id = "d1"
+admin_id = "a1"
+
+[administrations.amsterdam]
+domain_id = "d2"
+admin_id = "a2"
+api_key = "nl-key"
+region = "nl"
+"#,
+    )
+    .unwrap();
+
+    let config = Config::load_from(&path).unwrap();
+    assert_eq!(config.region, Some(Region::Be));
+    assert_eq!(
+        config.target(Some("brussels")).unwrap().api_root,
+        "https://api.yukiworks.be/ws"
+    );
+    assert_eq!(
+        config.target(Some("amsterdam")).unwrap().api_root,
+        "https://api.yukiworks.nl/ws"
+    );
+
+    let keys = config.access_keys();
+    assert_eq!(keys[0].api_key, "shared-key");
+    assert_eq!(keys[0].api_root, "https://api.yukiworks.be/ws");
+    assert_eq!(keys[1].api_key, "nl-key");
+    assert_eq!(keys[1].api_root, "https://api.yukiworks.nl/ws");
+}
+
+#[test]
+fn rejects_an_unknown_region() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "api_key = \"k\"\ndefault_admin = \"a\"\nregion = \"de\"\n[administrations]\n",
+    )
+    .unwrap();
+
+    let err = Config::load_from(&path).unwrap_err().to_string();
+    assert!(err.contains("unknown region 'de'"), "{err}");
+}
+
+#[test]
+fn saved_base_url_beats_the_top_level_region_and_the_runtime_override_beats_both() {
+    let mut config = config_with("key", "a", [("a", AdminEntry::new("d", "x"))]);
+    config.region = Some(Region::Nl);
+    config.base_url = Some("http://file.example/ws".into());
+    assert_eq!(
+        config.target(None).unwrap().api_root,
+        "http://file.example/ws"
+    );
+
+    config.override_endpoint(Some(Region::Be), None);
+    assert_eq!(
+        config.target(None).unwrap().api_root,
+        "https://api.yukiworks.be/ws"
+    );
+
+    config.override_endpoint(Some(Region::Nl), Some("http://127.0.0.1:1/ws"));
+    assert_eq!(
+        config.target(None).unwrap().api_root,
+        "http://127.0.0.1:1/ws"
+    );
+}
+
+#[test]
+fn neither_region_nor_override_is_written_for_a_dutch_config() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = config_with("key", "a", [("a", AdminEntry::new("d", "x"))]);
+    config.override_endpoint(Some(Region::Be), Some("http://127.0.0.1:1/ws"));
+    config.save_to(&path).unwrap();
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("region"), "{saved}");
+    assert!(!saved.contains("base_url"), "{saved}");
+    assert!(!saved.contains("127.0.0.1"), "{saved}");
+}
+
+#[test]
+fn region_roundtrips_through_save() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut entry = AdminEntry::new("d", "x");
+    entry.region = Some(Region::Nl);
+    let mut config = config_with("key", "a", [("a", entry)]);
+    config.region = Some(Region::Be);
+    config.save_to(&path).unwrap();
+
+    let loaded = Config::load_from(&path).unwrap();
+    assert_eq!(loaded.region, Some(Region::Be));
+    assert_eq!(loaded.administrations["a"].region, Some(Region::Nl));
+}
+
+#[test]
+fn a_per_administration_region_beats_a_saved_base_url() {
+    let mut be = AdminEntry::new("d-be", "x-be");
+    be.region = Some(Region::Be);
+    let mut config = config_with(
+        "key",
+        "nl",
+        [("nl", AdminEntry::new("d-nl", "x-nl")), ("be", be)],
+    );
+    config.base_url = Some("http://proxy.example/ws".into());
+
+    // The saved URL replaces the default endpoint only; an administration that
+    // names its own region keeps reaching that region's host.
+    assert_eq!(
+        config.target(Some("be")).unwrap().api_root,
+        "https://api.yukiworks.be/ws"
+    );
+    assert_eq!(
+        config.target(Some("nl")).unwrap().api_root,
+        "http://proxy.example/ws"
+    );
+}
+
+#[test]
+fn region_follows_the_runtime_override() {
+    let mut entry = AdminEntry::new("d", "x");
+    entry.region = Some(Region::Nl);
+    let mut config = config_with("key", "a", [("a", entry)]);
+    let entry = config.administrations["a"].clone();
+    assert_eq!(config.region(Some(&entry)), Region::Nl);
+
+    config.override_endpoint(Some(Region::Be), None);
+    assert_eq!(config.region(Some(&entry)), Region::Be);
+    assert_eq!(config.region(None), Region::Be);
+
+    // A base URL that is a known deployment's root implies that deployment.
+    let mut config = config_with("key", "a", [("a", entry.clone())]);
+    config.override_endpoint(None, Some("https://api.yukiworks.be/ws/"));
+    assert_eq!(config.region(Some(&entry)), Region::Be);
+
+    // An unknown URL (a mock, a proxy) says nothing about the country.
+    let mut config = config_with("key", "a", [("a", entry.clone())]);
+    config.override_endpoint(None, Some("http://127.0.0.1:1/ws"));
+    assert_eq!(config.region(Some(&entry)), Region::Nl);
+
+    // An explicit region wins over what the URL would imply.
+    let mut config = config_with("key", "a", [("a", entry.clone())]);
+    config.override_endpoint(Some(Region::Be), Some("http://127.0.0.1:1/ws"));
+    assert_eq!(config.region(Some(&entry)), Region::Be);
+    assert_eq!(
+        config.target(None).unwrap().api_root,
+        "http://127.0.0.1:1/ws"
+    );
+}
+
+#[test]
+fn a_runtime_override_reaches_every_access_key() {
+    let mut be = AdminEntry::new("d-be", "x-be").with_api_key("be-key");
+    be.region = Some(Region::Be);
+    let mut config = config_with(
+        "nl-key",
+        "nl",
+        [("nl", AdminEntry::new("d-nl", "x-nl")), ("be", be)],
+    );
+    let roots = |c: &Config| -> Vec<String> {
+        c.access_keys()
+            .iter()
+            .map(|k| k.api_root.to_string())
+            .collect()
+    };
+    assert_eq!(
+        roots(&config),
+        ["https://api.yukiworks.nl/ws", "https://api.yukiworks.be/ws"]
+    );
+
+    config.override_endpoint(Some(Region::Be), None);
+    assert_eq!(
+        roots(&config),
+        ["https://api.yukiworks.be/ws", "https://api.yukiworks.be/ws"]
+    );
+}
+
+#[test]
+fn unknown_per_administration_fields_survive_a_load_save_roundtrip() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+api_key = "k"
+default_admin = "a"
+
+[administrations.a]
+domain_id = "d"
+admin_id = "x"
+region = "be"
+bank_accounts = ["550002", "550003"]
+some_future_setting = { depth = 2 }
+"#,
+    )
+    .unwrap();
+
+    let config = Config::load_from(&path).unwrap();
+    config.save_to(&path).unwrap();
+
+    let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let a = &saved["administrations"]["a"];
+    assert_eq!(a["region"].as_str(), Some("be"));
+    assert_eq!(a["bank_accounts"].as_array().unwrap().len(), 2, "{saved}");
+    assert_eq!(a["some_future_setting"]["depth"].as_integer(), Some(2));
+}
+
+#[test]
+fn merge_administrations_keeps_the_settings_of_a_rediscovered_administration() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+api_key = "k"
+default_admin = "a"
+
+[administrations.a]
+domain_id = "d"
+admin_id = "x"
+name = "Old Name"
+region = "be"
+bank_accounts = ["550002"]
+creditor_accounts = []
+some_future_setting = true
+"#,
+    )
+    .unwrap();
+    let mut config = Config::load_from(&path).unwrap();
+
+    // Discovery knows nothing about per-administration settings.
+    let (_, updated) = config.merge_administrations(
+        [("a", AdminEntry::new("d2", "x").with_name("New Name"))],
+        "k",
+    );
+    assert_eq!(updated, ["a"]);
+    let a = &config.administrations["a"];
+    assert_eq!(a.domain_id, "d2");
+    assert_eq!(a.name.as_deref(), Some("New Name"));
+    assert_eq!(a.region, Some(Region::Be));
+    assert_eq!(a.bank_accounts, ["550002"]);
+    assert_eq!(a.creditor_accounts.as_deref(), Some(&[] as &[String]));
+    assert!(a.extra.contains_key("some_future_setting"));
+
+    // A region the caller states explicitly does replace the stored one.
+    let mut nl = AdminEntry::new("d2", "x");
+    nl.region = Some(Region::Nl);
+    config.merge_administrations([("a", nl)], "k");
+    assert_eq!(config.administrations["a"].region, Some(Region::Nl));
+}
+
+#[test]
+fn a_per_administration_base_url_beats_every_saved_setting_but_the_runtime_override() {
+    let mut other = AdminEntry::new("d-x", "x-x");
+    other.base_url = Some("https://api.yukiworks.example/ws".into());
+    // A stale region stamp must not pull it back onto a known host.
+    other.region = Some(Region::Be);
+    let mut config = config_with(
+        "key",
+        "nl",
+        [("nl", AdminEntry::new("d-nl", "x-nl")), ("other", other)],
+    );
+    config.region = Some(Region::Nl);
+    config.base_url = Some("http://proxy.example/ws".into());
+
+    assert_eq!(
+        config.target(Some("other")).unwrap().api_root,
+        "https://api.yukiworks.example/ws"
+    );
+    assert_eq!(
+        config.target(Some("nl")).unwrap().api_root,
+        "http://proxy.example/ws"
+    );
+
+    config.override_endpoint(None, Some("http://127.0.0.1:1/ws"));
+    assert_eq!(
+        config.target(Some("other")).unwrap().api_root,
+        "http://127.0.0.1:1/ws"
+    );
+}
+
+#[test]
+fn a_rediscovered_administration_takes_the_endpoint_it_was_found_on() {
+    let mut earlier = AdminEntry::new("d", "x");
+    earlier.base_url = Some("https://api.yukiworks.example/ws".into());
+    let mut config = config_with("k", "a", [("a", earlier)]);
+
+    // Found on a known region: the old URL goes, or it would still win.
+    let mut be = AdminEntry::new("d", "x");
+    be.region = Some(Region::Be);
+    config.merge_administrations([("a", be)], "k");
+    let a = &config.administrations["a"];
+    assert_eq!((a.region, a.base_url.as_deref()), (Some(Region::Be), None));
+
+    // Found on another URL: the region stamp goes.
+    let mut url = AdminEntry::new("d", "x");
+    url.base_url = Some("https://api.yukiworks.example/ws".into());
+    config.merge_administrations([("a", url)], "k");
+    let a = &config.administrations["a"];
+    assert_eq!(
+        (a.region, a.base_url.as_deref()),
+        (None, Some("https://api.yukiworks.example/ws"))
+    );
 }

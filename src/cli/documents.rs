@@ -22,7 +22,7 @@ pub async fn list(
     opts: ListOptions<'_>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = ArchiveClient::new();
+    let mut client = ArchiveClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
 
     // Offset and limit are pushed into the API request, so no client-side slicing.
@@ -96,7 +96,7 @@ pub async fn search(
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = ArchiveClient::new();
+    let mut client = ArchiveClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
 
     // Use current year as default search range when no date is specified.
@@ -151,7 +151,7 @@ pub async fn exists(
     let (search_start, search_end, filter_start, filter_end) = date_range(date)?;
 
     let target = config.target(admin)?;
-    let mut client = ArchiveClient::new();
+    let mut client = ArchiveClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
 
     let search_text = contact.unwrap_or("");

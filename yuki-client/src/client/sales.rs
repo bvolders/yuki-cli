@@ -4,9 +4,9 @@ use quick_xml::events::Event;
 use crate::error::YukiError;
 
 use super::soap_client::{SoapClient, SoapEnvelope};
-use super::{local_name, unescape_text};
+use super::{ElementText, Region, local_name, service_url};
 
-const BASE_URL: &str = "https://api.yukiworks.nl/ws/Sales.asmx";
+const SERVICE: &str = "Sales.asmx";
 
 /// A Yuki sales item (product or service available for invoicing).
 #[derive(Debug, Clone)]
@@ -23,7 +23,7 @@ pub struct SalesClient {
 impl SalesClient {
     pub fn new() -> Self {
         Self {
-            soap: SoapClient::new(BASE_URL),
+            soap: SoapClient::new(&service_url(Region::default().api_root(), SERVICE)),
         }
     }
 
@@ -31,8 +31,24 @@ impl SalesClient {
     /// share a single pooled client across all service clients.
     pub fn with_client(http: reqwest::Client) -> Self {
         Self {
-            soap: SoapClient::with_client(BASE_URL, http),
+            soap: SoapClient::with_client(
+                &service_url(Region::default().api_root(), SERVICE),
+                http,
+            ),
         }
+    }
+
+    /// Target another Yuki deployment, e.g. `Region::Be.api_root()`, or any root
+    /// such as a local mock. The service path is appended to `api_root`.
+    #[must_use]
+    pub fn with_api_root(mut self, api_root: &str) -> Self {
+        self.soap.retarget(api_root, SERVICE);
+        self
+    }
+
+    /// The endpoint this client posts to.
+    pub fn base_url(&self) -> &str {
+        self.soap.base_url()
     }
 
     fn require_session(&self) -> Result<&str, YukiError> {
@@ -59,7 +75,6 @@ impl SalesClient {
     /// Each `SalesItem` element carries child elements `id` and `description`.
     pub fn parse_sales_items(xml: &str) -> Result<Vec<SalesItem>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut items = Vec::new();
         let mut in_item = false;
@@ -68,6 +83,7 @@ impl SalesClient {
             id: String::new(),
             description: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -88,24 +104,18 @@ impl SalesClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if let Some(ref f) = field {
-                        let text = unescape_text(e)
-                            .map_err(|e| YukiError::Xml(e.to_string()))?
-                            .trim()
-                            .to_string();
-                        match f.as_str() {
-                            "id" => current.id = text,
-                            "description" => current.description = text,
-                            _ => {}
-                        }
-                    }
-                }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "id" | "description" => {
-                            field = None;
+                            let text = content.take();
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "id" => current.id = text,
+                                    "description" => current.description = text,
+                                    _ => {}
+                                }
+                            }
                         }
                         "SalesItem" if in_item => {
                             items.push(current.clone());
@@ -116,7 +126,7 @@ impl SalesClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(field.is_some(), event)?,
             }
             buf.clear();
         }

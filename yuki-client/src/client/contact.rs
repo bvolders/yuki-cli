@@ -4,9 +4,9 @@ use quick_xml::events::Event;
 use crate::error::YukiError;
 
 use super::soap_client::{SoapClient, SoapEnvelope};
-use super::{local_name, unescape_text};
+use super::{ElementText, Region, local_name, service_url};
 
-const BASE_URL: &str = "https://api.yukiworks.nl/ws/Contact.asmx";
+const SERVICE: &str = "Contact.asmx";
 
 /// A Yuki contact (customer or supplier).
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ pub struct ContactClient {
 impl ContactClient {
     pub fn new() -> Self {
         Self {
-            soap: SoapClient::new(BASE_URL),
+            soap: SoapClient::new(&service_url(Region::default().api_root(), SERVICE)),
         }
     }
 
@@ -35,8 +35,24 @@ impl ContactClient {
     /// share a single pooled client across all service clients.
     pub fn with_client(http: reqwest::Client) -> Self {
         Self {
-            soap: SoapClient::with_client(BASE_URL, http),
+            soap: SoapClient::with_client(
+                &service_url(Region::default().api_root(), SERVICE),
+                http,
+            ),
         }
+    }
+
+    /// Target another Yuki deployment, e.g. `Region::Be.api_root()`, or any root
+    /// such as a local mock. The service path is appended to `api_root`.
+    #[must_use]
+    pub fn with_api_root(mut self, api_root: &str) -> Self {
+        self.soap.retarget(api_root, SERVICE);
+        self
+    }
+
+    /// The endpoint this client posts to.
+    pub fn base_url(&self) -> &str {
+        self.soap.base_url()
     }
 
     fn require_session(&self) -> Result<&str, YukiError> {
@@ -111,11 +127,10 @@ const CONTACT_PAGE_SIZE: usize = 100;
 /// The contact ID is an XML attribute; all other fields are child text nodes.
 pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut contacts = Vec::new();
     let mut in_contact = false;
-    let mut current_field = String::new();
+    let mut field: Option<String> = None;
     let mut contact = Contact {
         id: String::new(),
         name: String::new(),
@@ -124,6 +139,7 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
         is_supplier: false,
         is_customer: false,
     };
+    let mut content = ElementText::default();
     let mut buf = Vec::new();
 
     loop {
@@ -148,22 +164,8 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
                         }
                     }
                     "Type" | "Name" | "Country" | "IsSupplier" | "IsCustomer" if in_contact => {
-                        current_field = local;
+                        field = Some(local);
                     }
-                    _ => {}
-                }
-            }
-            Ok(Event::Text(ref e)) if in_contact && !current_field.is_empty() => {
-                let text = unescape_text(e)
-                    .map_err(|e| YukiError::Xml(e.to_string()))?
-                    .trim()
-                    .to_string();
-                match current_field.as_str() {
-                    "Type" => contact.contact_type = text,
-                    "Name" => contact.name = text,
-                    "Country" => contact.country = text,
-                    "IsSupplier" => contact.is_supplier = text.eq_ignore_ascii_case("true"),
-                    "IsCustomer" => contact.is_customer = text.eq_ignore_ascii_case("true"),
                     _ => {}
                 }
             }
@@ -172,7 +174,21 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
                 let local = local_name(name.as_ref());
                 match local {
                     "Type" | "Name" | "Country" | "IsSupplier" | "IsCustomer" => {
-                        current_field.clear();
+                        let text = content.take();
+                        if let Some(f) = field.take() {
+                            match f.as_str() {
+                                "Type" => contact.contact_type = text,
+                                "Name" => contact.name = text,
+                                "Country" => contact.country = text,
+                                "IsSupplier" => {
+                                    contact.is_supplier = text.eq_ignore_ascii_case("true")
+                                }
+                                "IsCustomer" => {
+                                    contact.is_customer = text.eq_ignore_ascii_case("true")
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     "Contact" => {
                         if !contact.id.is_empty() {
@@ -185,7 +201,7 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(YukiError::Xml(e.to_string())),
-            _ => {}
+            Ok(ref event) => content.push_if(field.is_some(), event)?,
         }
         buf.clear();
     }

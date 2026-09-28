@@ -55,6 +55,43 @@ pub fn parse_period(period: &str) -> Result<(String, String), YukiError> {
     Err(invalid())
 }
 
+/// First day of the month `months` before the month of `date` (`YYYY-MM-DD`),
+/// e.g. `month_start_before("2026-02-15", 3)` is `"2025-11-01"`.
+///
+/// An unparseable year or month falls back to 1970 and January.
+pub fn month_start_before(date: &str, months: i32) -> String {
+    let year: i32 = date.get(0..4).and_then(|y| y.parse().ok()).unwrap_or(1970);
+    let month: i32 = date.get(5..7).and_then(|m| m.parse().ok()).unwrap_or(1);
+    let total = year * 12 + (month - 1) - months;
+    format!("{:04}-{:02}-01", total / 12, total % 12 + 1)
+}
+
+/// Today's date (UTC) as `YYYY-MM-DD`.
+pub fn today() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    date_from_epoch_days((secs / 86_400) as i64)
+}
+
+/// Calendar date (`YYYY-MM-DD`) of a day count since 1970-01-01.
+///
+/// Howard Hinnant's `civil_from_days`, valid for the proleptic Gregorian calendar.
+pub fn date_from_epoch_days(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// Return the number of days in the given month of the given year.
 fn days_in_month(year: u32, month: u32) -> u32 {
     match month {

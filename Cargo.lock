@@ -2244,6 +2244,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "comfy-table",
+ "futures-util",
  "jsonschema",
  "owo-colors",
  "serde",
@@ -2260,6 +2261,7 @@ version = "0.2.1"
 dependencies = [
  "quick-xml",
  "reqwest",
+ "serde",
  "thiserror",
 ]
 
