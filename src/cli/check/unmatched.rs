@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures_util::future::try_join_all;
+
 use super::resolve_period;
 use crate::cli::setup_domain;
 use crate::client::Region;
@@ -633,7 +635,7 @@ fn find_unmatched(
 }
 
 /// Transactions with contact on each of `accounts` from `from` to `to`, one
-/// list per account in the same order; one API call per account.
+/// list per account in the same order; one API call per account, concurrently.
 async fn gl_entries(
     client: &AccountingClient,
     admin_id: &str,
@@ -641,15 +643,12 @@ async fn gl_entries(
     from: &str,
     to: &str,
 ) -> Result<Vec<Vec<GlTransactionWithContact>>, YukiError> {
-    let mut lists = Vec::with_capacity(accounts.len());
-    for account in accounts {
-        lists.push(
-            client
-                .gl_account_transactions_and_contact(admin_id, account, from, to)
-                .await?,
-        );
-    }
-    Ok(lists)
+    try_join_all(
+        accounts
+            .iter()
+            .map(|account| client.gl_account_transactions_and_contact(admin_id, account, from, to)),
+    )
+    .await
 }
 
 /// Find bank transactions on the bank GL account(s) that have no matching invoice.
@@ -685,28 +684,31 @@ pub async fn unmatched(
         eprintln!("Fetching booked invoices from archive...");
     }
     let admin_id = target.admin_id;
-    let bank_entries =
-        gl_entries(&accounting, admin_id, &setup.bank_accounts, &start, &end).await?;
-    let creditor_entries = gl_entries(
-        &accounting,
-        admin_id,
-        &setup.creditor_accounts,
-        &lookback,
-        &end,
-    )
-    .await?;
-    let transfer_entries = gl_entries(
-        &accounting,
-        admin_id,
-        &setup.transfer_accounts,
-        &start,
-        &end,
-    )
-    .await?;
-    let creditor_items = accounting.outstanding_creditor_items(admin_id).await?;
-    let mut archive = ArchiveClient::new().with_api_root(target.api_root);
-    archive.authenticate(target.api_key).await?;
-    let archive_docs = archive.search_documents("", &start, &end).await?;
+    // The requests are independent, so they run concurrently; results keep
+    // their order, so the output does not depend on timing.
+    let (bank_entries, creditor_entries, transfer_entries, creditor_items, archive_docs) = tokio::try_join!(
+        gl_entries(&accounting, admin_id, &setup.bank_accounts, &start, &end),
+        gl_entries(
+            &accounting,
+            admin_id,
+            &setup.creditor_accounts,
+            &lookback,
+            &end
+        ),
+        gl_entries(
+            &accounting,
+            admin_id,
+            &setup.transfer_accounts,
+            &start,
+            &end
+        ),
+        accounting.outstanding_creditor_items(admin_id),
+        async {
+            let mut archive = ArchiveClient::new().with_api_root(target.api_root);
+            archive.authenticate(target.api_key).await?;
+            archive.search_documents("", &start, &end).await
+        },
+    )?;
 
     if !quiet {
         // Authenticate + SetCurrentDomain, one call per GL account, the open
