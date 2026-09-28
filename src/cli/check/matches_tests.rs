@@ -6,7 +6,7 @@ use crate::client::accounting::TransactionType;
 const CODA_CARD: &str = "Kaarten : Betaling met debetkaart binnen eurozone | Netto \
     bedrag: 12,340 : | Debet ATM/POS - Gemaskeerde PAN of kaartnummer: 0000000000000000";
 const CODA_TRANSFER_TO_PERSON: &str = "Binnenlandse overschrijvingen - SEPA credit transfers : \
-    Enkelvoudige overschrijving | Netto bedrag: 180,000 : Overschrijving | JANSSENS-PEETERS";
+    Enkelvoudige overschrijving | Netto bedrag: 165,000 : Overschrijving | JANSSENS-PEETERS";
 
 fn tx(
     id: &str,
@@ -78,11 +78,11 @@ fn confidence_of(result: &Matches, invoice: usize) -> Option<Confidence> {
 
 #[test]
 fn exact_amount_supplier_and_close_date_is_high() {
-    let invoices = vec![invoice("Supplier A", "2026-04-27", "1363.99")];
+    let invoices = vec![invoice("Supplier A", "2026-04-24", "1240.50")];
     let payments = vec![payment(
         "p1",
-        "2026-04-02",
-        "1363.99",
+        "2026-03-30",
+        "1240.50",
         Some("Supplier A NV"),
     )];
     let result = suggest(&invoices, &payments);
@@ -104,10 +104,10 @@ fn exact_amount_and_supplier_far_apart_is_medium() {
 
 #[test]
 fn split_payments_of_the_supplier_summing_to_the_invoice_are_medium() {
-    let invoices = vec![invoice("Supplier B", "2026-08-29", "58.68")];
+    let invoices = vec![invoice("Supplier B", "2026-08-29", "58.85")];
     let payments = vec![
-        payment("p1", "2026-08-29", "19.46", Some("Supplier B")),
-        payment("p2", "2026-08-30", "39.22", Some("Supplier B")),
+        payment("p1", "2026-08-29", "21.30", Some("Supplier B")),
+        payment("p2", "2026-08-30", "37.55", Some("Supplier B")),
         payment("p3", "2026-08-30", "5.00", Some("Supplier B")),
     ];
     let result = suggest(&invoices, &payments);
@@ -119,8 +119,8 @@ fn split_payments_of_the_supplier_summing_to_the_invoice_are_medium() {
 
 #[test]
 fn anonymous_payment_of_the_same_amount_is_low() {
-    let invoices = vec![invoice("Supplier C", "2026-08-07", "63.50")];
-    let payments = vec![payment("p1", "2026-08-08", "63.50", None)];
+    let invoices = vec![invoice("Supplier C", "2026-08-07", "58.20")];
+    let payments = vec![payment("p1", "2026-08-08", "58.20", None)];
     assert_eq!(
         confidence_of(&suggest(&invoices, &payments), 0),
         Some(Confidence::Low)
@@ -129,11 +129,11 @@ fn anonymous_payment_of_the_same_amount_is_low() {
 
 #[test]
 fn a_payment_naming_another_party_is_no_candidate() {
-    let invoices = vec![invoice("Supplier D", "2026-06-26", "180.00")];
+    let invoices = vec![invoice("Supplier D", "2026-06-26", "165.00")];
     let payments = vec![payment(
         "p1",
         "2026-07-08",
-        "180.00",
+        "165.00",
         Some("Janssens-Peeters"),
     )];
     let result = suggest(&invoices, &payments);
@@ -145,10 +145,10 @@ fn a_payment_naming_another_party_is_no_candidate() {
 fn one_payment_settles_at_most_one_invoice() {
     // Two identical monthly invoices, one payment: the closer invoice gets it.
     let invoices = vec![
-        invoice("Supplier E", "2026-07-02", "27.52"),
-        invoice("Supplier E", "2026-08-02", "27.52"),
+        invoice("Supplier E", "2026-07-02", "26.40"),
+        invoice("Supplier E", "2026-08-02", "26.40"),
     ];
-    let payments = vec![payment("p1", "2026-08-03", "27.52", Some("Supplier E"))];
+    let payments = vec![payment("p1", "2026-08-03", "26.40", Some("Supplier E"))];
     let result = suggest(&invoices, &payments);
     assert_eq!(confidence_of(&result, 0), None);
     assert_eq!(confidence_of(&result, 1), Some(Confidence::High));
@@ -174,14 +174,14 @@ fn higher_confidence_wins_a_contested_payment() {
 
 #[test]
 fn an_invoice_without_any_payment_has_no_suggestion() {
-    let invoices = vec![invoice("Supplier H", "2026-04-09", "16.69")];
+    let invoices = vec![invoice("Supplier H", "2026-04-09", "15.80")];
     let result = suggest(&invoices, &[]);
     assert_eq!(confidence_of(&result, 0), None);
 }
 
 #[test]
 fn credit_notes_are_not_open_invoices() {
-    assert!(OpenInvoice::from_item(&item("Supplier I", "2025-11-06", "-209.00")).is_none());
+    assert!(OpenInvoice::from_item(&item("Supplier I", "2025-11-06", "-187.00")).is_none());
 }
 
 #[test]
@@ -217,17 +217,17 @@ fn open_invoices_do_not_cover_ledger_payments() {
     // A payment booked against the supplier but not linked to its invoice:
     // the invoice stays open, so it must not count as what the payment paid.
     let ledger = vec![
-        ledger_line("9", "i1", "2026-03-01", "-9.99", "Supplier T"),
-        ledger_line("0", "p1", "2026-03-01", "9.99", "Supplier T"),
-        ledger_line("9", "i2", "2026-07-01", "-9.99", "Supplier T"),
-        ledger_line("0", "p2", "2026-06-12", "9.99", "Supplier T"),
+        ledger_line("9", "i1", "2026-03-01", "-8.45", "Supplier T"),
+        ledger_line("0", "p1", "2026-03-01", "8.45", "Supplier T"),
+        ledger_line("9", "i2", "2026-07-01", "-8.45", "Supplier T"),
+        ledger_line("0", "p2", "2026-06-12", "8.45", "Supplier T"),
     ];
-    let open = vec![item("Supplier T", "2026-07-01", "9.99")];
+    let open = vec![item("Supplier T", "2026-07-01", "8.45")];
     let closed_only = without_open_invoices(&ledger, &open);
     assert_eq!(closed_only.len(), 3);
     let mut ledger = match_creditor_ledger(&closed_only, "2026-04-01");
     let p = ledger
-        .claim(&entry_key("2026-06-12", Cents(999)), "")
+        .claim(&entry_key("2026-06-12", Cents(845)), "")
         .unwrap();
     assert!(!p.covered, "the June payment paid no closed invoice");
     assert_eq!(p.id, "p2");
@@ -239,17 +239,17 @@ fn collect_payments_uses_ledger_suppliers_and_skips_what_is_explained() {
         "550000".to_string(),
         vec![
             // Paid a closed invoice: covered on the ledger, not a candidate.
-            tx("b1", "2026-06-01", "-9.99", CODA_CARD, ""),
+            tx("b1", "2026-06-01", "-8.45", CODA_CARD, ""),
             // Booked against the supplier, unlinked: candidate named by the ledger.
-            tx("b2", "2026-06-12", "-9.99", CODA_CARD, ""),
+            tx("b2", "2026-06-12", "-8.45", CODA_CARD, ""),
             // Anonymous card payment booked straight to a cost account.
-            tx("b3", "2026-06-15", "-63.50", CODA_CARD, "612000"),
+            tx("b3", "2026-06-15", "-58.20", CODA_CARD, "612000"),
             // Bank costs (class 65) never carry an invoice.
-            tx("b4", "2026-06-15", "-7.73", CODA_CARD, "657000"),
+            tx("b4", "2026-06-15", "-6.35", CODA_CARD, "657000"),
             // Own transfer to the transfer account.
             tx("b5", "2026-06-16", "-500.00", CODA_TRANSFER_TO_PERSON, ""),
             // A named transfer to a person, not on the ledger.
-            tx("b6", "2026-06-20", "-180.00", CODA_TRANSFER_TO_PERSON, ""),
+            tx("b6", "2026-06-20", "-165.00", CODA_TRANSFER_TO_PERSON, ""),
             // Before the window: ignored.
             tx("b7", "2026-01-10", "-1.00", CODA_CARD, ""),
             // A credit: ignored.
@@ -257,9 +257,9 @@ fn collect_payments_uses_ledger_suppliers_and_skips_what_is_explained() {
         ],
     )];
     let ledger_entries = vec![
-        ledger_line("9", "i1", "2026-05-31", "-9.99", "Supplier T"),
-        ledger_line("0", "l1", "2026-06-01", "9.99", "Supplier T"),
-        ledger_line("0", "l2", "2026-06-12", "9.99", "Supplier T"),
+        ledger_line("9", "i1", "2026-05-31", "-8.45", "Supplier T"),
+        ledger_line("0", "l1", "2026-06-01", "8.45", "Supplier T"),
+        ledger_line("0", "l2", "2026-06-12", "8.45", "Supplier T"),
         // Paid by card from an account that is not scanned.
         ledger_line("0", "l3", "2026-06-25", "30.00", "Supplier U"),
     ];
@@ -295,11 +295,11 @@ fn collect_payments_uses_ledger_suppliers_and_skips_what_is_explained() {
 #[test]
 fn rows_list_every_invoice_and_optionally_unallocated_payments() {
     let invoices = vec![
-        invoice("Supplier A", "2026-04-27", "1363.99"),
-        invoice("Supplier H", "2026-04-09", "16.69"),
+        invoice("Supplier A", "2026-04-24", "1240.50"),
+        invoice("Supplier H", "2026-04-09", "15.80"),
     ];
     let payments = vec![
-        payment("p1", "2026-04-02", "1363.99", Some("Supplier A")),
+        payment("p1", "2026-03-30", "1240.50", Some("Supplier A")),
         payment("p2", "2026-05-02", "12.00", Some("Supplier Z")),
     ];
     let result = suggest(&invoices, &payments);
@@ -330,20 +330,20 @@ fn rows_with(
 }
 
 /// A marketplace order paid in one card payment but invoiced per seller:
-/// 63.92 = 19.46 + 22.23 + 22.23 (all the marketplace itself, two identical
-/// amounts), and 76.97 = 59.98 (a third-party seller, invoiced the payment's
-/// day) + 16.99 (the marketplace).
+/// 69.60 = 21.30 + 24.15 + 24.15 (all the marketplace itself, two identical
+/// amounts), and 74.15 = 55.40 (a third-party seller, invoiced the payment's
+/// day) + 18.75 (the marketplace).
 fn marketplace() -> (Vec<OpenInvoice>, Vec<Payment>) {
     let invoices = vec![
-        invoice("Marketplace NV", "2026-08-29", "19.46"),
-        invoice("Seller X BV", "2026-08-29", "59.98"),
-        invoice("Marketplace NV", "2026-08-30", "16.99"),
-        invoice("Marketplace NV", "2026-08-30", "22.23"),
-        invoice("Marketplace NV", "2026-08-30", "22.23"),
+        invoice("Marketplace NV", "2026-08-29", "21.30"),
+        invoice("Seller X BV", "2026-08-29", "55.40"),
+        invoice("Marketplace NV", "2026-08-30", "18.75"),
+        invoice("Marketplace NV", "2026-08-30", "24.15"),
+        invoice("Marketplace NV", "2026-08-30", "24.15"),
     ];
     let payments = vec![
-        payment("b1", "2026-08-29", "76.97", Some("Marketplace.com")),
-        payment("b2", "2026-08-29", "63.92", Some("Marketplace.com")),
+        payment("b1", "2026-08-29", "74.15", Some("Marketplace.com")),
+        payment("b2", "2026-08-29", "69.60", Some("Marketplace.com")),
     ];
     (invoices, payments)
 }
@@ -392,9 +392,9 @@ fn invoices_are_only_added_up_close_to_the_payment() {
 
 #[test]
 fn a_foreign_invoice_matches_a_supplier_payment_within_the_fx_tolerance_as_medium() {
-    // USD 20 booked at 17.22, charged at 17.62: 2.3% off.
-    let invoices = vec![foreign_invoice("Hosting Inc", "2026-06-07", "17.22")];
-    let payments = vec![payment("p1", "2026-06-07", "17.62", Some("Hosting Inc"))];
+    // Booked at 16.40, charged at 16.80: 2.4% off.
+    let invoices = vec![foreign_invoice("Hosting Inc", "2026-06-07", "16.40")];
+    let payments = vec![payment("p1", "2026-06-07", "16.80", Some("Hosting Inc"))];
     let result = suggest(&invoices, &payments);
     let s = result.suggestions[0].as_ref().unwrap();
     assert_eq!(s.confidence, Confidence::Medium);
@@ -406,23 +406,23 @@ fn a_foreign_invoice_matches_a_supplier_payment_within_the_fx_tolerance_as_mediu
 
 #[test]
 fn the_fx_tolerance_is_three_percent_or_one_euro_whichever_is_larger() {
-    assert_eq!(fx_tolerance(Cents(1722)), Cents(100));
+    assert_eq!(fx_tolerance(Cents(1640)), Cents(100));
     assert_eq!(fx_tolerance(Cents(100_000)), Cents(3000));
-    let invoices = vec![foreign_invoice("Hosting Inc", "2026-06-07", "17.22")];
-    let too_far = vec![payment("p1", "2026-06-07", "18.23", Some("Hosting Inc"))];
+    let invoices = vec![foreign_invoice("Hosting Inc", "2026-06-07", "16.40")];
+    let too_far = vec![payment("p1", "2026-06-07", "17.41", Some("Hosting Inc"))];
     assert_eq!(confidence_of(&suggest(&invoices, &too_far), 0), None);
     // A nameless payment near a foreign amount is too weak to suggest.
-    let nameless = vec![payment("p1", "2026-06-07", "17.62", None)];
+    let nameless = vec![payment("p1", "2026-06-07", "16.80", None)];
     assert_eq!(confidence_of(&suggest(&invoices, &nameless), 0), None);
 }
 
 #[test]
 fn euro_invoices_stay_exact() {
-    let invoices = vec![invoice("Supplier A", "2026-06-07", "17.22")];
-    let payments = vec![payment("p1", "2026-06-07", "17.62", Some("Supplier A"))];
+    let invoices = vec![invoice("Supplier A", "2026-06-07", "16.40")];
+    let payments = vec![payment("p1", "2026-06-07", "16.80", Some("Supplier A"))];
     assert_eq!(confidence_of(&suggest(&invoices, &payments), 0), None);
     assert!(!invoices[0].fx);
-    let mut unknown = item("Supplier A", "2026-06-07", "17.22");
+    let mut unknown = item("Supplier A", "2026-06-07", "16.40");
     unknown.country = String::new();
     assert!(!OpenInvoice::from_item(&unknown).unwrap().fx);
 }
@@ -495,11 +495,11 @@ fn collect_payments_records_every_supplier_paid_from_the_bank() {
     // from the bank.
     let banks = vec![(
         "550000".to_string(),
-        vec![tx("b1", "2026-06-01", "-9.99", CODA_CARD, "")],
+        vec![tx("b1", "2026-06-01", "-8.45", CODA_CARD, "")],
     )];
     let ledger_entries = vec![
-        ledger_line("9", "i1", "2026-05-31", "-9.99", "Supplier T"),
-        ledger_line("0", "l1", "2026-06-01", "9.99", "Supplier T"),
+        ledger_line("9", "i1", "2026-05-31", "-8.45", "Supplier T"),
+        ledger_line("0", "l1", "2026-06-01", "8.45", "Supplier T"),
     ];
     let ledger = match_creditor_ledger(&ledger_entries, "2026-03-01");
     let collected = collect(

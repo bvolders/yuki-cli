@@ -1086,7 +1086,7 @@ mod tests {
         bedrag: 12,340 : | Debet ATM/POS - Gemaskeerde PAN of kaartnummer: 0000000000000000 - \
         Kaartschema: TEST - Terminalnummer: 000000 - Volgnummer verrichting: 000001 - Uur";
     const CODA_DIRECT_DEBIT: &str = "Domiciliëringen - Direct debit : Betaling | Netto bedrag: \
-        61,500 : | Europese domiciliëring - Datum: 01-07-26 - Type domiciliëring: recurrent";
+        58,400 : | Europese domiciliëring - Datum: 01-07-26 - Type domiciliëring: recurrent";
     const CODA_LOAN: &str = "Kredieten : Lening op korte termijn | Netto bedrag: 900,000 : \
         Kredieten - Lening op korte termijn (Netto bedrag) -- |\n| Afloss. kapitaal lening of \
         krediet: 880,000\n| Betaalde rente: 20,000 --";
@@ -1148,7 +1148,7 @@ mod tests {
     #[test]
     fn cents_parse_and_print_like_the_api() {
         assert_eq!(Cents::parse(" -7.3 "), Some(Cents(-730)));
-        assert_eq!(Cents::parse("144.25"), Some(Cents(14425)));
+        assert_eq!(Cents::parse("133.20"), Some(Cents(13320)));
         assert_eq!(Cents::parse("x"), None);
         assert_eq!(Cents(-730).to_string(), "-7.30");
         assert_eq!(Cents(5).to_string(), "0.05");
@@ -1381,7 +1381,7 @@ mod tests {
         let sepa = "/TRTP/SEPA/CNTP/NL00TEST0000000000/TESTNL2A/Foo Bar/REMI/x";
         let banks = vec![(
             "11001".to_string(),
-            vec![tx("by-name", "2025-03-03", "-9.99", sepa, "")],
+            vec![tx("by-name", "2025-03-03", "-8.95", sepa, "")],
         )];
         let found = find_unmatched(
             &banks,
@@ -1416,7 +1416,7 @@ mod tests {
                 tx(
                     "by-name",
                     "2025-03-03",
-                    "-9.99",
+                    "-8.95",
                     &sepa("Supplier C via Mollie"),
                     "",
                 ),
@@ -1577,11 +1577,11 @@ mod tests {
             ),
             typed(
                 "9",
-                tx("c1", "2025-12-05", "1.44", "Creditnota", "Supplier X"),
+                tx("c1", "2025-12-05", "1.37", "Creditnota", "Supplier X"),
             ),
             typed(
                 "0",
-                tx("r1", "2025-12-22", "-1.44", CODA_TRANSFER, "Supplier X"),
+                tx("r1", "2025-12-22", "-1.37", CODA_TRANSFER, "Supplier X"),
             ),
             typed(
                 "0",
@@ -1681,7 +1681,7 @@ mod tests {
             vec![
                 tx("bank-cost", "2026-07-06", "-4.56", CODA_CARD, "657100"),
                 tx("interest", "2026-07-06", "-9.10", CODA_CARD, "650000"),
-                tx("expense", "2026-07-07", "-61.50", CODA_TRANSFER, "612000"),
+                tx("expense", "2026-07-07", "-58.40", CODA_TRANSFER, "612000"),
             ],
         )];
         let found = find_unmatched(
@@ -1717,11 +1717,11 @@ mod tests {
         let entries = vec![
             typed(
                 "9",
-                with_file(tx("i1", "2026-07-12", "-144.23", "Factuur", "Supplier A")),
+                with_file(tx("i1", "2026-07-12", "-133.18", "Factuur", "Supplier A")),
             ),
             typed(
                 "0",
-                tx("p1", "2026-07-13", "144.25", CODA_CARD, "Supplier A"),
+                tx("p1", "2026-07-13", "133.20", CODA_CARD, "Supplier A"),
             ),
             typed(
                 "0",
@@ -1730,11 +1730,11 @@ mod tests {
             // And the other way round: paid 0.02 less, difference booked as a debit.
             typed(
                 "9",
-                with_file(tx("i2", "2026-07-16", "-47.27", "Factuur", "Supplier B")),
+                with_file(tx("i2", "2026-07-16", "-52.07", "Factuur", "Supplier B")),
             ),
             typed(
                 "0",
-                tx("p2", "2026-07-17", "47.25", CODA_CARD, "Supplier B"),
+                tx("p2", "2026-07-17", "52.05", CODA_CARD, "Supplier B"),
             ),
             typed(
                 "0",
@@ -1742,7 +1742,7 @@ mod tests {
             ),
         ];
         let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
-        assert!(covered(&mut ledger, "2026-07-13", "144.25"));
-        assert!(covered(&mut ledger, "2026-07-17", "47.25"));
+        assert!(covered(&mut ledger, "2026-07-13", "133.20"));
+        assert!(covered(&mut ledger, "2026-07-17", "52.05"));
     }
 }
