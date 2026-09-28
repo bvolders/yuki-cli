@@ -71,9 +71,14 @@ usual authentication error (exit 2), an ambiguous one a configuration error aski
 for `--region`.
 
 Passing `--region nl|be` or `--base-url <root>` (or exporting `YUKI_REGION` /
-`YUKI_BASE_URL`) skips detection. `init` persists a region only when it was detected,
-chosen, or passed as the `--region` flag; an exported `YUKI_REGION` or `YUKI_BASE_URL`
-is used for that run and never written to the config. `yuki init --add` detects per
+`YUKI_BASE_URL`) skips detection. A fresh `init` — nothing exists yet to protect
+from the environment — persists whichever endpoint was actually used, whether it
+came from the flag or from `YUKI_REGION`/`YUKI_BASE_URL`, exactly like a typed
+`--region`/`--base-url`; a URL matching no known region is stored as `base_url`,
+one that does is stored as `region` instead. Re-running `init` on an *existing*
+config, rotating the key, or `--add` is different: only the flag is persisted
+there, since an exported `YUKI_REGION`/`YUKI_BASE_URL` is a per-shell choice and
+must not silently rewrite a configuration that already exists. `yuki init --add` detects per
 key and records the region (or `base_url`) on the administrations that key reaches,
 so Dutch and Belgian books can live in one config. Re-running `yuki init` keeps the
 per-administration settings (region, and any other keys in its table) of every
@@ -230,8 +235,8 @@ yuki upload payment-methods                             # List payment method ID
 | `--output text\|json` | Output format (auto-detects TTY) |
 | `--quiet` | Suppress informational output |
 | `--yes` | Confirm destructive operations |
-| `--region nl\|be` | Yuki deployment; `init` detects it from the key when omitted (env `YUKI_REGION`; only the flag is stored by `init`) |
-| `--base-url <root>` | Full API root, overrides `--region` (env `YUKI_BASE_URL`) |
+| `--region nl\|be` | Yuki deployment; `init` detects it from the key when omitted (env `YUKI_REGION`; stored by `init` on a fresh config, flag-only on an existing one) |
+| `--base-url <root>` | Full API root, overrides `--region` (env `YUKI_BASE_URL`; same storage rule as `--region`) |
 
 ## Periods
 

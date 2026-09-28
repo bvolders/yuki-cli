@@ -1,7 +1,10 @@
 //! End-to-end smoke tests: `init --region` stores the region and later commands
-//! resolve the Belgian host; exported YUKI_REGION/YUKI_BASE_URL are never stored.
-//! Precedence itself is unit-tested in tests/config.rs and cli::tests.
-//! A local mock stands in for Yuki; nothing leaves the machine.
+//! resolve the Belgian host. A fresh `init` (nothing to overwrite) stores the
+//! endpoint an exported YUKI_REGION/YUKI_BASE_URL resolved to, exactly as a typed
+//! flag would; re-running `init` on an existing config does not let the
+//! environment silently rewrite it. Precedence itself is unit-tested in
+//! tests/config.rs and cli::tests. A local mock stands in for Yuki; nothing
+//! leaves the machine.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -152,11 +155,13 @@ fn saved_config(home: &TempDir) -> toml::Value {
 }
 
 #[test]
-fn an_exported_region_is_never_persisted_by_init() {
+fn a_fresh_init_persists_the_env_resolved_endpoint_like_a_typed_region() {
     let (root, _) = mock_yuki();
     let env = [("YUKI_REGION", "be"), ("YUKI_BASE_URL", root.as_str())];
 
-    // Fresh init.
+    // Nothing exists yet to protect from the environment, so the endpoint this
+    // run actually used is the one `init` has to record — otherwise the next
+    // run without YUKI_REGION silently falls back to the legacy `nl` default.
     let home = TempDir::new().expect("temp home");
     let init = yuki_with_env(&home, &["init", "--api-key", "be-key"], &env);
     assert!(
@@ -165,14 +170,38 @@ fn an_exported_region_is_never_persisted_by_init() {
         String::from_utf8_lossy(&init.stderr)
     );
     let saved = saved_config(&home);
-    assert!(
-        saved.get("region").is_none(),
-        "env region persisted: {saved}"
+    assert_eq!(
+        saved["region"].as_str(),
+        Some("be"),
+        "env region was not persisted on a fresh init: {saved}"
     );
+    // The mock URL is just how the test reaches the Belgian host; a known
+    // region is recorded as `region`, not as the runtime URL that reached it.
     assert!(
         saved.get("base_url").is_none(),
-        "env URL persisted: {saved}"
+        "runtime URL was persisted: {saved}"
     );
+}
+
+#[test]
+fn an_exported_region_is_never_persisted_over_an_existing_config() {
+    let (root, _) = mock_yuki();
+    let env = [("YUKI_REGION", "be"), ("YUKI_BASE_URL", root.as_str())];
+
+    // Seed a config the ordinary way, with a region env will disagree with, so
+    // there is something for the environment to try (and fail) to overwrite.
+    let home = TempDir::new().expect("temp home");
+    let seed = yuki_with_env(
+        &home,
+        &["init", "--api-key", "key-1", "--region", "nl"],
+        &[("YUKI_BASE_URL", root.as_str())],
+    );
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    assert_eq!(saved_config(&home)["region"].as_str(), Some("nl"));
 
     // Key rotation.
     let rotate = yuki_with_env(&home, &["init", "--api-key", "other-key"], &env);
@@ -181,7 +210,11 @@ fn an_exported_region_is_never_persisted_by_init() {
         "{}",
         String::from_utf8_lossy(&rotate.stderr)
     );
-    assert!(saved_config(&home).get("region").is_none());
+    assert_eq!(
+        saved_config(&home)["region"].as_str(),
+        Some("nl"),
+        "env region overwrote the stored one on rotation"
+    );
 
     // --add stamps nothing either.
     let add = yuki_with_env(&home, &["init", "--add", "--api-key", "third-key"], &env);

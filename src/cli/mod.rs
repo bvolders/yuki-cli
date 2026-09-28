@@ -62,7 +62,9 @@ pub struct Cli {
     /// Yuki deployment, e.g. be (api.yukiworks.be) or nl (api.yukiworks.nl).
     /// `yuki init` detects it from the key when omitted, and stores it.
     /// Overrides the configured region for this run. YUKI_REGION does the
-    /// same when the flag is absent, but is never stored.
+    /// same when the flag is absent. `init` stores whichever was used on a
+    /// fresh config; re-running it on an existing one never lets the
+    /// environment variable rewrite the stored region.
     #[arg(
         long,
         global = true,
@@ -72,7 +74,9 @@ pub struct Cli {
     pub region: Option<Region>,
 
     /// Full API root, e.g. https://api.yukiworks.be/ws. Overrides --region.
-    /// YUKI_BASE_URL does the same when the flag is absent. Never stored.
+    /// YUKI_BASE_URL does the same when the flag is absent. `init` stores it
+    /// (as `base_url`) only on a fresh config and only when it names no known
+    /// region; re-running `init` on an existing config never stores it.
     #[arg(long, global = true)]
     pub base_url: Option<String>,
 
