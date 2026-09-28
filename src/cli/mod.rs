@@ -478,9 +478,11 @@ pub enum CheckCommands {
         /// Accounting period (e.g. 2025-Q1).
         #[arg(long)]
         period: Option<String>,
-        /// GL account code for the bank account (default: 11001).
-        #[arg(long, default_value = "11001")]
-        bank_account: String,
+        /// Bank GL account(s) to scan; repeat or comma-separate for several.
+        /// Defaults to the administration's `bank_accounts`, else the region
+        /// default (nl: 11001, be: 550000).
+        #[arg(long, value_delimiter = ',')]
+        bank_account: Vec<String>,
     },
 
     /// Check if a specific invoice reference is still outstanding.

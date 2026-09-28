@@ -35,6 +35,30 @@ pub struct AdminEntry {
         with = "region_serde"
     )]
     pub region: Option<Region>,
+
+    /// Bank GL accounts `check unmatched` scans when `--bank-account` is not
+    /// given, e.g. `["550002", "550003"]`. Empty means the region default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bank_accounts: Vec<String>,
+
+    /// Creditors control accounts (e.g. `440000`) `check unmatched` reads to
+    /// learn who a bank payment went to and whether a purchase invoice of that
+    /// supplier covers it. Absent means the region default; empty turns it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creditor_accounts: Option<Vec<String>>,
+
+    /// Internal-transfer accounts (e.g. `580000`): a bank debit with a same-day,
+    /// same-amount counter-entry here needs no invoice. Absent means the region
+    /// default; empty turns it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_accounts: Option<Vec<String>>,
+
+    /// Description patterns (case-insensitive substrings of the full bank
+    /// description, which includes the bank's transaction type) that
+    /// `check unmatched` skips: loans, salaries, tax payments and the like.
+    /// Absent means the region default; an empty list switches it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmatched_ignore_descriptions: Option<Vec<String>>,
 }
 
 impl AdminEntry {
@@ -45,6 +69,10 @@ impl AdminEntry {
             name: None,
             api_key: None,
             region: None,
+            bank_accounts: Vec::new(),
+            creditor_accounts: None,
+            transfer_accounts: None,
+            unmatched_ignore_descriptions: None,
         }
     }
 
@@ -221,11 +249,18 @@ impl Config {
         {
             return url;
         }
+        self.region(entry).api_root()
+    }
+
+    /// Region for `entry`: its own, else the top-level one, else the Netherlands.
+    ///
+    /// Unlike [`Config::api_root`] this ignores URL overrides, because it drives
+    /// country conventions (chart of accounts, bank formats), not the endpoint.
+    pub fn region(&self, entry: Option<&AdminEntry>) -> Region {
         entry
             .and_then(|e| e.region)
             .or(self.region)
             .unwrap_or_default()
-            .api_root()
     }
 
     /// Resolve the administration a command should run against.
@@ -318,6 +353,14 @@ impl Config {
             // The shared key stays implicit, so rotating it keeps reaching these.
             if api_key != self.api_key {
                 entry.api_key = Some(api_key.to_string());
+            }
+            // Settings only the user writes survive a re-run of `yuki init`.
+            if let Some(existing) = self.administrations.get(&name) {
+                entry.bank_accounts = existing.bank_accounts.clone();
+                entry.creditor_accounts = existing.creditor_accounts.clone();
+                entry.transfer_accounts = existing.transfer_accounts.clone();
+                entry.unmatched_ignore_descriptions =
+                    existing.unmatched_ignore_descriptions.clone();
             }
             if self.administrations.insert(name.clone(), entry).is_some() {
                 updated.push(name);

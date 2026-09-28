@@ -92,6 +92,33 @@ fn parses_gl_transactions_with_contact() {
     assert_eq!(txs[1].contact_name, "");
 }
 
+/// Belgian (CODA) bank lines: no contact on an unprocessed line, and a GL code in
+/// `Contact` for a line booked straight to a ledger account. Data is made up.
+#[test]
+fn parses_gl_transactions_with_contact_from_a_belgian_bank_account() {
+    let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GLAccountTransactionsAndContactResponse xmlns="http://www.theyukicompany.com/">
+      <GLAccountTransactionsAndContactResult>
+        <GLAccountTransactions xmlns="">
+          <GLAccountTransaction ID="tx-be-1"><Date>2026-07-07</Date><Description>Binnenlandse overschrijvingen - SEPA credit transfers : Enkelvoudige overschrijving | Netto bedrag: 88,110 : Overschrijving | EXAMPLE PARTNERS BV</Description><Amount>-88.11</Amount><SalesItem /><Project></Project><GLAccountCode>550003</GLAccountCode><FileName></FileName><TransactionType>0</TransactionType></GLAccountTransaction>
+          <GLAccountTransaction ID="tx-be-2"><Date>2026-07-06</Date><Description>Kaarten : Betaling met debetkaart binnen eurozone | Netto bedrag: 4,560 : | Debet ATM/POS</Description><Amount>-4.56</Amount><SalesItem /><Contact>657100</Contact><ContactID>00000000-0000-0000-0000-000000000001</ContactID><Project></Project><GLAccountCode>550003</GLAccountCode><FileName></FileName><TransactionType>10</TransactionType></GLAccountTransaction>
+        </GLAccountTransactions>
+      </GLAccountTransactionsAndContactResult>
+    </GLAccountTransactionsAndContactResponse>
+  </soap:Body>
+</soap:Envelope>"#;
+
+    let txs = AccountingClient::parse_gl_transactions_with_contact(xml).unwrap();
+    assert_eq!(txs.len(), 2);
+    assert!(txs[0].description.ends_with("| EXAMPLE PARTNERS BV"));
+    assert_eq!(txs[0].contact_name, "");
+    assert_eq!(txs[0].gl_account, "550003");
+    assert_eq!(txs[1].contact_name, "657100");
+    assert_eq!(txs[1].amount, "-4.56");
+}
+
 #[test]
 fn parses_archive_documents() {
     let xml = r#"<?xml version="1.0" encoding="utf-8"?>

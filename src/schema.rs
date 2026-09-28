@@ -347,7 +347,7 @@ pub fn generate() -> Value {
                 "mutating": false,
                 "args": [
                     {"name": "--period", "type": "string", "required": false, "description": "Accounting period (e.g. 2025-Q1)."},
-                    {"name": "--bank-account", "type": "string", "required": false, "description": "GL account code for the bank account.", "default": "11001"}
+                    {"name": "--bank-account", "type": "string", "required": false, "description": "Bank GL account(s), comma-separated or repeated. Defaults to the administration's bank_accounts, else 11001 (nl) or 550000 (be)."}
                 ],
                 "output_fields": [
                     {"name": "date", "type": "string"},

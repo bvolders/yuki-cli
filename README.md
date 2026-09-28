@@ -248,6 +248,32 @@ name = "Example Holding B.V."
 api_key = "second-api-key"
 ```
 
+### `check unmatched` per administration
+
+`check unmatched` scans the bank GL account(s) given with `--bank-account`
+(repeat it or comma-separate), else the administration's `bank_accounts`, else
+the region default: `11001` (nl) or `550000` (be). For Belgian administrations it
+also reads the supplier ledger (`440000`, three months back) to name the
+counterparty and check whether a purchase invoice of that supplier covers the
+payment, treats a same-day counter-entry on `580000` or another scanned bank
+account as an own transfer, and skips loans, credit fees, card settlements,
+salaries and tax payments by description. All of it can be tuned per
+administration:
+
+```toml
+[administrations.example_bv]
+domain_id = "domain-uuid"
+admin_id = "admin-uuid"
+region = "be"
+bank_accounts = ["550002", "550003"]
+creditor_accounts = ["440000"]       # [] turns the supplier ledger off
+transfer_accounts = ["580000"]
+# Replaces the Belgian defaults; matched against the full bank description.
+unmatched_ignore_descriptions = ["Lening op korte termijn", "Betaling lonen"]
+```
+
+Dutch administrations keep the original behaviour unless these are set.
+
 `name` and the per-administration `api_key` are optional. An administration without
 its own key uses the shared one, so rotating the shared key keeps reaching it.
 

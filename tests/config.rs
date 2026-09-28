@@ -364,6 +364,20 @@ fn merge_administrations_updates_in_place_when_the_name_is_the_same_administrati
 }
 
 #[test]
+fn merge_administrations_keeps_user_written_unmatched_settings() {
+    let mut existing = AdminEntry::new("uuid-a", "admin-a");
+    existing.bank_accounts = vec!["550002".into()];
+    existing.creditor_accounts = Some(Vec::new());
+    let mut config = config_with("key", "co_a", [("co_a", existing)]);
+
+    config.merge_administrations([("co_a", AdminEntry::new("uuid-a", "admin-a"))], "key");
+
+    let entry = &config.administrations["co_a"];
+    assert_eq!(entry.bank_accounts, ["550002"]);
+    assert_eq!(entry.creditor_accounts.as_deref(), Some(&[][..]));
+}
+
+#[test]
 fn merge_administrations_preserves_existing_entries() {
     // The defect this guards: `yuki init` replaced the whole map, so re-running it
     // with a second key dropped every administration the first key had reached.
@@ -477,6 +491,53 @@ admin_id = "admin-1"
 
     let config = Config::load_from(&path).unwrap();
     assert!(config.unmatched_ignore.is_empty());
+}
+
+#[test]
+fn loads_per_administration_unmatched_settings() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+api_key = "test-key"
+default_admin = "co"
+region = "be"
+
+[administrations.co]
+domain_id = "uuid-1"
+admin_id = "admin-1"
+bank_accounts = ["550002", "550003"]
+creditor_accounts = ["440000"]
+transfer_accounts = []
+unmatched_ignore_descriptions = ["Huur"]
+
+[administrations.other]
+domain_id = "uuid-2"
+admin_id = "admin-2"
+region = "nl"
+"#,
+    )
+    .unwrap();
+
+    let config = Config::load_from(&path).unwrap();
+    let co = &config.administrations["co"];
+    assert_eq!(co.bank_accounts, ["550002", "550003"]);
+    assert_eq!(
+        co.creditor_accounts.as_deref(),
+        Some(&["440000".to_string()][..])
+    );
+    assert_eq!(co.transfer_accounts.as_deref(), Some(&[][..]));
+    assert_eq!(
+        co.unmatched_ignore_descriptions.as_deref(),
+        Some(&["Huur".to_string()][..])
+    );
+    assert_eq!(config.region(Some(co)), Region::Be);
+
+    let other = &config.administrations["other"];
+    assert!(other.bank_accounts.is_empty());
+    assert!(other.creditor_accounts.is_none());
+    assert_eq!(config.region(Some(other)), Region::Nl);
 }
 
 #[test]
