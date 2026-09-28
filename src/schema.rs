@@ -116,16 +116,17 @@ pub fn generate() -> Value {
             },
             {
                 "name": "accounts balance",
-                "description": "Show the balance of a general ledger account for a period.",
+                "description": "Show GL account balances at the end of a period (or today, if it is still running).",
                 "mutating": false,
                 "args": [
                     {"name": "--account", "type": "string", "required": false, "description": "GL account code."},
-                    {"name": "--period", "type": "string", "required": false, "description": "Accounting period (e.g. 2025-01)."}
+                    {"name": "--period", "type": "string", "required": false, "description": "Accounting period (e.g. 2025-01); the balance is taken on its last day, clamped to today."}
                 ],
                 "output_fields": [
                     {"name": "account", "type": "string"},
                     {"name": "description", "type": "string"},
-                    {"name": "balance", "type": "string"}
+                    {"name": "balance", "type": "string"},
+                    {"name": "as_of", "type": "string"}
                 ]
             },
             {

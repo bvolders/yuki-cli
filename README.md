@@ -122,7 +122,7 @@ yuki sales items                          # Sales item catalogue (products/servi
 yuki contacts search "Hetzner"            # Search contacts
 yuki contacts list                        # List all suppliers and customers
 
-yuki accounts balance --account 11001 --period 2025-Q1
+yuki accounts balance --account 11001 --period 2025-Q1  # Balance on 2025-03-31 (or today, if earlier)
 yuki accounts transactions --account 11001 --period 2025-Q1
 yuki accounts scheme                      # Chart of accounts (GL scheme)
 yuki accounts revenue --period 2025-Q1    # Net revenue for a period

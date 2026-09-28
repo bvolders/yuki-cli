@@ -400,13 +400,13 @@ pub enum ContactCommands {
 
 #[derive(Subcommand)]
 pub enum AccountCommands {
-    /// Show the balance of a general ledger account for a period.
+    /// Show GL account balances at the end of a period (or today, if it is still running).
     Balance {
         /// GL account code.
         #[arg(long)]
         account: Option<String>,
 
-        /// Accounting period (e.g. 2025-01).
+        /// Accounting period (e.g. 2025-01); the balance is taken on its last day, clamped to today.
         #[arg(long)]
         period: Option<String>,
     },
