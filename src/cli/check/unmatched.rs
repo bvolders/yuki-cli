@@ -281,9 +281,10 @@ impl CreditorLedger {
     /// bank line), then the first in supplier-name order.
     fn claim(&mut self, key: &str, hint: &str) -> Option<LedgerPayment> {
         let list = self.payments.get_mut(key)?;
+        let hint = normalize_name(hint);
         let index = list
             .iter()
-            .position(|p| !hint.is_empty() && names_match(hint, &p.contact))
+            .position(|p| normalized_names_match(&hint, &normalize_name(&p.contact)))
             .or_else(|| list.iter().position(|p| p.covered))
             .or(if list.is_empty() { None } else { Some(0) })?;
         Some(list.remove(index))
@@ -476,13 +477,15 @@ fn find_unmatched(
             let abs_amount = format!("{:.2}", amount.abs());
             let key = entry_key(&tx.date, &abs_amount);
 
-            // The supplier the bank names, to pick among equal ledger payments.
-            let hint = if !tx.contact_name.is_empty() && !is_gl_code(&tx.contact_name) {
+            // The supplier the bank names: the API contact when it is a name,
+            // else the description. Picks among equal ledger payments.
+            let bank_counterparty = if !tx.contact_name.is_empty() && !is_gl_code(&tx.contact_name)
+            {
                 tx.contact_name.clone()
             } else {
                 parse_counterparty(&tx.description)
             };
-            let ledger_payment = ledger.claim(&key, &hint);
+            let ledger_payment = ledger.claim(&key, &bank_counterparty);
             if ledger_payment.as_ref().is_some_and(|p| p.covered) || transfers.take(&key) {
                 continue;
             }
@@ -510,17 +513,11 @@ fn find_unmatched(
                 continue;
             }
 
-            // Prefer the supplier from the creditors account, then the API
-            // contact when it is a name, then the description.
+            // Prefer the supplier from the creditors account over the bank's.
             let ledger_contact = ledger_payment.map(|p| p.contact);
             let known_to_ledger = ledger_contact.is_some();
-            let counterparty = match ledger_contact {
-                Some(name) => name,
-                None if !tx.contact_name.is_empty() && !is_gl_code(&tx.contact_name) => {
-                    tx.contact_name.clone()
-                }
-                None => parse_counterparty(&tx.description),
-            };
+            let counterparty = ledger_contact.unwrap_or(bank_counterparty);
+            let normalized = normalize_name(&counterparty);
 
             let cp_lower = counterparty.to_lowercase();
             if rules
@@ -530,11 +527,15 @@ fn find_unmatched(
             {
                 continue;
             }
-            if rules.own_names.contains(&normalize_name(&counterparty)) {
+            if rules.own_names.contains(&normalized) {
                 continue;
             }
             // The creditors account already compared this supplier's invoices.
-            if !known_to_ledger && archive_names.iter().any(|n| names_match(&counterparty, n)) {
+            if !known_to_ledger
+                && archive_names
+                    .iter()
+                    .any(|n| normalized_names_match(&normalized, n))
+            {
                 continue;
             }
 
@@ -727,13 +728,14 @@ fn normalize_name(name: &str) -> String {
 ///
 /// Returns true if one normalized name contains the other, allowing for
 /// abbreviations or partial matches.
+#[cfg(test)]
 fn names_match(bank_name: &str, archive_name: &str) -> bool {
-    let a = normalize_name(bank_name);
-    let b = normalize_name(archive_name);
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    a.contains(b.as_str()) || b.contains(a.as_str())
+    normalized_names_match(&normalize_name(bank_name), &normalize_name(archive_name))
+}
+
+/// [`names_match`] over names already passed through [`normalize_name`].
+fn normalized_names_match(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && (a.contains(b) || b.contains(a))
 }
 
 #[cfg(test)]
