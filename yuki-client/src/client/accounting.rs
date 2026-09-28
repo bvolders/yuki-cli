@@ -49,6 +49,9 @@ pub struct GlTransactionWithContact {
     /// `9` for a purchase invoice or credit note and `0`/`10` for bank lines
     /// (as observed on Yuki Belgium). Empty when the response has none.
     pub transaction_type: String,
+    /// Name of the document (e.g. the invoice PDF) the line is linked to;
+    /// empty for a line without one.
+    pub file_name: String,
 }
 
 /// A general ledger account balance as of a date, from `GLAccountBalance`.
@@ -500,7 +503,7 @@ impl AccountingClient {
                             }
                         }
                         "Date" | "Description" | "Amount" | "GLAccountCode" | "Contact"
-                        | "ContactName" | "TransactionType"
+                        | "ContactName" | "TransactionType" | "FileName"
                             if in_transaction =>
                         {
                             field = Some(local);
@@ -517,7 +520,7 @@ impl AccountingClient {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "Date" | "Description" | "Amount" | "GLAccountCode" | "Contact"
-                        | "ContactName" | "TransactionType" => {
+                        | "ContactName" | "TransactionType" | "FileName" => {
                             let text = content.take();
                             if let Some(f) = field.take() {
                                 match f.as_str() {
@@ -527,6 +530,7 @@ impl AccountingClient {
                                     "GLAccountCode" => current.gl_account = text,
                                     "Contact" | "ContactName" => current.contact_name = text,
                                     "TransactionType" => current.transaction_type = text,
+                                    "FileName" => current.file_name = text,
                                     _ => {}
                                 }
                             }

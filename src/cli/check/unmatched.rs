@@ -234,13 +234,21 @@ enum CreditorLine {
 impl CreditorLine {
     /// Classify by journal type when the response carries one, else by sign
     /// alone (credit = invoice, debit = payment).
+    ///
+    /// A bank-type credit linked to a document (`FileName`) is the payment
+    /// difference Yuki books when a payment settles an invoice for slightly
+    /// more (rounding, exchange rate), so it counts with the invoice rather
+    /// than as a refund. Bank-type debits stay payments even with a document:
+    /// Yuki links real payments (type `10`, "Betaling: Factuur van ...") too.
     fn of(tx: &GlTransactionWithContact, amount: f64) -> Self {
         let credit = amount < 0.0;
+        let document = !tx.file_name.trim().is_empty();
         match tx.transaction_type.trim() {
             "" if credit => Self::Invoice,
             "" => Self::Payment,
             PURCHASE_TRANSACTION_TYPE if credit => Self::Invoice,
             PURCHASE_TRANSACTION_TYPE => Self::CreditNote,
+            _ if credit && document => Self::Invoice,
             _ if credit => Self::Refund,
             _ => Self::Payment,
         }
@@ -827,6 +835,7 @@ mod tests {
             amount: amount.into(),
             contact_name: contact.into(),
             transaction_type: String::new(),
+            file_name: String::new(),
         }
     }
 
@@ -1366,5 +1375,45 @@ mod tests {
         );
         let setup = UnmatchedSetup::resolve(&custom, "co", &[]);
         assert_eq!(setup.rules.no_document_accounts, ["657", "6400"]);
+    }
+
+    #[test]
+    fn creditor_ledger_counts_document_linked_payment_differences() {
+        // Yuki books a rounding/FX difference found while matching a payment to
+        // an invoice as a bank-type line that carries the invoice's document.
+        let with_file = |mut t: GlTransactionWithContact| {
+            t.file_name = "invoice.pdf".into();
+            t
+        };
+        let entries = vec![
+            typed(
+                "9",
+                with_file(tx("i1", "2026-07-12", "-144.23", "Factuur", "Supplier A")),
+            ),
+            typed(
+                "0",
+                tx("p1", "2026-07-13", "144.25", CODA_CARD, "Supplier A"),
+            ),
+            typed(
+                "0",
+                with_file(tx("d1", "2026-07-13", "-0.02", "Factuur", "Supplier A")),
+            ),
+            // And the other way round: paid 0.02 less, difference booked as a debit.
+            typed(
+                "9",
+                with_file(tx("i2", "2026-07-16", "-47.27", "Factuur", "Supplier B")),
+            ),
+            typed(
+                "0",
+                tx("p2", "2026-07-17", "47.25", CODA_CARD, "Supplier B"),
+            ),
+            typed(
+                "0",
+                with_file(tx("d2", "2026-07-17", "0.02", "Factuur", "Supplier B")),
+            ),
+        ];
+        let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
+        assert!(covered(&mut ledger, "2026-07-13", "144.25"));
+        assert!(covered(&mut ledger, "2026-07-17", "47.25"));
     }
 }

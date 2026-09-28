@@ -104,7 +104,7 @@ fn parses_gl_transactions_with_contact_from_a_belgian_bank_account() {
       <GLAccountTransactionsAndContactResult>
         <GLAccountTransactions xmlns="">
           <GLAccountTransaction ID="tx-be-1"><Date>2026-07-07</Date><Description>Binnenlandse overschrijvingen - SEPA credit transfers : Enkelvoudige overschrijving | Netto bedrag: 88,110 : Overschrijving | EXAMPLE PARTNERS BV</Description><Amount>-88.11</Amount><SalesItem /><Project></Project><GLAccountCode>550003</GLAccountCode><FileName></FileName><TransactionType>0</TransactionType></GLAccountTransaction>
-          <GLAccountTransaction ID="tx-be-2"><Date>2026-07-06</Date><Description>Kaarten : Betaling met debetkaart binnen eurozone | Netto bedrag: 4,560 : | Debet ATM/POS</Description><Amount>-4.56</Amount><SalesItem /><Contact>657100</Contact><ContactID>00000000-0000-0000-0000-000000000001</ContactID><Project></Project><GLAccountCode>550003</GLAccountCode><FileName></FileName><TransactionType>10</TransactionType></GLAccountTransaction>
+          <GLAccountTransaction ID="tx-be-2"><Date>2026-07-06</Date><Description>Kaarten : Betaling met debetkaart binnen eurozone | Netto bedrag: 4,560 : | Debet ATM/POS</Description><Amount>-4.56</Amount><SalesItem /><Contact>657100</Contact><ContactID>00000000-0000-0000-0000-000000000001</ContactID><Project></Project><GLAccountCode>550003</GLAccountCode><FileName>Example &amp; Co - 0001.pdf</FileName><TransactionType>10</TransactionType></GLAccountTransaction>
         </GLAccountTransactions>
       </GLAccountTransactionsAndContactResult>
     </GLAccountTransactionsAndContactResponse>
@@ -121,6 +121,8 @@ fn parses_gl_transactions_with_contact_from_a_belgian_bank_account() {
     // The journal type separates bank lines from purchase documents.
     assert_eq!(txs[0].transaction_type, "0");
     assert_eq!(txs[1].transaction_type, "10");
+    assert_eq!(txs[0].file_name, "");
+    assert_eq!(txs[1].file_name, "Example & Co - 0001.pdf");
 }
 
 #[test]
