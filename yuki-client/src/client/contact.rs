@@ -3,8 +3,8 @@ use quick_xml::events::Event;
 
 use crate::error::YukiError;
 
-use super::local_name;
 use super::soap_client::{SoapClient, SoapEnvelope};
+use super::{local_name, unescape_text};
 
 const BASE_URL: &str = "https://api.yukiworks.nl/ws/Contact.asmx";
 
@@ -142,8 +142,8 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
                             is_customer: false,
                         };
                         for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"ID" {
-                                contact.id = String::from_utf8_lossy(&attr.value).to_string();
+                            if attr.key.as_ref() == "ID" {
+                                contact.id = attr.value.into_owned();
                             }
                         }
                     }
@@ -154,8 +154,7 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
                 }
             }
             Ok(Event::Text(ref e)) if in_contact && !current_field.is_empty() => {
-                let text = e
-                    .unescape()
+                let text = unescape_text(e)
                     .map_err(|e| YukiError::Xml(e.to_string()))?
                     .trim()
                     .to_string();

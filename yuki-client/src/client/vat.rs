@@ -3,8 +3,8 @@ use quick_xml::events::Event;
 
 use crate::error::YukiError;
 
-use super::local_name;
 use super::soap_client::{SoapClient, SoapEnvelope};
+use super::{local_name, unescape_text};
 
 const BASE_URL: &str = "https://api.yukiworks.nl/ws/Vat.asmx";
 
@@ -121,8 +121,7 @@ impl VatClient {
                 }
                 Ok(Event::Text(ref e)) => {
                     if let Some(ref f) = field {
-                        let text = e
-                            .unescape()
+                        let text = unescape_text(e)
                             .map_err(|e| YukiError::Xml(e.to_string()))?
                             .trim()
                             .to_string();
@@ -203,8 +202,7 @@ impl VatClient {
                 }
                 Ok(Event::Text(ref e)) => {
                     if let Some(ref f) = field {
-                        let text = e
-                            .unescape()
+                        let text = unescape_text(e)
                             .map_err(|e| YukiError::Xml(e.to_string()))?
                             .trim()
                             .to_string();

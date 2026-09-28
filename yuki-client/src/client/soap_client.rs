@@ -4,7 +4,7 @@ use reqwest::Client;
 
 use crate::error::YukiError;
 
-use super::local_name;
+use super::{local_name, unescape_text};
 
 const YUKI_NS: &str = "http://www.theyukicompany.com/";
 const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -179,8 +179,7 @@ impl SoapClient {
                     }
                 }
                 Ok(Event::Text(ref e)) if inside_target => {
-                    let text = e
-                        .unescape()
+                    let text = unescape_text(e)
                         .map_err(|e| YukiError::Xml(e.to_string()))?
                         .trim()
                         .to_string();
@@ -235,9 +234,9 @@ impl SoapClient {
                 }
                 Ok(Event::Text(ref e)) => {
                     if in_faultcode {
-                        faultcode = e.unescape().unwrap_or_default().trim().to_string();
+                        faultcode = unescape_text(e).unwrap_or_default().trim().to_string();
                     } else if in_faultstring {
-                        faultstring = e.unescape().unwrap_or_default().trim().to_string();
+                        faultstring = unescape_text(e).unwrap_or_default().trim().to_string();
                     }
                 }
                 Ok(Event::End(ref e)) => {

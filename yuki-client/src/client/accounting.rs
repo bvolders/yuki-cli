@@ -3,8 +3,8 @@ use quick_xml::events::Event;
 
 use crate::error::YukiError;
 
-use super::local_name;
 use super::soap_client::{SoapClient, SoapEnvelope};
+use super::{local_name, unescape_text};
 
 const BASE_URL: &str = "https://api.yukiworks.nl/ws/Accounting.asmx";
 
@@ -316,13 +316,11 @@ impl AccountingClient {
                             };
                             for attr in e.attributes().flatten() {
                                 match attr.key.as_ref() {
-                                    b"Code" => {
-                                        current.code =
-                                            String::from_utf8_lossy(&attr.value).to_string();
+                                    "Code" => {
+                                        current.code = attr.value.into_owned();
                                     }
-                                    b"BalanceType" => {
-                                        current.balance_type =
-                                            String::from_utf8_lossy(&attr.value).to_string();
+                                    "BalanceType" => {
+                                        current.balance_type = attr.value.into_owned();
                                     }
                                     _ => {}
                                 }
@@ -336,8 +334,7 @@ impl AccountingClient {
                 }
                 Ok(Event::Text(ref e)) => {
                     if let Some(ref f) = field {
-                        let text = e
-                            .unescape()
+                        let text = unescape_text(e)
                             .map_err(|e| YukiError::Xml(e.to_string()))?
                             .trim()
                             .to_string();
@@ -404,8 +401,8 @@ impl AccountingClient {
                                 amount: String::new(),
                             };
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"ID" {
-                                    current.id = String::from_utf8_lossy(&attr.value).to_string();
+                                if attr.key.as_ref() == "ID" {
+                                    current.id = attr.value.into_owned();
                                 }
                             }
                         }
@@ -417,8 +414,7 @@ impl AccountingClient {
                 }
                 Ok(Event::Text(ref e)) => {
                     if let Some(ref f) = field {
-                        let text = e
-                            .unescape()
+                        let text = unescape_text(e)
                             .map_err(|e| YukiError::Xml(e.to_string()))?
                             .trim()
                             .to_string();
@@ -492,8 +488,8 @@ impl AccountingClient {
                                 contact_name: String::new(),
                             };
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"ID" {
-                                    current.id = String::from_utf8_lossy(&attr.value).to_string();
+                                if attr.key.as_ref() == "ID" {
+                                    current.id = attr.value.into_owned();
                                 }
                             }
                         }
@@ -508,8 +504,7 @@ impl AccountingClient {
                 }
                 Ok(Event::Text(ref e)) => {
                     if let Some(ref f) = field {
-                        let text = e
-                            .unescape()
+                        let text = unescape_text(e)
                             .map_err(|e| YukiError::Xml(e.to_string()))?
                             .trim()
                             .to_string();
@@ -577,8 +572,8 @@ impl AccountingClient {
                             current_domain_id.clear();
                             // ID is an attribute on the Administration element
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"ID" {
-                                    current_id = String::from_utf8_lossy(&attr.value).to_string();
+                                if attr.key.as_ref() == "ID" {
+                                    current_id = attr.value.into_owned();
                                 }
                             }
                         }
@@ -588,8 +583,7 @@ impl AccountingClient {
                     }
                 }
                 Ok(Event::Text(ref e)) => {
-                    let text = e
-                        .unescape()
+                    let text = unescape_text(e)
                         .map_err(|e| YukiError::Xml(e.to_string()))?
                         .trim()
                         .to_string();
@@ -678,8 +672,7 @@ impl AccountingClient {
                 }
                 Ok(Event::Text(ref e)) => {
                     if let Some(ref f) = field {
-                        let text = e
-                            .unescape()
+                        let text = unescape_text(e)
                             .map_err(|e| YukiError::Xml(e.to_string()))?
                             .trim()
                             .to_string();

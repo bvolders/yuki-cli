@@ -3,8 +3,8 @@ use quick_xml::events::Event;
 
 use crate::error::YukiError;
 
-use super::local_name;
 use super::soap_client::{SoapClient, SoapEnvelope};
+use super::{local_name, unescape_text};
 
 const BASE_URL: &str = "https://api.yukiworks.nl/ws/Archive.asmx";
 
@@ -303,8 +303,8 @@ impl ArchiveClient {
                                 reference: String::new(),
                             };
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"ID" {
-                                    doc.id = String::from_utf8_lossy(&attr.value).to_string();
+                                if attr.key.as_ref() == "ID" {
+                                    doc.id = attr.value.into_owned();
                                 }
                             }
                         }
@@ -318,8 +318,7 @@ impl ArchiveClient {
                     }
                 }
                 Ok(Event::Text(ref e)) if in_document && !current_field.is_empty() => {
-                    let text = e
-                        .unescape()
+                    let text = unescape_text(e)
                         .map_err(|e| YukiError::Xml(e.to_string()))?
                         .trim()
                         .to_string();
@@ -386,8 +385,8 @@ impl ArchiveClient {
                             current_id.clear();
                             current_desc.clear();
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"ID" {
-                                    current_id = String::from_utf8_lossy(&attr.value).to_string();
+                                if attr.key.as_ref() == "ID" {
+                                    current_id = attr.value.into_owned();
                                 }
                             }
                         }
@@ -398,8 +397,7 @@ impl ArchiveClient {
                     }
                 }
                 Ok(Event::Text(ref e)) if in_description => {
-                    current_desc = e
-                        .unescape()
+                    current_desc = unescape_text(e)
                         .map_err(|e| YukiError::Xml(e.to_string()))?
                         .trim()
                         .to_string();
@@ -456,8 +454,8 @@ impl ArchiveClient {
                             current_id.clear();
                             current_desc.clear();
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"ID" {
-                                    current_id = String::from_utf8_lossy(&attr.value).to_string();
+                                if attr.key.as_ref() == "ID" {
+                                    current_id = attr.value.into_owned();
                                 }
                             }
                         }
@@ -468,8 +466,7 @@ impl ArchiveClient {
                     }
                 }
                 Ok(Event::Text(ref e)) if in_description => {
-                    current_desc = e
-                        .unescape()
+                    current_desc = unescape_text(e)
                         .map_err(|e| YukiError::Xml(e.to_string()))?
                         .trim()
                         .to_string();
