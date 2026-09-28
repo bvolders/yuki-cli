@@ -561,3 +561,32 @@ fn a_nameless_payment_adding_up_same_day_invoices_is_low() {
         rows[0][reason]
     );
 }
+
+#[test]
+fn an_exact_one_to_one_match_beats_a_closer_group_of_equal_confidence() {
+    // Both are `high`: p1 pays invoice 0 exactly 20 days on, or adds up
+    // invoices 1 and 2 of the same day. The exact 1:1 is the stronger story.
+    let invoices = vec![
+        invoice("Supplier F", "2026-05-01", "40.40"),
+        invoice("Supplier F", "2026-05-21", "10.10"),
+        invoice("Supplier F", "2026-05-21", "30.30"),
+    ];
+    let payments = vec![payment("p1", "2026-05-21", "40.40", Some("Supplier F"))];
+    let result = suggest(&invoices, &payments);
+    let s = result.suggestions[0].as_ref().unwrap();
+    assert_eq!(s.confidence, Confidence::High);
+    assert_eq!((s.invoices.clone(), s.days), (vec![0], 20));
+    assert!(result.suggestions[1].is_none() && result.suggestions[2].is_none());
+}
+
+#[test]
+fn among_equal_confidence_one_to_one_matches_the_closest_date_wins() {
+    let invoices = vec![
+        invoice("Supplier F", "2026-05-01", "40.40"),
+        invoice("Supplier F", "2026-05-15", "40.40"),
+    ];
+    let payments = vec![payment("p1", "2026-05-20", "40.40", Some("Supplier F"))];
+    let result = suggest(&invoices, &payments);
+    assert!(result.suggestions[0].is_none());
+    assert_eq!(result.suggestions[1].as_ref().unwrap().days, 5);
+}

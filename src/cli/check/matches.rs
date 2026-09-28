@@ -539,16 +539,18 @@ fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> 
 /// Pair payments with open invoices, each payment to at most one invoice.
 ///
 /// Every invoice is settled at most once too. Greedy: strongest confidence
-/// first, then closest in date, then the fewest items, then invoice and
+/// first; within it an exact amount before an FX one and the fewest items
+/// (an exact 1:1 before any sum), then closest in date, then invoice and
 /// payment order, so the result depends on nothing but the input.
 pub(super) fn suggest(invoices: &[OpenInvoice], payments: &[Payment]) -> Matches {
     let mut found = candidates(invoices, payments);
+    let items = |c: &Candidate| c.payments.len() + c.invoices.len();
     found.sort_by(|a, b| {
         b.confidence
             .cmp(&a.confidence)
-            .then(a.days.cmp(&b.days))
             .then(a.fx.cmp(&b.fx))
-            .then((a.payments.len() + a.invoices.len()).cmp(&(b.payments.len() + b.invoices.len())))
+            .then(items(a).cmp(&items(b)))
+            .then(a.days.cmp(&b.days))
             .then(a.invoices.cmp(&b.invoices))
             .then(a.payments.cmp(&b.payments))
     });

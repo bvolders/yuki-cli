@@ -361,7 +361,8 @@ supplier's country, not the currency): Yuki books it at its own exchange rate
 and the card is charged at another, so a payment of that supplier within 3% or
 1.00 (whichever is larger) and 30 days is suggested as `medium`, with a reason
 starting `FX:`. Each payment and each
-invoice is used once, strongest confidence first, then closest in date.
+invoice is used once, strongest confidence first; at equal confidence an exact
+1:1 match before an FX match or a sum, then closest in date.
 `--unallocated` adds the supplier payments no open invoice took.
 
 ```sh
