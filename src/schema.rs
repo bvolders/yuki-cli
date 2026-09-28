@@ -243,17 +243,21 @@ pub fn generate() -> Value {
             },
             {
                 "name": "invoices show",
-                "description": "Show details for a single invoice.",
+                "description": "Show one transaction by ID. Yuki cannot look a transaction up by ID, so this fetches every line on --account within --period (one API call) and keeps the matching one.",
                 "mutating": false,
                 "args": [
-                    {"name": "id", "type": "string", "required": true, "description": "Invoice ID."}
+                    {"name": "id", "type": "string", "required": true, "description": "Transaction ID (as shown by `accounts transactions`)."},
+                    {"name": "--account", "type": "string", "required": true, "description": "GL account code the transaction is booked on."},
+                    {"name": "--period", "type": "string", "required": false, "description": "Period to search (e.g. 2025, 2025-Q1, 2025-01). Defaults to the current year."}
                 ],
                 "output_fields": [
                     {"name": "id", "type": "string"},
                     {"name": "date", "type": "string"},
-                    {"name": "contact", "type": "string"},
                     {"name": "amount", "type": "string"},
-                    {"name": "status", "type": "string"}
+                    {"name": "currency", "type": "string"},
+                    {"name": "gl_account", "type": "string"},
+                    {"name": "contact", "type": "string"},
+                    {"name": "description", "type": "string"}
                 ]
             },
             {

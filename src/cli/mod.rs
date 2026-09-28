@@ -282,10 +282,21 @@ pub enum InvoiceCommands {
         fields: Option<String>,
     },
 
-    /// Show details for a single invoice.
+    /// Show one transaction by ID.
+    ///
+    /// Yuki cannot look a transaction up by ID, so this fetches every line on
+    /// --account within --period (one API call) and keeps the matching one.
     Show {
-        /// Invoice ID.
+        /// Transaction ID (as shown by `accounts transactions`).
         id: String,
+
+        /// GL account code the transaction is booked on.
+        #[arg(long)]
+        account: String,
+
+        /// Period to search (e.g. 2025, 2025-Q1, 2025-01). Defaults to the current year.
+        #[arg(long)]
+        period: Option<String>,
     },
 
     /// Show the document linked to a transaction.

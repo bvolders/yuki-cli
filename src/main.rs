@@ -361,8 +361,20 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     )
                     .await?;
                 }
-                InvoiceCommands::Show { id } => {
-                    yuki_cli::cli::invoices::show(&config, admin, &id, format).await?;
+                InvoiceCommands::Show {
+                    id,
+                    account,
+                    period,
+                } => {
+                    yuki_cli::cli::invoices::show(
+                        &config,
+                        admin,
+                        &id,
+                        &account,
+                        period.as_deref(),
+                        format,
+                    )
+                    .await?;
                 }
                 InvoiceCommands::Document { id } => {
                     yuki_cli::cli::invoices::document(&config, admin, &id, format).await?;

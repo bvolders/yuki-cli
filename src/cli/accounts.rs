@@ -164,7 +164,7 @@ pub async fn revenue(
 /// Resolve an optional period string to (start_date, end_date).
 ///
 /// When no period is given, defaults to the current calendar year.
-fn resolve_period(period: Option<&str>) -> Result<(String, String), YukiError> {
+pub(crate) fn resolve_period(period: Option<&str>) -> Result<(String, String), YukiError> {
     match period {
         Some(p) => parse_period(p),
         None => {

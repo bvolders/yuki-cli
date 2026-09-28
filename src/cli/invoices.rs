@@ -1,5 +1,6 @@
+use crate::cli::accounts::resolve_period;
 use crate::cli::setup_domain;
-use crate::client::accounting_info::AccountingInfoClient;
+use crate::client::accounting_info::{AccountingInfoClient, TransactionDetail};
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::output::{
@@ -117,16 +118,44 @@ pub async fn document(
     Ok(())
 }
 
+/// Keep only the line with `id`, or report which scope was searched.
+fn only_transaction(
+    details: Vec<TransactionDetail>,
+    id: &str,
+    account: &str,
+) -> Result<Vec<TransactionDetail>, YukiError> {
+    let found: Vec<TransactionDetail> = details.into_iter().filter(|d| d.id == id).collect();
+    if found.is_empty() {
+        return Err(YukiError::NotFound(format!(
+            "transaction {id} on GL account {account} in the given period; \
+             check --account and --period"
+        )));
+    }
+    Ok(found)
+}
+
+/// Show one transaction.
+///
+/// Yuki's `GetTransactionDetails` cannot look a transaction up by ID: it returns
+/// every line on one GL account in a date range. So this fetches that scope in a
+/// single API call and filters client-side; the response grows with the
+/// account's volume in the period, so a narrow `--period` is cheaper.
 pub async fn show(
     config: &Config,
     admin: Option<&str>,
     id: &str,
+    account: &str,
+    period: Option<&str>,
     format: Option<&str>,
 ) -> Result<(), YukiError> {
+    let (start, end) = resolve_period(period)?;
     let target = config.target(admin)?;
     let mut client = AccountingInfoClient::new();
     client.authenticate(target.api_key).await?;
-    let details = client.get_transaction_details(id).await?;
+    let details = client
+        .get_transaction_details(target.admin_id, account, &start, &end)
+        .await?;
+    let details = only_transaction(details, id, account)?;
 
     let headers = vec![
         "ID".into(),
@@ -134,18 +163,20 @@ pub async fn show(
         "Amount".into(),
         "Currency".into(),
         "GL Account".into(),
+        "Contact".into(),
         "Description".into(),
     ];
     let rows: Vec<Vec<String>> = details
-        .iter()
+        .into_iter()
         .map(|d| {
             vec![
-                d.id.clone(),
-                d.date.clone(),
-                d.amount.clone(),
-                d.currency.clone(),
-                d.gl_account_code.clone(),
-                d.description.clone(),
+                d.id,
+                d.date,
+                d.amount,
+                d.currency,
+                d.gl_account_code,
+                d.contact_name,
+                d.description,
             ]
         })
         .collect();
@@ -179,6 +210,28 @@ mod tests {
             invoice_side(Some("CREDITOR")).unwrap(),
             InvoiceSide::Creditor
         );
+    }
+
+    fn detail(id: &str) -> TransactionDetail {
+        TransactionDetail {
+            id: id.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn show_returns_only_the_requested_transaction() {
+        let details = vec![detail("tx-1"), detail("tx-2"), detail("tx-3")];
+        let found = only_transaction(details, "tx-2", "400000").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "tx-2");
+    }
+
+    #[test]
+    fn show_reports_not_found_with_the_searched_scope() {
+        let err = only_transaction(vec![detail("tx-1")], "tx-9", "400000").unwrap_err();
+        assert!(matches!(err, YukiError::NotFound(_)), "{err}");
+        assert!(err.to_string().contains("400000"), "{err}");
     }
 
     #[test]
