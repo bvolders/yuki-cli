@@ -280,10 +280,7 @@ pub(super) fn collect(
                 Some(p) if p.covered => continue,
                 Some(p) => (Some(p.contact), true),
                 None => {
-                    if own_transfers.take(account, &key)
-                        || rules.skips_description(&tx.description)
-                        || rules.skips_gl_booking(&tx.contact_name)
-                    {
+                    if rules.skips_debit(tx, account, &key, &mut own_transfers) {
                         continue;
                     }
                     let name = bank_counterparty_name(tx);

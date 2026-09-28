@@ -221,6 +221,21 @@ impl UnmatchedRules {
                 .any(|prefix| contact.starts_with(prefix.as_str()))
     }
 
+    /// Whether a bank debit that no closed invoice explains still needs no
+    /// document: an own transfer (consumed from `own_transfers`), an ignored
+    /// description, or a booking straight to a no-document account.
+    pub(super) fn skips_debit(
+        &self,
+        tx: &GlTransactionWithContact,
+        account: &str,
+        key: &EntryKey,
+        own_transfers: &mut OwnTransfers<'_>,
+    ) -> bool {
+        own_transfers.take(account, key)
+            || self.skips_description(&tx.description)
+            || self.skips_gl_booking(&tx.contact_name)
+    }
+
     /// Whether the counterparty is ignored or is the administration itself.
     pub(super) fn skips_counterparty(&self, counterparty: &str) -> bool {
         let lower = counterparty.to_lowercase();
@@ -692,12 +707,7 @@ fn find_unmatched(
             let bank_counterparty = bank_counterparty(tx);
             let ledger_payment = ledger.claim(&key, &bank_counterparty);
             if ledger_payment.as_ref().is_some_and(|p| p.covered)
-                || own_transfers.take(account, &key)
-            {
-                continue;
-            }
-
-            if rules.skips_description(&tx.description) || rules.skips_gl_booking(&tx.contact_name)
+                || rules.skips_debit(tx, account, &key, &mut own_transfers)
             {
                 continue;
             }
