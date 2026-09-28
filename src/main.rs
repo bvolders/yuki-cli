@@ -1,7 +1,7 @@
 use std::fmt;
 use std::process;
 
-use clap::{CommandFactory, Parser};
+use clap::CommandFactory;
 use owo_colors::OwoColorize;
 use yuki_cli::cli::Cli;
 use yuki_cli::cli::Commands;
@@ -68,7 +68,7 @@ impl AppError {
 
 #[tokio::main]
 async fn main() {
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_tracked() {
         Ok(cli) => cli,
         Err(e) => {
             use clap::error::ErrorKind;
@@ -103,6 +103,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
     // An empty YUKI_BASE_URL means unset, not a root of "".
     let base_url = cli.base_url.clone().filter(|u| !u.trim().is_empty());
     let region = cli.region;
+    let region_flag = cli.region_flag();
     let load = || -> Result<Config, YukiError> {
         let mut config = Config::load()?;
         config.override_endpoint(region, base_url.as_deref());
@@ -120,6 +121,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 default_admin.as_deref().or(cli.admin.as_deref()),
                 add,
                 region,
+                region_flag,
                 base_url.as_deref(),
             )
             .await?;
@@ -136,6 +138,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     default_admin.as_deref().or(cli.admin.as_deref()),
                     add,
                     region,
+                    region_flag,
                     base_url.as_deref(),
                 )
                 .await?;

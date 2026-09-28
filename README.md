@@ -60,11 +60,26 @@ yuki init --region be
 ```
 
 The default is `nl`, so existing configurations are unaffected. `--region` (or
-`YUKI_REGION`) overrides the stored region for a single run. An administration added
-with `yuki init --add --region <other>` records its own region, so Dutch and Belgian
-books can live in one config. `--base-url <root>` (or `YUKI_BASE_URL`, or `base_url`
-in the config file) points every service at an arbitrary root such as
-`https://api.yukiworks.be/ws` and wins over any region.
+`YUKI_REGION`) overrides the stored region for a single run. `init` persists a region
+only when it is passed as the `--region` flag; an exported `YUKI_REGION` or
+`YUKI_BASE_URL` is used for that run and never written to the config. An
+administration added with `yuki init --add --region <other>` records its own region,
+so Dutch and Belgian books can live in one config. Re-running `yuki init` keeps the
+per-administration settings (region, and any other keys in its table) of every
+administration the key still reaches.
+
+The endpoint is resolved in this order, highest first:
+
+1. `--base-url` / `YUKI_BASE_URL`, then `--region` / `YUKI_REGION` — for this run,
+   for every administration and every key (so `admin list` in a mixed config reports
+   the other deployment's keys as failing);
+2. the administration's own `region`;
+3. `base_url` in the config file (replaces the default endpoint only);
+4. the top-level `region`;
+5. `nl`.
+
+Country conventions (chart of accounts, bank formats) follow the same order; a base
+URL that is not a known Yuki root (a proxy, a mock) is skipped for that purpose.
 
 ### Reaching more than one administration
 
@@ -203,7 +218,7 @@ yuki upload payment-methods                             # List payment method ID
 | `--output text\|json` | Output format (auto-detects TTY) |
 | `--quiet` | Suppress informational output |
 | `--yes` | Confirm destructive operations |
-| `--region nl\|be` | Yuki deployment (env `YUKI_REGION`; stored by `init`) |
+| `--region nl\|be` | Yuki deployment (env `YUKI_REGION`; only the flag is stored by `init`) |
 | `--base-url <root>` | Full API root, overrides `--region` (env `YUKI_BASE_URL`) |
 
 ## Periods
