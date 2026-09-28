@@ -60,6 +60,14 @@ pub struct AdminEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unmatched_ignore_descriptions: Option<Vec<String>>,
 
+    /// GL account prefixes (e.g. `657` for bank costs) that never come with a
+    /// document: a bank line booked straight to one needs no invoice, so
+    /// `check unmatched` skips it. A line booked straight to any other account
+    /// is reported. Absent means the region default (be: `65`, financial
+    /// charges); an empty list reports every GL-booked line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_document_accounts: Option<Vec<String>>,
+
     /// Per-administration settings this build does not know about, kept
     /// verbatim so an older or newer `yuki` never drops them on save.
     #[serde(flatten)]
@@ -78,6 +86,7 @@ impl AdminEntry {
             creditor_accounts: None,
             transfer_accounts: None,
             unmatched_ignore_descriptions: None,
+            no_document_accounts: None,
             extra: toml::Table::new(),
         }
     }

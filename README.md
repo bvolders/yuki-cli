@@ -272,8 +272,14 @@ also reads the supplier ledger (`440000`, three months back) to name the
 counterparty and check whether a purchase invoice of that supplier covers the
 payment, treats a same-day counter-entry on `580000` or another scanned bank
 account as an own transfer, and skips loans, credit fees, card settlements,
-salaries and tax payments by description. All of it can be tuned per
-administration:
+salaries and tax payments by description. On the supplier ledger, purchase
+credit notes reduce that supplier's open invoices and refunds received never
+count as invoices; payments are matched oldest first, including those before the
+period, so an invoice already paid cannot cover a later payment. A bank line
+booked straight to a GL account is skipped only when that account never has a
+document (`no_document_accounts`, default `65`: interest, bank costs `657xxx`,
+exchange differences); one booked straight to any other account, such as a
+`6xxxxx` expense, is reported. All of it can be tuned per administration:
 
 ```toml
 [administrations.example_bv]
@@ -285,9 +291,15 @@ creditor_accounts = ["440000"]       # [] turns the supplier ledger off
 transfer_accounts = ["580000"]
 # Replaces the Belgian defaults; matched against the full bank description.
 unmatched_ignore_descriptions = ["Lening op korte termijn", "Betaling lonen"]
+# GL prefixes a bank line may be booked to without a document; [] reports all.
+no_document_accounts = ["657", "650"]
 ```
 
 Dutch administrations keep the original behaviour unless these are set.
+
+Known limitation: individual credit-card purchases are not visible. The bank GL
+account only shows the monthly card settlement ("Afrekening kredietkaarten"),
+which is skipped, so a card purchase without an invoice is not reported.
 
 `name` and the per-administration `api_key` are optional. An administration without
 its own key uses the shared one, so rotating the shared key keeps reaching it.

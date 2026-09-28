@@ -92,6 +92,11 @@ const BE_IGNORE_DESCRIPTIONS: &[&str] = &[
     "FOD FINANCI",
 ];
 
+/// GL prefixes skipped by default for Belgian administrations when a bank line
+/// is booked straight to them: class 65, financial charges (interest, bank
+/// costs 657xxx, exchange differences), which never come with an invoice.
+const BE_NO_DOCUMENT_ACCOUNTS: &[&str] = &["65"];
+
 /// Matching rules for `check unmatched`, from region defaults and config.
 #[derive(Debug, Clone, Default)]
 struct UnmatchedRules {
@@ -99,8 +104,10 @@ struct UnmatchedRules {
     ignore_counterparties: Vec<String>,
     /// Full-description substrings to skip.
     ignore_descriptions: Vec<String>,
-    /// Skip lines whose API contact is a GL code, i.e. booked straight to the ledger.
-    skip_gl_booked: bool,
+    /// GL account prefixes that never carry a document. A bank line booked
+    /// straight to one (its API contact is that GL code) is skipped; a line
+    /// booked straight to any other account is still reported.
+    no_document_accounts: Vec<String>,
     /// Names of the administration itself; a payment to one is an own transfer.
     own_names: Vec<String>,
 }
@@ -157,7 +164,9 @@ impl UnmatchedSetup {
                 ignore_descriptions: entry
                     .and_then(|e| e.unmatched_ignore_descriptions.clone())
                     .unwrap_or_else(|| region_default(BE_IGNORE_DESCRIPTIONS)),
-                skip_gl_booked: be,
+                no_document_accounts: entry
+                    .and_then(|e| e.no_document_accounts.clone())
+                    .unwrap_or_else(|| region_default(BE_NO_DOCUMENT_ACCOUNTS)),
                 own_names,
             },
         }
@@ -205,85 +214,175 @@ impl Pool {
     }
 }
 
+/// `TransactionType` of a purchase invoice or credit note on the creditors
+/// account (Yuki Belgium). Bank and card lines carry other types (`0`, `10`).
+const PURCHASE_TRANSACTION_TYPE: &str = "9";
+
+/// What a line on the creditors control account is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreditorLine {
+    /// A purchase invoice: a credit, adds to what the supplier is owed.
+    Invoice,
+    /// A purchase credit note: a debit that reduces what is owed; no bank line.
+    CreditNote,
+    /// A payment to the supplier: a debit mirrored by a bank debit.
+    Payment,
+    /// Money back from the supplier: a credit with no document behind it.
+    Refund,
+}
+
+impl CreditorLine {
+    /// Classify by journal type when the response carries one, else by sign
+    /// alone (credit = invoice, debit = payment).
+    fn of(tx: &GlTransactionWithContact, amount: f64) -> Self {
+        let credit = amount < 0.0;
+        match tx.transaction_type.trim() {
+            "" if credit => Self::Invoice,
+            "" => Self::Payment,
+            PURCHASE_TRANSACTION_TYPE if credit => Self::Invoice,
+            PURCHASE_TRANSACTION_TYPE => Self::CreditNote,
+            _ if credit => Self::Refund,
+            _ => Self::Payment,
+        }
+    }
+}
+
+/// A supplier payment on the creditors account.
+#[derive(Debug, Clone, PartialEq)]
+struct LedgerPayment {
+    contact: String,
+    /// Whether that supplier's invoices cover it.
+    covered: bool,
+}
+
 /// What the creditors control account says about bank payments.
 #[derive(Default)]
 struct CreditorLedger {
-    /// Payments (by date and amount) covered by an invoice of the same supplier.
-    covered: Pool,
-    /// Supplier name per payment (by date and amount), covered or not.
-    contacts: HashMap<String, String>,
+    /// Supplier payments by date and amount ([`entry_key`]). Several payments
+    /// can share a key, so every one is kept.
+    payments: HashMap<String, Vec<LedgerPayment>>,
+}
+
+impl CreditorLedger {
+    /// Claim the ledger payment mirroring a bank debit with `key`, whose
+    /// counterparty according to the bank is `hint` (may be empty).
+    ///
+    /// The bank line and its ledger line share no identifier, only date and
+    /// amount, so among equal candidates this prefers the supplier the bank
+    /// names, then a covered payment (leaving the uncovered one for another
+    /// bank line), then the first in supplier-name order.
+    fn claim(&mut self, key: &str, hint: &str) -> Option<LedgerPayment> {
+        let list = self.payments.get_mut(key)?;
+        let index = list
+            .iter()
+            .position(|p| !hint.is_empty() && names_match(hint, &p.contact))
+            .or_else(|| list.iter().position(|p| p.covered))
+            .or(if list.is_empty() { None } else { Some(0) })?;
+        Some(list.remove(index))
+    }
+}
+
+/// Take up to `amount` from `invoices`, oldest first.
+fn consume_fifo(invoices: &mut Vec<(&str, f64)>, amount: f64) {
+    let mut due = amount;
+    invoices.retain_mut(|(_, open)| {
+        if due <= 0.005 {
+            return true;
+        }
+        let used = open.min(due);
+        due -= used;
+        *open -= used;
+        *open > 0.005
+    });
 }
 
 /// Match supplier payments on the creditors account to that supplier's invoices.
 ///
 /// On the creditors account an invoice is a credit and a payment a debit, each
-/// carrying the supplier as contact. A payment is covered by an invoice of the
-/// same supplier with the same amount, or else, for payments from
-/// `period_start` on, by what is left of that supplier's invoices (batched or
-/// partial payments). `entries` should reach back before the period so that
-/// invoices paid later are seen.
+/// carrying the supplier as contact. Credit notes (debits from the purchase
+/// journal) first reduce the supplier's invoices; refunds (credits from the
+/// bank) are no invoices and are ignored ([`CreditorLine`]).
+///
+/// Payments are taken in date order. Each is covered by an open invoice of
+/// the same supplier with the same amount, or else by what is left of that
+/// supplier's invoices (batched or partial payments), consumed oldest first. Payments before `period_start`
+/// consume invoices the same way, so an invoice paid before the period cannot
+/// also cover a payment inside it. `entries` should reach back before the
+/// period so that invoices paid later are seen.
 fn match_creditor_ledger(
     entries: &[GlTransactionWithContact],
     period_start: &str,
 ) -> CreditorLedger {
-    let mut ledger = CreditorLedger::default();
-    let mut invoices: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut invoices: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
+    let mut credit_notes: Vec<(&str, f64)> = Vec::new();
     let mut payments: Vec<(&GlTransactionWithContact, f64)> = Vec::new();
     for tx in entries {
         let Ok(amount) = tx.amount.trim().parse::<f64>() else {
             continue;
         };
         let contact = tx.contact_name.as_str();
-        if contact.is_empty() || is_gl_code(contact) {
+        if contact.is_empty() || is_gl_code(contact) || amount == 0.0 {
             continue;
         }
-        if amount < 0.0 {
-            invoices.entry(contact).or_default().push(-amount);
-        } else if amount > 0.0 {
-            payments.push((tx, amount));
-            ledger.contacts.insert(
-                entry_key(&tx.date, &format!("{amount:.2}")),
-                contact.to_string(),
-            );
+        match CreditorLine::of(tx, amount) {
+            CreditorLine::Invoice => invoices
+                .entry(contact)
+                .or_default()
+                .push((tx.date.as_str(), -amount)),
+            CreditorLine::CreditNote => credit_notes.push((contact, amount)),
+            CreditorLine::Payment => payments.push((tx, amount)),
+            CreditorLine::Refund => {}
         }
     }
-    payments.sort_by(|a, b| a.0.date.cmp(&b.0.date));
+    for list in invoices.values_mut() {
+        list.sort_by(|a, b| a.0.cmp(b.0));
+    }
 
     let same = |a: f64, b: f64| (a - b).abs() < 0.005;
-    let mut open: Vec<(&GlTransactionWithContact, f64)> = Vec::new();
-    for (tx, amount) in payments {
-        let list = invoices.entry(tx.contact_name.as_str()).or_default();
-        if let Some(i) = list.iter().position(|inv| same(*inv, amount)) {
-            list.swap_remove(i);
-            ledger
-                .covered
-                .add(entry_key(&tx.date, &format!("{amount:.2}")));
-        } else {
-            open.push((tx, amount));
+    for (contact, amount) in credit_notes {
+        let list = invoices.entry(contact).or_default();
+        match list.iter().position(|(_, inv)| same(*inv, amount)) {
+            Some(i) => {
+                list.remove(i);
+            }
+            None => consume_fifo(list, amount),
         }
     }
-    for (tx, amount) in open {
-        if tx.date.as_str() < period_start {
+
+    // One pass in date order, so every payment sees only the invoices that
+    // earlier payments left open.
+    payments.sort_by(|a, b| a.0.date.cmp(&b.0.date));
+    let mut covered = vec![false; payments.len()];
+    for (i, (tx, amount)) in payments.iter().enumerate() {
+        let list = invoices.entry(tx.contact_name.as_str()).or_default();
+        if let Some(j) = list.iter().position(|(_, inv)| same(*inv, *amount)) {
+            list.remove(j);
+            covered[i] = true;
             continue;
         }
-        let list = invoices.entry(tx.contact_name.as_str()).or_default();
-        let left: f64 = list.iter().sum();
-        if left + 0.005 >= amount {
-            // Consume the invoices this payment settles.
-            let mut due = amount;
-            list.retain_mut(|inv| {
-                if due <= 0.005 {
-                    return true;
-                }
-                let used = inv.min(due);
-                due -= used;
-                *inv -= used;
-                *inv > 0.005
-            });
-            ledger
-                .covered
-                .add(entry_key(&tx.date, &format!("{amount:.2}")));
+        let left: f64 = list.iter().map(|(_, inv)| inv).sum();
+        if tx.date.as_str() < period_start {
+            // Outside the period nothing is reported; it only uses up invoices.
+            consume_fifo(list, *amount);
+        } else if left + 0.005 >= *amount {
+            consume_fifo(list, *amount);
+            covered[i] = true;
         }
+    }
+
+    let mut ledger = CreditorLedger::default();
+    for ((tx, amount), covered) in payments.into_iter().zip(covered) {
+        ledger
+            .payments
+            .entry(entry_key(&tx.date, &format!("{amount:.2}")))
+            .or_default()
+            .push(LedgerPayment {
+                contact: tx.contact_name.clone(),
+                covered,
+            });
+    }
+    for list in ledger.payments.values_mut() {
+        list.sort_by(|a, b| a.contact.cmp(&b.contact));
     }
     ledger
 }
@@ -369,7 +468,14 @@ fn find_unmatched(
             let abs_amount = format!("{:.2}", amount.abs());
             let key = entry_key(&tx.date, &abs_amount);
 
-            if ledger.covered.take(&key) || transfers.take(&key) {
+            // The supplier the bank names, to pick among equal ledger payments.
+            let hint = if !tx.contact_name.is_empty() && !is_gl_code(&tx.contact_name) {
+                tx.contact_name.clone()
+            } else {
+                parse_counterparty(&tx.description)
+            };
+            let ledger_payment = ledger.claim(&key, &hint);
+            if ledger_payment.as_ref().is_some_and(|p| p.covered) || transfers.take(&key) {
                 continue;
             }
             let own_transfer = banks
@@ -383,7 +489,12 @@ fn find_unmatched(
             if ignore_desc.iter().any(|p| desc_lower.contains(p.as_str())) {
                 continue;
             }
-            if rules.skip_gl_booked && is_gl_code(&tx.contact_name) {
+            if is_gl_code(&tx.contact_name)
+                && rules
+                    .no_document_accounts
+                    .iter()
+                    .any(|prefix| tx.contact_name.starts_with(prefix.as_str()))
+            {
                 continue;
             }
 
@@ -393,7 +504,7 @@ fn find_unmatched(
 
             // Prefer the supplier from the creditors account, then the API
             // contact when it is a name, then the description.
-            let ledger_contact = ledger.contacts.remove(&key);
+            let ledger_contact = ledger_payment.map(|p| p.contact);
             let known_to_ledger = ledger_contact.is_some();
             let counterparty = match ledger_contact {
                 Some(name) => name,
@@ -556,26 +667,52 @@ pub async fn unmatched(
 /// Dutch, German, English, and Belgian (Dutch and French forms).
 const LEGAL_SUFFIXES: &[&str] = &[
     "bv", "gmbh", "inc", "ltd", "sa", "nv", "srl", "bvba", "sprl", "vzw", "asbl", "cvba", "scrl",
-    "commv",
+    "commv", "commva", "vof",
 ];
 
 /// Normalize a company name for fuzzy matching.
 ///
-/// Lowercases the name, removes "via ..." suffixes, drops legal-form words
-/// ("B.V.", "NV", "SRL", "Comm.V", ...) and punctuation, and trims whitespace.
-/// This allows loose matching between bank counterparty names and Yuki contact
-/// names despite formatting differences. Suffixes are removed as whole words
-/// only, so a name that merely contains "sa" or "nv" is left intact.
+/// Lowercases the name, removes "via ..." suffixes, treats `, ( ) - /` as word
+/// breaks, drops dots, and removes legal-form words ("B.V.", "NV", "SRL",
+/// "Comm.V", ...), including spaced spellings such as "B. V." or "Comm. V.".
+/// Suffixes are removed as whole words only, so a name that merely contains
+/// "sa" or "nv" is left intact.
+///
+/// A name made only of a legal form (or punctuation) never normalizes to
+/// empty: it falls back to its dot-less form, then to the trimmed lowercase
+/// original, so it still matches itself.
 fn normalize_name(name: &str) -> String {
-    let lower = name.to_lowercase();
+    let lower = name.trim().to_lowercase();
     // Remove "via ..." suffix (e.g. "Vimexx via Mollie" -> "vimexx")
     let base = lower.split(" via ").next().unwrap_or(&lower);
-    base.replace('.', "")
-        .replace(',', " ")
-        .split_whitespace()
-        .filter(|word| !LEGAL_SUFFIXES.contains(word))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let cleaned = base
+        .replace('.', "")
+        .replace([',', '(', ')', '-', '/'], " ");
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+
+    let mut kept: Vec<&str> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        // "B. V." and "Comm. V." arrive as two words once the dots are gone.
+        if let Some(next) = words.get(i + 1)
+            && LEGAL_SUFFIXES.contains(&format!("{}{next}", words[i]).as_str())
+        {
+            i += 2;
+            continue;
+        }
+        if !LEGAL_SUFFIXES.contains(&words[i]) {
+            kept.push(words[i]);
+        }
+        i += 1;
+    }
+
+    if !kept.is_empty() {
+        return kept.join(" ");
+    }
+    if !words.is_empty() {
+        return words.concat();
+    }
+    lower
 }
 
 /// Check whether two company names refer to the same entity.
@@ -689,7 +826,15 @@ mod tests {
             gl_account: String::new(),
             amount: amount.into(),
             contact_name: contact.into(),
+            transaction_type: String::new(),
         }
+    }
+
+    /// A creditors-account line with its journal type: "9" for a purchase
+    /// document, "0" for a bank line.
+    fn typed(kind: &str, mut t: GlTransactionWithContact) -> GlTransactionWithContact {
+        t.transaction_type = kind.into();
+        t
     }
 
     fn doc(amount: &str, contact: &str) -> ArchiveDocument {
@@ -709,9 +854,16 @@ mod tests {
         UnmatchedRules {
             ignore_counterparties: Vec::new(),
             ignore_descriptions: BE_IGNORE_DESCRIPTIONS.iter().map(|s| (*s).into()).collect(),
-            skip_gl_booked: true,
+            no_document_accounts: vec!["65".into()],
             own_names: vec![normalize_name("Example Studio BV")],
         }
+    }
+
+    /// Whether the ledger shows the payment of `amount` on `date` as covered.
+    fn covered(ledger: &mut CreditorLedger, date: &str, amount: &str) -> bool {
+        ledger
+            .claim(&entry_key(date, amount), "")
+            .is_some_and(|p| p.covered)
     }
 
     fn ids(found: &[UnmatchedDebit]) -> Vec<&str> {
@@ -809,16 +961,11 @@ mod tests {
             tx("p3", "2026-07-06", "30.00", CODA_CARD, "Supplier C"),
         ];
         let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
-        assert!(ledger.covered.take(&entry_key("2026-07-02", "50.00")));
-        assert!(ledger.covered.take(&entry_key("2026-07-05", "25.00")));
-        assert!(!ledger.covered.take(&entry_key("2026-07-06", "30.00")));
-        assert_eq!(
-            ledger
-                .contacts
-                .get(&entry_key("2026-07-06", "30.00"))
-                .map(String::as_str),
-            Some("Supplier C")
-        );
+        assert!(covered(&mut ledger, "2026-07-02", "50.00"));
+        assert!(covered(&mut ledger, "2026-07-05", "25.00"));
+        let open = ledger.claim(&entry_key("2026-07-06", "30.00"), "").unwrap();
+        assert!(!open.covered);
+        assert_eq!(open.contact, "Supplier C");
     }
 
     #[test]
@@ -835,8 +982,8 @@ mod tests {
             tx("p2", "2026-07-09", "20.00", CODA_CARD, "Supplier A"),
         ];
         let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
-        assert!(ledger.covered.take(&entry_key("2026-07-02", "20.00")));
-        assert!(!ledger.covered.take(&entry_key("2026-07-09", "20.00")));
+        assert!(covered(&mut ledger, "2026-07-02", "20.00"));
+        assert!(!covered(&mut ledger, "2026-07-09", "20.00"));
     }
 
     #[test]
@@ -1015,7 +1162,7 @@ mod tests {
         assert!(setup.creditor_accounts.is_empty());
         assert!(setup.transfer_accounts.is_empty());
         assert!(setup.rules.ignore_descriptions.is_empty());
-        assert!(!setup.rules.skip_gl_booked);
+        assert!(setup.rules.no_document_accounts.is_empty());
         assert!(setup.rules.own_names.is_empty());
     }
 
@@ -1026,7 +1173,7 @@ mod tests {
         assert_eq!(setup.creditor_accounts, ["440000"]);
         assert_eq!(setup.transfer_accounts, ["580000"]);
         assert!(!setup.rules.ignore_descriptions.is_empty());
-        assert!(setup.rules.skip_gl_booked);
+        assert_eq!(setup.rules.no_document_accounts, ["65"]);
         assert_eq!(setup.rules.own_names, ["example studio"]);
     }
 
@@ -1043,5 +1190,181 @@ mod tests {
 
         let flagged = UnmatchedSetup::resolve(&cfg, "co", &["550009".to_string()]);
         assert_eq!(flagged.bank_accounts, ["550009"]);
+    }
+
+    #[test]
+    fn normalize_name_handles_brackets_dashes_slashes_and_spaced_forms() {
+        assert_eq!(normalize_name("Example (Belgium) NV"), "example belgium");
+        assert_eq!(normalize_name("Ex-ample"), "ex ample");
+        assert_eq!(normalize_name("Example / Other"), "example other");
+        assert_eq!(normalize_name("Example Comm. V."), "example");
+        assert_eq!(normalize_name("Example Comm. VA"), "example");
+        assert_eq!(normalize_name("Example B. V."), "example");
+        assert!(names_match("Example Comm. V.", "EXAMPLE COMMV"));
+    }
+
+    #[test]
+    fn normalize_name_never_returns_empty_for_a_name() {
+        assert_eq!(normalize_name("NV"), "nv");
+        assert_eq!(normalize_name("B.V."), "bv");
+        assert_eq!(normalize_name("(-)"), "(-)");
+        assert_eq!(normalize_name("  "), "");
+    }
+
+    #[test]
+    fn creditor_ledger_lets_pre_period_payments_consume_invoices_first() {
+        let entries = vec![
+            typed(
+                "9",
+                tx("i1", "2026-05-01", "-100.00", "Factuur", "Supplier A"),
+            ),
+            typed(
+                "9",
+                tx("i2", "2026-05-15", "-100.00", "Factuur", "Supplier A"),
+            ),
+            // Paid before the period: settles i1 and half of i2 (FIFO).
+            typed(
+                "0",
+                tx("p0", "2026-06-10", "150.00", CODA_CARD, "Supplier A"),
+            ),
+            // Only 50.00 of invoices is left for this one.
+            typed(
+                "0",
+                tx("p1", "2026-07-05", "100.00", CODA_CARD, "Supplier A"),
+            ),
+        ];
+        let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
+        assert!(!covered(&mut ledger, "2026-07-05", "100.00"));
+    }
+
+    #[test]
+    fn creditor_ledger_does_not_count_a_supplier_refund_as_an_invoice() {
+        let entries = vec![
+            // Money back from the supplier: same sign as an invoice, no document.
+            typed(
+                "0",
+                tx("r1", "2026-07-01", "-80.00", CODA_TRANSFER, "Supplier A"),
+            ),
+            typed(
+                "0",
+                tx("p1", "2026-07-10", "80.00", CODA_CARD, "Supplier A"),
+            ),
+        ];
+        let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
+        assert!(!covered(&mut ledger, "2026-07-10", "80.00"));
+    }
+
+    #[test]
+    fn creditor_ledger_offsets_credit_notes_without_treating_them_as_payments() {
+        let entries = vec![
+            typed(
+                "9",
+                tx("i1", "2026-06-01", "-100.00", "Factuur", "Supplier A"),
+            ),
+            // A credit note of 30.00 leaves 70.00 to pay.
+            typed(
+                "9",
+                tx("c1", "2026-06-05", "30.00", "Creditnota", "Supplier A"),
+            ),
+            typed(
+                "0",
+                tx("p1", "2026-07-03", "70.00", CODA_CARD, "Supplier A"),
+            ),
+            // A credit note on the same day and amount as a real bank payment
+            // to another supplier must not cover that payment.
+            typed(
+                "9",
+                tx("i2", "2026-07-01", "-40.00", "Factuur", "Supplier B"),
+            ),
+            typed(
+                "9",
+                tx("c2", "2026-07-08", "40.00", "Creditnota", "Supplier B"),
+            ),
+            typed(
+                "0",
+                tx("p2", "2026-07-08", "40.00", CODA_CARD, "Supplier C"),
+            ),
+        ];
+        let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
+        assert!(covered(&mut ledger, "2026-07-03", "70.00"));
+        let p2 = ledger.claim(&entry_key("2026-07-08", "40.00"), "").unwrap();
+        assert!(!p2.covered);
+        assert_eq!(p2.contact, "Supplier C");
+        assert!(
+            ledger
+                .claim(&entry_key("2026-07-08", "40.00"), "")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn find_unmatched_keeps_every_ledger_payment_of_the_same_day_and_amount() {
+        let named = "Binnenlandse overschrijvingen - SEPA credit transfers : Enkelvoudige \
+            overschrijving | Netto bedrag: 25,000 : | SUPPLIER B NV";
+        let banks = vec![(
+            "550003".to_string(),
+            vec![
+                tx("to-b", "2026-07-06", "-25.00", named, ""),
+                tx("card", "2026-07-06", "-25.00", CODA_CARD, ""),
+            ],
+        )];
+        let creditor = vec![
+            // Supplier B was paid without an invoice; Supplier A's is covered.
+            typed("0", tx("pb", "2026-07-06", "25.00", named, "Supplier B")),
+            typed(
+                "9",
+                tx("ia", "2026-06-20", "-25.00", "Factuur", "Supplier A"),
+            ),
+            typed(
+                "0",
+                tx("pa", "2026-07-06", "25.00", CODA_CARD, "Supplier A"),
+            ),
+        ];
+        let found = find_unmatched(
+            &banks,
+            match_creditor_ledger(&creditor, "2026-07-01"),
+            &[],
+            &[],
+            &[],
+            &be_rules(),
+        );
+        assert_eq!(ids(&found), ["to-b"]);
+        assert_eq!(found[0].counterparty, "Supplier B");
+    }
+
+    #[test]
+    fn find_unmatched_skips_only_gl_bookings_to_no_document_accounts() {
+        let banks = vec![(
+            "550003".to_string(),
+            vec![
+                tx("bank-cost", "2026-07-06", "-4.56", CODA_CARD, "657100"),
+                tx("interest", "2026-07-06", "-9.10", CODA_CARD, "650000"),
+                tx("expense", "2026-07-07", "-61.50", CODA_TRANSFER, "612000"),
+            ],
+        )];
+        let found = find_unmatched(
+            &banks,
+            CreditorLedger::default(),
+            &[],
+            &[],
+            &[],
+            &be_rules(),
+        );
+        assert_eq!(ids(&found), ["expense"]);
+        assert_eq!(found[0].counterparty, "EXAMPLE RECOVERY BV");
+    }
+
+    #[test]
+    fn setup_reads_no_document_accounts() {
+        let be = UnmatchedSetup::resolve(&config("region = \"be\"", ""), "co", &[]);
+        assert_eq!(be.rules.no_document_accounts, ["65"]);
+        let nl = UnmatchedSetup::resolve(&config("", ""), "co", &[]);
+        assert!(nl.rules.no_document_accounts.is_empty());
+        let custom = config(
+            "region = \"be\"",
+            "no_document_accounts = [\"657\", \"6400\"]",
+        );
+        let setup = UnmatchedSetup::resolve(&custom, "co", &[]);
+        assert_eq!(setup.rules.no_document_accounts, ["657", "6400"]);
     }
 }

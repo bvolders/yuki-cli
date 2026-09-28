@@ -90,6 +90,7 @@ fn parses_gl_transactions_with_contact() {
     assert_eq!(txs[0].contact_name, "Hetzner Online GmbH");
     assert_eq!(txs[0].amount, "-7.28");
     assert_eq!(txs[1].contact_name, "");
+    assert_eq!(txs[0].transaction_type, "", "absent means unknown");
 }
 
 /// Belgian (CODA) bank lines: no contact on an unprocessed line, and a GL code in
@@ -117,6 +118,9 @@ fn parses_gl_transactions_with_contact_from_a_belgian_bank_account() {
     assert_eq!(txs[0].gl_account, "550003");
     assert_eq!(txs[1].contact_name, "657100");
     assert_eq!(txs[1].amount, "-4.56");
+    // The journal type separates bank lines from purchase documents.
+    assert_eq!(txs[0].transaction_type, "0");
+    assert_eq!(txs[1].transaction_type, "10");
 }
 
 #[test]

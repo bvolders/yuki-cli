@@ -37,7 +37,7 @@ pub struct GlTransaction {
 }
 
 /// A general ledger transaction with contact information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GlTransactionWithContact {
     pub id: String,
     pub date: String,
@@ -45,6 +45,10 @@ pub struct GlTransactionWithContact {
     pub gl_account: String,
     pub amount: String,
     pub contact_name: String,
+    /// Yuki's `TransactionType`: the kind of journal the line came from, e.g.
+    /// `9` for a purchase invoice or credit note and `0`/`10` for bank lines
+    /// (as observed on Yuki Belgium). Empty when the response has none.
+    pub transaction_type: String,
 }
 
 /// A general ledger account balance as of a date, from `GLAccountBalance`.
@@ -477,14 +481,7 @@ impl AccountingClient {
         let mut transactions = Vec::new();
         let mut in_transaction = false;
         let mut field: Option<String> = None;
-        let mut current = GlTransactionWithContact {
-            id: String::new(),
-            date: String::new(),
-            description: String::new(),
-            gl_account: String::new(),
-            amount: String::new(),
-            contact_name: String::new(),
-        };
+        let mut current = GlTransactionWithContact::default();
         let mut content = ElementText::default();
         let mut buf = Vec::new();
 
@@ -495,14 +492,7 @@ impl AccountingClient {
                     match local.as_str() {
                         "GLAccountTransaction" => {
                             in_transaction = true;
-                            current = GlTransactionWithContact {
-                                id: String::new(),
-                                date: String::new(),
-                                description: String::new(),
-                                gl_account: String::new(),
-                                amount: String::new(),
-                                contact_name: String::new(),
-                            };
+                            current = GlTransactionWithContact::default();
                             for attr in e.attributes().flatten() {
                                 if attr.key.as_ref() == "ID" {
                                     current.id = attr.value.into_owned();
@@ -510,7 +500,7 @@ impl AccountingClient {
                             }
                         }
                         "Date" | "Description" | "Amount" | "GLAccountCode" | "Contact"
-                        | "ContactName"
+                        | "ContactName" | "TransactionType"
                             if in_transaction =>
                         {
                             field = Some(local);
@@ -527,7 +517,7 @@ impl AccountingClient {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "Date" | "Description" | "Amount" | "GLAccountCode" | "Contact"
-                        | "ContactName" => {
+                        | "ContactName" | "TransactionType" => {
                             let text = content.take();
                             if let Some(f) = field.take() {
                                 match f.as_str() {
@@ -536,6 +526,7 @@ impl AccountingClient {
                                     "Amount" => current.amount = text,
                                     "GLAccountCode" => current.gl_account = text,
                                     "Contact" | "ContactName" => current.contact_name = text,
+                                    "TransactionType" => current.transaction_type = text,
                                     _ => {}
                                 }
                             }
