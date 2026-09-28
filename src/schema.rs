@@ -90,11 +90,7 @@ pub fn generate() -> Value {
                 "name": "vat codes",
                 "description": "List active VAT codes.",
                 "mutating": false,
-                "args": [
-                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
-                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
-                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
-                ],
+                "args": [],
                 "output_fields": [
                     {"name": "code", "type": "string"},
                     {"name": "description", "type": "string"},
@@ -133,16 +129,17 @@ pub fn generate() -> Value {
             },
             {
                 "name": "accounts balance",
-                "description": "Show the balance of a general ledger account for a period.",
+                "description": "Show GL account balances at the end of a period (or today, if it is still running).",
                 "mutating": false,
                 "args": [
                     {"name": "--account", "type": "string", "required": false, "description": "GL account code."},
-                    {"name": "--period", "type": "string", "required": false, "description": "Accounting period (e.g. 2025-01)."}
+                    {"name": "--period", "type": "string", "required": false, "description": "Accounting period (e.g. 2025-01); the balance is taken on its last day, clamped to today."}
                 ],
                 "output_fields": [
                     {"name": "account", "type": "string"},
                     {"name": "description", "type": "string"},
-                    {"name": "balance", "type": "string"}
+                    {"name": "balance", "type": "string"},
+                    {"name": "as_of", "type": "string"}
                 ]
             },
             {
@@ -167,11 +164,7 @@ pub fn generate() -> Value {
                 "name": "accounts scheme",
                 "description": "Show the chart of accounts (GL account scheme).",
                 "mutating": false,
-                "args": [
-                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
-                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
-                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
-                ],
+                "args": [],
                 "output_fields": [
                     {"name": "code", "type": "string"},
                     {"name": "description", "type": "string"},
@@ -195,10 +188,7 @@ pub fn generate() -> Value {
                 "description": "Show opening balances per GL account for a book year.",
                 "mutating": false,
                 "args": [
-                    {"name": "--year", "type": "string", "required": false, "description": "Book year (e.g. 2025)."},
-                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
-                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
-                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
+                    {"name": "--year", "type": "string", "required": false, "description": "Book year (e.g. 2025)."}
                 ],
                 "output_fields": [
                     {"name": "account", "type": "string"},
@@ -210,11 +200,7 @@ pub fn generate() -> Value {
                 "name": "projects list",
                 "description": "List all projects.",
                 "mutating": false,
-                "args": [
-                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
-                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
-                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
-                ],
+                "args": [],
                 "output_fields": [
                     {"name": "code", "type": "string"},
                     {"name": "name", "type": "string"},
@@ -238,36 +224,54 @@ pub fn generate() -> Value {
             },
             {
                 "name": "invoices list",
-                "description": "List invoices, optionally filtered by period and type.",
+                "description": "List outstanding (open) invoices, optionally filtered by period and type.",
                 "mutating": false,
                 "args": [
-                    {"name": "--period", "type": "string", "required": false, "description": "Accounting period (e.g. 2025-01)."},
-                    {"name": "--invoice-type", "type": "string", "required": false, "description": "Invoice type filter (e.g. sales, purchase)."},
+                    {"name": "--period", "type": "string", "required": false, "description": "Only items dated within this period (e.g. 2025, 2025-Q1, 2025-01)."},
+                    {"name": "--invoice-type", "type": "string", "required": false, "enum": ["sales", "debtor", "purchase", "creditor"], "default": "sales", "description": "Invoice type: sales (default, debtor items) or purchase (creditor items)."},
+                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
+                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
+                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
+                ],
+                "output_fields": [
+                    {"name": "contact", "type": "string"},
+                    {"name": "description", "type": "string"},
+                    {"name": "date", "type": "string"},
+                    {"name": "amount", "type": "string"},
+                    {"name": "open", "type": "string"}
+                ]
+            },
+            {
+                "name": "sales items",
+                "description": "List sales items (the products and services you invoice).",
+                "mutating": false,
+                "args": [
                     {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
                     {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
                     {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
                 ],
                 "output_fields": [
                     {"name": "id", "type": "string"},
-                    {"name": "date", "type": "string"},
-                    {"name": "contact", "type": "string"},
-                    {"name": "amount", "type": "string"},
-                    {"name": "status", "type": "string"}
+                    {"name": "description", "type": "string"}
                 ]
             },
             {
                 "name": "invoices show",
-                "description": "Show details for a single invoice.",
+                "description": "Show one transaction by ID. Yuki cannot look a transaction up by ID, so this fetches every line on --account within --period (one API call) and keeps the matching one.",
                 "mutating": false,
                 "args": [
-                    {"name": "id", "type": "string", "required": true, "description": "Invoice ID."}
+                    {"name": "id", "type": "string", "required": true, "description": "Transaction ID (as shown by `accounts transactions`)."},
+                    {"name": "--account", "type": "string", "required": true, "description": "GL account code the transaction is booked on."},
+                    {"name": "--period", "type": "string", "required": false, "description": "Period to search (e.g. 2025, 2025-Q1, 2025-01). Defaults to the current year."}
                 ],
                 "output_fields": [
                     {"name": "id", "type": "string"},
                     {"name": "date", "type": "string"},
-                    {"name": "contact", "type": "string"},
                     {"name": "amount", "type": "string"},
-                    {"name": "status", "type": "string"}
+                    {"name": "currency", "type": "string"},
+                    {"name": "gl_account", "type": "string"},
+                    {"name": "contact", "type": "string"},
+                    {"name": "description", "type": "string"}
                 ]
             },
             {
@@ -321,7 +325,7 @@ pub fn generate() -> Value {
                 "mutating": false,
                 "args": [
                     {"name": "--amount", "type": "number", "required": true, "description": "Invoice amount to search for."},
-                    {"name": "--date", "type": "string", "required": true, "description": "Invoice date (YYYY-MM-DD). Matches within +/-7 days."},
+                    {"name": "--date", "type": "string", "required": true, "description": "Invoice date: YYYY-MM-DD matches within +/-7 days; a period (2025, 2025-Q1, 2025-03) matches the whole period."},
                     {"name": "--contact", "type": "string", "required": false, "description": "Contact/supplier name to narrow the search."}
                 ],
                 "output_fields": [
@@ -767,6 +771,77 @@ mod tests {
         assert!(names.contains(&"profile list"), "missing 'profile list'");
         assert!(names.contains(&"config path"), "missing 'config path'");
         assert!(names.contains(&"doctor"), "missing 'doctor'");
+    }
+
+    /// Leaf commands and their arguments as clap defines them, keyed "group sub".
+    fn clap_leaves() -> Vec<(String, Vec<String>)> {
+        use clap::CommandFactory;
+        fn walk(cmd: &clap::Command, prefix: &str, out: &mut Vec<(String, Vec<String>)>) {
+            for sub in cmd.get_subcommands() {
+                let name = if prefix.is_empty() {
+                    sub.get_name().to_string()
+                } else {
+                    format!("{prefix} {}", sub.get_name())
+                };
+                if sub.has_subcommands() {
+                    walk(sub, &name, out);
+                } else {
+                    let mut args: Vec<String> = sub
+                        .get_arguments()
+                        .filter(|a| !a.is_global_set() && a.get_id() != "help")
+                        .map(|a| match a.get_long() {
+                            Some(long) => format!("--{long}"),
+                            None => a.get_id().to_string(),
+                        })
+                        .collect();
+                    args.sort();
+                    out.push((name, args));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&crate::cli::Cli::command(), "", &mut out);
+        out
+    }
+
+    #[test]
+    fn schema_commands_and_args_match_clap() {
+        let schema = generate();
+        let documented: std::collections::BTreeMap<String, Vec<String>> = schema["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let mut args: Vec<String> = c["args"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|arg| arg["name"].as_str().unwrap().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                args.sort();
+                (c["name"].as_str().unwrap().to_string(), args)
+            })
+            .collect();
+        let mut problems = Vec::new();
+        for (name, args) in clap_leaves() {
+            if matches!(name.as_str(), "completions" | "schema" | "capabilities") {
+                continue;
+            }
+            match documented.get(&name) {
+                None => problems.push(format!("{name}: missing from schema")),
+                Some(doc_args) if doc_args != &args => {
+                    problems.push(format!("{name}: schema {doc_args:?} != clap {args:?}"))
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "schema drift:\n{}",
+            problems.join("\n")
+        );
     }
 
     #[test]

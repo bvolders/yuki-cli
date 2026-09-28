@@ -289,6 +289,66 @@ fn parses_transaction_details() {
 }
 
 #[test]
+fn transaction_details_envelope_matches_the_wsdl() {
+    // AccountingInfo.GetTransactionDetails takes an administration, a GL account
+    // and a date range; it has no transaction-id parameter.
+    let envelope = AccountingInfoClient::transaction_details_envelope(
+        "session-1",
+        "admin-1",
+        "400000",
+        "2025-01-01",
+        "2025-12-31",
+    );
+    assert!(envelope.contains("<yuki:sessionID>session-1</yuki:sessionID>"));
+    assert!(envelope.contains("<yuki:administrationID>admin-1</yuki:administrationID>"));
+    assert!(envelope.contains("<yuki:GLAccountCode>400000</yuki:GLAccountCode>"));
+    assert!(envelope.contains("<yuki:StartDate>2025-01-01</yuki:StartDate>"));
+    assert!(envelope.contains("<yuki:EndDate>2025-12-31</yuki:EndDate>"));
+    assert!(envelope.contains("<yuki:financialMode>0</yuki:financialMode>"));
+    assert!(!envelope.to_lowercase().contains("transactionid"));
+}
+
+#[test]
+fn parses_transaction_details_as_returned_by_the_api() {
+    // Shape per the AccountingInfo WSDL: TransactionInfo directly under the result.
+    let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetTransactionDetailsResponse xmlns="http://www.theyukicompany.com/">
+      <GetTransactionDetailsResult>
+        <TransactionInfo>
+          <id>tx-1</id>
+          <hID>101</hID>
+          <transactionDate>2025-03-15T00:00:00</transactionDate>
+          <description>Invoice 2025-001</description>
+          <transactionAmount>121.00</transactionAmount>
+          <currency>EUR</currency>
+          <fullName>Acme B.V.</fullName>
+          <glAccountCode>400000</glAccountCode>
+        </TransactionInfo>
+        <TransactionInfo>
+          <id>tx-2</id>
+          <transactionDate>2025-04-01T00:00:00</transactionDate>
+          <description>Invoice 2025-002</description>
+          <transactionAmount>-50.00</transactionAmount>
+          <currency>EUR</currency>
+          <glAccountCode>400000</glAccountCode>
+        </TransactionInfo>
+      </GetTransactionDetailsResult>
+    </GetTransactionDetailsResponse>
+  </soap:Body>
+</soap:Envelope>"#;
+
+    let details = AccountingInfoClient::parse_transaction_details(xml).unwrap();
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].id, "tx-1");
+    assert_eq!(details[0].contact_name, "Acme B.V.");
+    assert_eq!(details[1].id, "tx-2");
+    assert_eq!(details[1].contact_name, "");
+    assert_eq!(details[1].amount, "-50.00");
+}
+
+#[test]
 fn parses_vat_returns() {
     let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">

@@ -96,3 +96,18 @@ fn month_start_before_crosses_year_boundaries() {
     assert_eq!(month_start_before("2026-02-15", 3), "2025-11-01");
     assert_eq!(month_start_before("2026-01-01", 3), "2025-10-01");
 }
+
+#[test]
+fn epoch_days_convert_to_calendar_dates() {
+    use yuki_client::period::date_from_epoch_days;
+    assert_eq!(date_from_epoch_days(0), "1970-01-01");
+    assert_eq!(date_from_epoch_days(19_782), "2024-02-29");
+    assert_eq!(date_from_epoch_days(20_724), "2026-09-28");
+}
+
+#[test]
+fn today_is_an_iso_date() {
+    let today = yuki_client::period::today();
+    assert_eq!(today.len(), 10);
+    assert!(today.as_str() >= "2026-01-01");
+}

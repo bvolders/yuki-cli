@@ -41,7 +41,7 @@ pub struct ProjectBalance {
 }
 
 /// Full details for a single transaction line.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TransactionDetail {
     pub id: String,
     pub date: String,
@@ -49,6 +49,8 @@ pub struct TransactionDetail {
     pub amount: String,
     pub currency: String,
     pub gl_account_code: String,
+    /// Contact name (`fullName`); empty when the line has no contact.
+    pub contact_name: String,
 }
 
 /// Client for the Yuki AccountingInfo SOAP service.
@@ -98,38 +100,60 @@ impl AccountingInfoClient {
         self.soap.authenticate(api_key).await
     }
 
-    /// Retrieve full details for a single transaction by ID.
+    /// Retrieve the transaction lines booked on a GL account within a date range.
+    ///
+    /// `GetTransactionDetails` has no transaction-id parameter: it returns every
+    /// line on `gl_account_code` between `start_date` and `end_date`
+    /// (`YYYY-MM-DD`). Callers looking for one transaction filter by
+    /// [`TransactionDetail::id`].
     pub async fn get_transaction_details(
         &self,
-        transaction_id: &str,
+        administration_id: &str,
+        gl_account_code: &str,
+        start_date: &str,
+        end_date: &str,
     ) -> Result<Vec<TransactionDetail>, YukiError> {
         let session = self.require_session()?;
-        let envelope = SoapEnvelope::new("GetTransactionDetails")
-            .session(session)
-            .param("transactionId", transaction_id)
-            .build();
+        let envelope = Self::transaction_details_envelope(
+            session,
+            administration_id,
+            gl_account_code,
+            start_date,
+            end_date,
+        );
         let body = self.soap.call("GetTransactionDetails", envelope).await?;
         Self::parse_transaction_details(&body)
+    }
+
+    /// Build the `GetTransactionDetails` request envelope.
+    pub fn transaction_details_envelope(
+        session_id: &str,
+        administration_id: &str,
+        gl_account_code: &str,
+        start_date: &str,
+        end_date: &str,
+    ) -> String {
+        SoapEnvelope::new("GetTransactionDetails")
+            .session(session_id)
+            .param("administrationID", administration_id)
+            .param("GLAccountCode", gl_account_code)
+            .param("StartDate", start_date)
+            .param("EndDate", end_date)
+            .param("financialMode", "0")
+            .build()
     }
 
     /// Parse a GetTransactionDetails SOAP response into a list of `TransactionDetail` values.
     ///
     /// Each `TransactionInfo` element carries child elements `id`, `transactionDate`,
-    /// `description`, `transactionAmount`, `currency`, and `glAccountCode`.
+    /// `description`, `transactionAmount`, `currency`, `glAccountCode` and `fullName`.
     pub fn parse_transaction_details(xml: &str) -> Result<Vec<TransactionDetail>, YukiError> {
         let mut reader = Reader::from_str(xml);
 
         let mut details = Vec::new();
         let mut in_info = false;
         let mut field: Option<String> = None;
-        let mut current = TransactionDetail {
-            id: String::new(),
-            date: String::new(),
-            description: String::new(),
-            amount: String::new(),
-            currency: String::new(),
-            gl_account_code: String::new(),
-        };
+        let mut current = TransactionDetail::default();
         let mut content = ElementText::default();
         let mut buf = Vec::new();
 
@@ -140,17 +164,10 @@ impl AccountingInfoClient {
                     match local.as_str() {
                         "TransactionInfo" => {
                             in_info = true;
-                            current = TransactionDetail {
-                                id: String::new(),
-                                date: String::new(),
-                                description: String::new(),
-                                amount: String::new(),
-                                currency: String::new(),
-                                gl_account_code: String::new(),
-                            };
+                            current = TransactionDetail::default();
                         }
                         "id" | "transactionDate" | "description" | "transactionAmount"
-                        | "currency" | "glAccountCode"
+                        | "currency" | "glAccountCode" | "fullName"
                             if in_info =>
                         {
                             field = Some(local);
@@ -162,7 +179,7 @@ impl AccountingInfoClient {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "id" | "transactionDate" | "description" | "transactionAmount"
-                        | "currency" | "glAccountCode" => {
+                        | "currency" | "glAccountCode" | "fullName" => {
                             let text = content.take();
                             if let Some(f) = field.take() {
                                 match f.as_str() {
@@ -172,6 +189,7 @@ impl AccountingInfoClient {
                                     "transactionAmount" => current.amount = text,
                                     "currency" => current.currency = text,
                                     "glAccountCode" => current.gl_account_code = text,
+                                    "fullName" => current.contact_name = text,
                                     _ => {}
                                 }
                             }

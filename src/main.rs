@@ -6,8 +6,8 @@ use owo_colors::OwoColorize;
 use yuki_cli::cli::Commands;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
-    DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, UploadCommands,
-    VatCommands,
+    DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, SalesCommands,
+    UploadCommands, VatCommands,
 };
 use yuki_cli::cli::{Cli, RunEndpoint};
 use yuki_cli::config::Config;
@@ -378,11 +378,47 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?;
                 }
-                InvoiceCommands::Show { id } => {
-                    yuki_cli::cli::invoices::show(&config, admin, &id, format).await?;
+                InvoiceCommands::Show {
+                    id,
+                    account,
+                    period,
+                } => {
+                    yuki_cli::cli::invoices::show(
+                        &config,
+                        admin,
+                        &id,
+                        &account,
+                        period.as_deref(),
+                        format,
+                    )
+                    .await?;
                 }
                 InvoiceCommands::Document { id } => {
                     yuki_cli::cli::invoices::document(&config, admin, &id, format).await?;
+                }
+            }
+        }
+
+        Commands::Sales { command } => {
+            let config = Config::load()?;
+            let admin = cli.admin.as_deref();
+            match command {
+                SalesCommands::Items {
+                    limit,
+                    offset,
+                    fields,
+                } => {
+                    yuki_cli::cli::sales::items(
+                        &config,
+                        admin,
+                        format,
+                        ListOptions {
+                            limit,
+                            offset,
+                            fields: fields.as_deref(),
+                        },
+                    )
+                    .await?;
                 }
             }
         }
@@ -476,7 +512,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
 
         Commands::Capabilities => {
             let value = serde_json::json!({
-                "areas": ["administrations", "vat", "contacts", "accounts", "projects", "invoices", "documents", "checks", "uploads"],
+                "areas": ["administrations", "vat", "contacts", "accounts", "projects", "invoices", "sales", "documents", "checks", "uploads"],
                 "structured_output": true,
                 "daily_api_limit": 1000
             });
@@ -490,7 +526,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                 );
             } else {
                 println!(
-                    "API areas: administrations, VAT, contacts, accounts, projects, invoices, documents, checks, uploads\nDaily API limit: 1000"
+                    "API areas: administrations, VAT, contacts, accounts, projects, invoices, sales, documents, checks, uploads\nDaily API limit: 1000"
                 );
             }
         }

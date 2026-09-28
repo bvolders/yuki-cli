@@ -7,6 +7,7 @@ pub mod documents;
 pub mod init;
 pub mod invoices;
 pub mod projects;
+pub mod sales;
 pub mod upload;
 pub mod vat;
 
@@ -199,7 +200,7 @@ pub enum Commands {
         command: AdminCommands,
     },
 
-    /// Work with sales invoices.
+    /// Work with outstanding sales and purchase invoices.
     Invoices {
         #[command(subcommand)]
         command: InvoiceCommands,
@@ -227,6 +228,12 @@ pub enum Commands {
     Vat {
         #[command(subcommand)]
         command: VatCommands,
+    },
+
+    /// Work with the sales catalogue.
+    Sales {
+        #[command(subcommand)]
+        command: SalesCommands,
     },
 
     /// Work with projects.
@@ -342,13 +349,13 @@ pub enum AdminCommands {
 
 #[derive(Subcommand)]
 pub enum InvoiceCommands {
-    /// List invoices, optionally filtered by period and type.
+    /// List outstanding (open) invoices, optionally filtered by period and type.
     List {
-        /// Accounting period (e.g. 2025-01).
+        /// Only items dated within this period (e.g. 2025, 2025-Q1, 2025-01).
         #[arg(long)]
         period: Option<String>,
 
-        /// Invoice type filter (e.g. sales, purchase).
+        /// Invoice type: sales (default, debtor items) or purchase (creditor items).
         #[arg(long)]
         invoice_type: Option<String>,
 
@@ -365,16 +372,45 @@ pub enum InvoiceCommands {
         fields: Option<String>,
     },
 
-    /// Show details for a single invoice.
+    /// Show one transaction by ID.
+    ///
+    /// Yuki cannot look a transaction up by ID, so this fetches every line on
+    /// --account within --period (one API call) and keeps the matching one.
     Show {
-        /// Invoice ID.
+        /// Transaction ID (as shown by `accounts transactions`).
         id: String,
+
+        /// GL account code the transaction is booked on.
+        #[arg(long)]
+        account: String,
+
+        /// Period to search (e.g. 2025, 2025-Q1, 2025-01). Defaults to the current year.
+        #[arg(long)]
+        period: Option<String>,
     },
 
     /// Show the document linked to a transaction.
     Document {
         /// Transaction ID.
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SalesCommands {
+    /// List sales items (the products and services you invoice).
+    Items {
+        /// Maximum number of results to return.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Number of results to skip (for pagination).
+        #[arg(long)]
+        offset: Option<usize>,
+
+        /// Comma-separated list of fields to include in output.
+        #[arg(long)]
+        fields: Option<String>,
     },
 }
 
@@ -415,7 +451,7 @@ pub enum DocumentCommands {
         /// Invoice amount to search for.
         #[arg(long)]
         amount: f64,
-        /// Invoice date (YYYY-MM-DD). Matches within +/-7 days.
+        /// Invoice date: YYYY-MM-DD matches within +/-7 days; a period (2025, 2025-Q1, 2025-03) matches the whole period.
         #[arg(long)]
         date: String,
         /// Contact/supplier name to narrow the search.
@@ -454,13 +490,13 @@ pub enum ContactCommands {
 
 #[derive(Subcommand)]
 pub enum AccountCommands {
-    /// Show the balance of a general ledger account for a period.
+    /// Show GL account balances at the end of a period (or today, if it is still running).
     Balance {
         /// GL account code.
         #[arg(long)]
         account: Option<String>,
 
-        /// Accounting period (e.g. 2025-01).
+        /// Accounting period (e.g. 2025-01); the balance is taken on its last day, clamped to today.
         #[arg(long)]
         period: Option<String>,
     },

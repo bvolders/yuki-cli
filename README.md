@@ -158,17 +158,20 @@ yuki upload file invoice.pdf --folder inkoop --amount 7.28 --remarks "Hetzner ho
 
 ```sh
 yuki vat returns                          # List all VAT return periods
-yuki vat returns --year 2025              # Filter by year
+yuki vat returns 2025                     # Filter by year
 yuki vat codes                            # List active VAT codes
 
-yuki invoices list --invoice-type purchase # Outstanding purchase invoices
-yuki invoices show <transaction-id>       # Transaction details
+yuki invoices list                        # Outstanding sales invoices (debtor items)
+yuki invoices list --invoice-type purchase # Outstanding purchase invoices (creditor items)
+yuki invoices list --period 2025-Q1       # Only items dated in the period
+yuki invoices show <transaction-id> --account 400000 --period 2025-Q1  # One transaction
 yuki invoices document <transaction-id>   # Document linked to a transaction
+yuki sales items                          # Sales item catalogue (products/services)
 
 yuki contacts search "Hetzner"            # Search contacts
 yuki contacts list                        # List all suppliers and customers
 
-yuki accounts balance --account 11001 --period 2025-Q1
+yuki accounts balance --account 11001 --period 2025-Q1  # Balance on 2025-03-31 (or today, if earlier)
 yuki accounts transactions --account 11001 --period 2025-Q1
 yuki accounts scheme                      # Chart of accounts (GL scheme)
 yuki accounts revenue --period 2025-Q1    # Net revenue for a period
@@ -184,6 +187,11 @@ yuki documents exists --amount 7.28 --date 2025-03  # Check if invoice exists
 yuki admin list                           # List administrations
 yuki admin switch <name>                  # Change default administration
 ```
+
+`invoices show` needs the GL account the transaction is booked on: Yuki has no
+lookup by transaction ID, so the CLI fetches that account's lines for `--period`
+(default: the current year) in one API call and keeps the matching one. A
+narrower period means a smaller response.
 
 ### Authentication and configuration
 
@@ -232,7 +240,7 @@ yuki upload payment-methods                             # List payment method ID
 | Flag | Description |
 |------|-------------|
 | `--profile <name>` / `--admin <name>` | Override default administration profile |
-| `--output text\|json` | Output format (auto-detects TTY) |
+| `--output auto\|text\|json` | Output format (default auto: table on a TTY, JSON when piped) |
 | `--quiet` | Suppress informational output |
 | `--yes` | Confirm destructive operations |
 | `--region nl\|be` | Yuki deployment; `init` detects it from the key when omitted (env `YUKI_REGION`; stored by `init` on a fresh config, flag-only on an existing one) |
