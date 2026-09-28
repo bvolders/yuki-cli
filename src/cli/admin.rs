@@ -111,7 +111,13 @@ async fn remote_rows(config: &Config) -> Result<Vec<Row>, YukiError> {
                 } else {
                     key.admins.join(", ")
                 };
-                eprintln!("warning: key for {used_by} could not be used: {e}");
+                // A runtime override sends every key to one endpoint, so a key
+                // from the other deployment is expected to fail here.
+                let forced = match &config.endpoint_override {
+                    Some(o) => format!(" (endpoint forced to {} for this run)", o.api_root),
+                    None => String::new(),
+                };
+                eprintln!("warning: key for {used_by} could not be used{forced}: {e}");
                 if first_failure.is_none() {
                     first_failure = Some(e);
                 }

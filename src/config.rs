@@ -35,6 +35,11 @@ pub struct AdminEntry {
         with = "region_serde"
     )]
     pub region: Option<Region>,
+
+    /// Per-administration settings this build does not know about, kept
+    /// verbatim so an older or newer `yuki` never drops them on save.
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 impl AdminEntry {
@@ -45,6 +50,7 @@ impl AdminEntry {
             name: None,
             api_key: None,
             region: None,
+            extra: toml::Table::new(),
         }
     }
 
@@ -58,6 +64,22 @@ impl AdminEntry {
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self
+    }
+
+    /// Fold a freshly discovered entry for the same administration into this one.
+    ///
+    /// Discovery only knows identifiers, the display name and (for `--add`) the
+    /// key and an explicit region; everything else the user configured survives.
+    pub fn refresh(&mut self, discovered: AdminEntry) {
+        self.domain_id = discovered.domain_id;
+        self.admin_id = discovered.admin_id;
+        if discovered.name.is_some() {
+            self.name = discovered.name;
+        }
+        self.api_key = discovered.api_key;
+        if discovered.region.is_some() {
+            self.region = discovered.region;
+        }
     }
 }
 
@@ -108,10 +130,20 @@ pub struct Config {
     /// region. An escape hatch for new deployments and local mocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// API root from `--region`/`--base-url` or `YUKI_REGION`/`YUKI_BASE_URL`.
+    /// Endpoint from `--region`/`--base-url` or `YUKI_REGION`/`YUKI_BASE_URL`.
     /// Wins over everything in the file and is never written back to it.
     #[serde(skip)]
-    pub endpoint_override: Option<String>,
+    pub endpoint_override: Option<EndpointOverride>,
+}
+
+/// A run-scoped endpoint: where to send requests and, when known, which
+/// country's conventions apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointOverride {
+    pub api_root: String,
+    /// The region given explicitly, or implied by a URL that is a known
+    /// deployment's root. `None` for a proxy or mock URL.
+    pub region: Option<Region>,
 }
 
 /// `Option<Region>` as a plain `"nl"`/`"be"` string.
@@ -200,32 +232,64 @@ impl Config {
     }
 
     /// Apply `--region`/`--base-url` (or their environment variables) for this run.
-    /// A base URL beats a region.
+    /// A base URL beats a region for the endpoint; the region, when given, still
+    /// decides the country conventions.
     pub fn override_endpoint(&mut self, region: Option<Region>, base_url: Option<&str>) {
-        if let Some(url) = base_url.filter(|u| !u.trim().is_empty()) {
-            self.endpoint_override = Some(url.trim().to_string());
-        } else if let Some(region) = region {
-            self.endpoint_override = Some(region.api_root().to_string());
-        }
+        let url = base_url.map(str::trim).filter(|u| !u.is_empty());
+        self.endpoint_override = match (url, region) {
+            (Some(url), region) => Some(EndpointOverride {
+                api_root: url.to_string(),
+                region: region.or_else(|| Region::from_api_root(url)),
+            }),
+            (None, Some(region)) => Some(EndpointOverride {
+                api_root: region.api_root().to_string(),
+                region: Some(region),
+            }),
+            (None, None) => None,
+        };
     }
 
     /// API root for `entry`, or for the shared key when `None`.
     ///
-    /// Precedence: runtime override, top-level `base_url`, the administration's
-    /// `region`, the top-level `region`, and finally the Netherlands.
+    /// Precedence, highest first:
+    /// 1. the runtime override (`--base-url`/`--region` or their env vars), for
+    ///    every administration and every key alike;
+    /// 2. the administration's own `region`;
+    /// 3. the top-level `base_url`;
+    /// 4. the top-level `region`;
+    /// 5. the Netherlands.
+    ///
+    /// A saved `base_url` replaces the default endpoint only, so it cannot pull
+    /// an administration that names its own region onto another deployment.
     pub fn api_root(&self, entry: Option<&AdminEntry>) -> &str {
-        if let Some(url) = self
-            .endpoint_override
-            .as_deref()
-            .or(self.base_url.as_deref())
-        {
+        if let Some(o) = &self.endpoint_override {
+            return &o.api_root;
+        }
+        if let Some(region) = entry.and_then(|e| e.region) {
+            return region.api_root();
+        }
+        if let Some(url) = &self.base_url {
             return url;
+        }
+        self.region.unwrap_or_default().api_root()
+    }
+
+    /// Region for `entry`: the country conventions (chart of accounts, bank
+    /// formats) of the deployment [`Config::api_root`] sends it to.
+    ///
+    /// Same precedence as `api_root`; a URL that is not a known deployment's root
+    /// (a proxy, a mock) is skipped, since it says nothing about the country.
+    pub fn region(&self, entry: Option<&AdminEntry>) -> Region {
+        if let Some(o) = &self.endpoint_override
+            && let Some(region) = o.region
+        {
+            return region;
         }
         entry
             .and_then(|e| e.region)
+            .or_else(|| self.base_url.as_deref().and_then(Region::from_api_root))
             .or(self.region)
             .unwrap_or_default()
-            .api_root()
     }
 
     /// Resolve the administration a command should run against.
@@ -319,10 +383,15 @@ impl Config {
             if api_key != self.api_key {
                 entry.api_key = Some(api_key.to_string());
             }
-            if self.administrations.insert(name.clone(), entry).is_some() {
-                updated.push(name);
-            } else {
-                added.push(name);
+            match self.administrations.get_mut(&name) {
+                Some(existing) => {
+                    existing.refresh(entry);
+                    updated.push(name);
+                }
+                None => {
+                    self.administrations.insert(name.clone(), entry);
+                    added.push(name);
+                }
             }
         }
 

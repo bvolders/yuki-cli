@@ -34,7 +34,7 @@ pub fn generate() -> Value {
             {
                 "name": "--region",
                 "type": "string",
-                "description": "Yuki deployment (env: YUKI_REGION). Overrides the configured region; init stores it.",
+                "description": "Yuki deployment (env: YUKI_REGION). Overrides the configured region for this run; init stores it only when passed as a flag.",
                 "enum": ["nl", "be"]
             },
             {

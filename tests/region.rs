@@ -230,3 +230,114 @@ fn base_url_reaches_every_authenticated_command() {
     assert_eq!(requests[0].0, "/ws/Vat.asmx");
     assert_eq!(requests[0].1, "http://www.theyukicompany.com/Authenticate");
 }
+
+fn saved_config(home: &TempDir) -> toml::Value {
+    toml::from_str(&std::fs::read_to_string(config_path(home)).expect("config"))
+        .expect("valid TOML")
+}
+
+#[test]
+fn an_exported_region_is_never_persisted_by_init() {
+    let (root, _) = mock_yuki();
+    let env = [("YUKI_REGION", "be"), ("YUKI_BASE_URL", root.as_str())];
+
+    // Fresh init.
+    let home = TempDir::new().expect("temp home");
+    let init = yuki(&home, &["init", "--api-key", "be-key"], &env);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let saved = saved_config(&home);
+    assert!(
+        saved.get("region").is_none(),
+        "env region persisted: {saved}"
+    );
+    assert!(
+        saved.get("base_url").is_none(),
+        "env URL persisted: {saved}"
+    );
+
+    // Key rotation.
+    let rotate = yuki(&home, &["init", "--api-key", "other-key"], &env);
+    assert!(
+        rotate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rotate.stderr)
+    );
+    assert!(saved_config(&home).get("region").is_none());
+
+    // --add stamps nothing either.
+    let add = yuki(&home, &["init", "--add", "--api-key", "third-key"], &env);
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let saved = saved_config(&home);
+    let entry = &saved["administrations"]["voorbeeld_bv"];
+    assert!(entry.get("region").is_none(), "env region stamped: {saved}");
+
+    // The flag, by contrast, is stored.
+    let flag = yuki(
+        &home,
+        &["init", "--add", "--api-key", "third-key", "--region", "be"],
+        &env,
+    );
+    assert!(
+        flag.status.success(),
+        "{}",
+        String::from_utf8_lossy(&flag.stderr)
+    );
+    let saved = saved_config(&home);
+    assert_eq!(
+        saved["administrations"]["voorbeeld_bv"]["region"].as_str(),
+        Some("be")
+    );
+}
+
+#[test]
+fn a_plain_reinit_keeps_the_settings_of_administrations_that_still_exist() {
+    let home = TempDir::new().expect("temp home");
+    let path = config_path(&home);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+    std::fs::write(
+        &path,
+        "api_key = \"old-key\"\ndefault_admin = \"voorbeeld_bv\"\n\n\
+         [administrations.voorbeeld_bv]\ndomain_id = \"domain-old\"\nadmin_id = \"admin-be\"\n\
+         api_key = \"stale-key\"\nregion = \"be\"\nbank_accounts = [\"550002\"]\n",
+    )
+    .expect("config");
+    let (root, _) = mock_yuki();
+
+    let init = yuki(
+        &home,
+        &[
+            "init",
+            "--api-key",
+            "be-key",
+            "--default-admin",
+            "Voorbeeld BV",
+        ],
+        &[("YUKI_BASE_URL", &root)],
+    );
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let saved = saved_config(&home);
+    let entry = &saved["administrations"]["voorbeeld_bv"];
+    assert_eq!(entry["domain_id"].as_str(), Some("domain-be"), "{saved}");
+    assert_eq!(entry["region"].as_str(), Some("be"), "{saved}");
+    assert_eq!(
+        entry["bank_accounts"][0].as_str(),
+        Some("550002"),
+        "{saved}"
+    );
+    // The new key is the shared one now, so the stale per-admin key goes.
+    assert!(entry.get("api_key").is_none(), "{saved}");
+    assert_eq!(saved["api_key"].as_str(), Some("be-key"));
+}

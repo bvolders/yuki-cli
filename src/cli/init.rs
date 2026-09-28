@@ -85,6 +85,53 @@ fn stored_region(region: Region) -> Option<Region> {
     (region != Region::default()).then_some(region)
 }
 
+/// Tell the user an environment region was used for this run but not stored.
+fn note_unstored_region(region: Option<Region>, region_flag: Option<Region>, stored: Region) {
+    if let Some(region) = region
+        && region_flag.is_none()
+        && region != stored
+    {
+        eprintln!(
+            "{}",
+            dim(&format!(
+                "note: YUKI_REGION={region} applies to this run only; \
+                 pass --region {region} to store it."
+            ))
+        );
+    }
+}
+
+/// Administrations for a plain `yuki init`: what discovery found, keeping every
+/// per-administration setting of an administration that was configured before.
+///
+/// An earlier entry is matched by `admin_id`, preferring the same config name.
+/// The key init was given becomes the shared one, so a matched entry's own key
+/// is dropped (discovery entries carry none).
+fn rebuild_administrations(
+    previous: Option<&BTreeMap<String, AdminEntry>>,
+    discovered: BTreeMap<String, AdminEntry>,
+) -> BTreeMap<String, AdminEntry> {
+    discovered
+        .into_iter()
+        .map(|(name, entry)| {
+            let earlier = previous.and_then(|p| {
+                p.get(&name)
+                    .filter(|e| e.admin_id == entry.admin_id)
+                    .or_else(|| p.values().find(|e| e.admin_id == entry.admin_id))
+            });
+            let merged = match earlier {
+                Some(earlier) => {
+                    let mut merged = earlier.clone();
+                    merged.refresh(entry);
+                    merged
+                }
+                None => entry,
+            };
+            (name, merged)
+        })
+        .collect()
+}
+
 /// Authenticate with `api_key` and list the administrations it reaches.
 async fn discover(api_key: &str, api_root: &str) -> Result<Vec<Administration>, YukiError> {
     eprint!("Authenticating...");
@@ -112,11 +159,19 @@ async fn discover(api_key: &str, api_root: &str) -> Result<Vec<Administration>, 
     }
 }
 
+/// Run `yuki init`.
+///
+/// `region` is the deployment for this run, from `--region` or `YUKI_REGION`;
+/// `region_flag` is the same value only when `--region` was typed on the command
+/// line. Only the flag is persisted: an exported environment variable is a
+/// per-shell choice and must not silently rewrite the configuration. `base_url`
+/// (flag or env) is never persisted.
 pub async fn run(
     api_key: Option<&str>,
     default_admin: Option<&str>,
     add: bool,
     region: Option<Region>,
+    region_flag: Option<Region>,
     base_url: Option<&str>,
 ) -> Result<(), YukiError> {
     let stdin = io::stdin();
@@ -132,10 +187,11 @@ pub async fn run(
             return Err(YukiError::Config("API key cannot be empty".to_string()));
         }
 
-        if let Some(region) = region {
+        if let Some(region) = region_flag {
             config.region = stored_region(region);
         }
-        config.override_endpoint(None, base_url);
+        note_unstored_region(region, region_flag, config.region.unwrap_or_default());
+        config.override_endpoint(region, base_url);
 
         eprintln!("Verifying new API key...");
         let mut client = AccountingClient::new().with_api_root(config.api_root(None));
@@ -162,18 +218,29 @@ pub async fn run(
     }
 
     if add {
-        return add_key(&path, &api_key, default_admin, region, base_url).await;
+        return add_key(
+            &path,
+            &api_key,
+            default_admin,
+            region,
+            region_flag,
+            base_url,
+        )
+        .await;
     }
 
     let existing = Config::load_from(&path).ok();
-    // A re-run keeps the stored region unless told otherwise.
-    let region = region
+    // A re-run keeps the stored region unless the flag says otherwise.
+    let stored = region_flag
         .or(existing.as_ref().and_then(|c| c.region))
         .unwrap_or_default();
+    note_unstored_region(region, region_flag, stored);
     let saved_base_url = existing.as_ref().and_then(|c| c.base_url.clone());
+    // Same precedence as Config::api_root for the shared key.
     let api_root = base_url
+        .or(region.map(Region::api_root))
         .or(saved_base_url.as_deref())
-        .unwrap_or(region.api_root());
+        .unwrap_or(stored.api_root());
 
     let admins = discover(&api_key, api_root).await?;
     if admins.is_empty() {
@@ -222,7 +289,10 @@ pub async fn run(
         safe_name(&admins[idx - 1].name)
     };
 
-    let administrations = to_entries(&admins);
+    let administrations = rebuild_administrations(
+        existing.as_ref().map(|c| &c.administrations),
+        to_entries(&admins),
+    );
 
     // A plain init replaces the administration map, so anything this key cannot reach
     // is about to disappear. Say which, rather than let a second set of books vanish.
@@ -258,7 +328,7 @@ pub async fn run(
         administrations,
         // Preserve unmatched_ignore from the existing config if present.
         unmatched_ignore: existing.map(|c| c.unmatched_ignore).unwrap_or_default(),
-        region: stored_region(region),
+        region: stored_region(stored),
         base_url: saved_base_url,
         endpoint_override: None,
     };
@@ -291,6 +361,7 @@ async fn add_key(
     api_key: &str,
     default_admin: Option<&str>,
     region: Option<Region>,
+    region_flag: Option<Region>,
     base_url: Option<&str>,
 ) -> Result<(), YukiError> {
     // Distinguish "nothing to add to" from a config that exists but will not parse;
@@ -305,13 +376,17 @@ async fn add_key(
 
     // Administrations on another deployment than the configured default carry
     // their own region, so a Dutch and a Belgian set of books can coexist.
+    // Only the flag stamps a region: an exported YUKI_REGION is for this run.
     let default_region = config.region.unwrap_or_default();
-    let region = region.unwrap_or(default_region);
-    let api_root = base_url
-        .or(config.base_url.as_deref())
-        .unwrap_or(region.api_root());
+    let stamp = region_flag.filter(|r| *r != default_region);
+    note_unstored_region(region, region_flag, default_region);
 
-    let admins = discover(api_key, api_root).await?;
+    let mut probe = AdminEntry::new("", "");
+    probe.region = stamp;
+    config.override_endpoint(region, base_url);
+    let api_root = config.api_root(Some(&probe)).to_string();
+
+    let admins = discover(api_key, &api_root).await?;
     if admins.is_empty() {
         return Err(YukiError::NotFound(
             "no administrations found for this API key".to_string(),
@@ -319,9 +394,9 @@ async fn add_key(
     }
 
     let mut entries = to_entries(&admins);
-    if region != default_region {
+    if stamp.is_some() {
         for entry in entries.values_mut() {
-            entry.region = Some(region);
+            entry.region = stamp;
         }
     }
     let (added, updated) = config.merge_administrations(entries, api_key);

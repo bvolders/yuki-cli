@@ -11,7 +11,8 @@ pub mod upload;
 pub mod vat;
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
-use clap::{Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::client::Region;
 use crate::client::accounting::AccountingClient;
@@ -58,7 +59,8 @@ pub struct Cli {
     pub yes: bool,
 
     /// Yuki deployment: nl (api.yukiworks.nl, default) or be (api.yukiworks.be).
-    /// Overrides the configured region; `yuki init` stores it.
+    /// Overrides the configured region for this run. `yuki init` stores it only
+    /// when given as a flag; an exported YUKI_REGION is never persisted.
     #[arg(
         long,
         global = true,
@@ -72,8 +74,39 @@ pub struct Cli {
     #[arg(long, global = true, env = "YUKI_BASE_URL")]
     pub base_url: Option<String>,
 
+    /// Whether `region` was typed on the command line rather than read from
+    /// `YUKI_REGION`. Clap merges both into one value, so this is recorded from
+    /// the argument's value source at parse time (see [`Cli::try_parse_tracked`]).
+    #[arg(skip)]
+    pub region_from_flag: bool,
+
     #[command(subcommand)]
     pub command: Commands,
+}
+
+impl Cli {
+    /// Parse the process arguments, recording where `--region` came from.
+    pub fn try_parse_tracked() -> Result<Self, clap::Error> {
+        Self::try_parse_tracked_from(std::env::args_os())
+    }
+
+    /// [`Cli::try_parse_tracked`] over explicit arguments.
+    pub fn try_parse_tracked_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = Self::command().try_get_matches_from(args)?;
+        let mut cli = Self::from_arg_matches(&matches)?;
+        cli.region_from_flag = matches.value_source("region") == Some(ValueSource::CommandLine);
+        Ok(cli)
+    }
+
+    /// The region only when it was passed as `--region`, i.e. the one that
+    /// `yuki init` may persist.
+    pub fn region_flag(&self) -> Option<Region> {
+        self.region.filter(|_| self.region_from_flag)
+    }
 }
 
 #[derive(Subcommand)]
@@ -531,4 +564,23 @@ pub enum UploadCommands {
 
     /// List available payment methods.
     PaymentMethods,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_flag_is_recorded_wherever_it_is_typed() {
+        for args in [
+            ["yuki", "init", "--region", "be"],
+            ["yuki", "--region", "be", "init"],
+        ] {
+            let cli = Cli::try_parse_tracked_from(args).expect("parses");
+            assert_eq!(cli.region, Some(Region::Be));
+            assert_eq!(cli.region_flag(), Some(Region::Be), "{args:?}");
+        }
+        let cli = Cli::try_parse_tracked_from(["yuki", "init"]).expect("parses");
+        assert_eq!(cli.region_flag(), None);
+    }
 }

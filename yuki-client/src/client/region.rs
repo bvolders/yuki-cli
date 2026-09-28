@@ -24,6 +24,15 @@ impl Region {
         }
     }
 
+    /// The deployment whose root `url` is, ignoring a trailing slash and case.
+    /// `None` for anything else, such as a proxy or a local mock.
+    pub fn from_api_root(url: &str) -> Option<Self> {
+        let url = url.trim().trim_end_matches('/');
+        [Self::Nl, Self::Be]
+            .into_iter()
+            .find(|r| r.api_root().eq_ignore_ascii_case(url))
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Nl => "nl",
@@ -53,4 +62,22 @@ impl FromStr for Region {
 /// Full endpoint of `service` (e.g. `Accounting.asmx`) under `api_root`.
 pub(crate) fn service_url(api_root: &str, service: &str) -> String {
     format!("{}/{service}", api_root.trim_end_matches('/'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_api_root_recognises_only_known_roots() {
+        assert_eq!(
+            Region::from_api_root("https://api.yukiworks.be/ws/"),
+            Some(Region::Be)
+        );
+        assert_eq!(
+            Region::from_api_root("https://api.yukiworks.nl/ws"),
+            Some(Region::Nl)
+        );
+        assert_eq!(Region::from_api_root("http://127.0.0.1:1/ws"), None);
+    }
 }
