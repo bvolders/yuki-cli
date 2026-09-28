@@ -4,7 +4,7 @@ use quick_xml::events::Event;
 use crate::error::YukiError;
 
 use super::soap_client::{SoapClient, SoapEnvelope};
-use super::{local_name, unescape_text};
+use super::{ElementText, local_name};
 
 const BASE_URL: &str = "https://api.yukiworks.nl/ws/Sales.asmx";
 
@@ -59,7 +59,6 @@ impl SalesClient {
     /// Each `SalesItem` element carries child elements `id` and `description`.
     pub fn parse_sales_items(xml: &str) -> Result<Vec<SalesItem>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut items = Vec::new();
         let mut in_item = false;
@@ -68,6 +67,7 @@ impl SalesClient {
             id: String::new(),
             description: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -88,24 +88,23 @@ impl SalesClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if let Some(ref f) = field {
-                        let text = unescape_text(e)
-                            .map_err(|e| YukiError::Xml(e.to_string()))?
-                            .trim()
-                            .to_string();
-                        match f.as_str() {
-                            "id" => current.id = text,
-                            "description" => current.description = text,
-                            _ => {}
-                        }
-                    }
+                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                    if field.is_some() =>
+                {
+                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "id" | "description" => {
-                            field = None;
+                            let text = content.take();
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "id" => current.id = text,
+                                    "description" => current.description = text,
+                                    _ => {}
+                                }
+                            }
                         }
                         "SalesItem" if in_item => {
                             items.push(current.clone());

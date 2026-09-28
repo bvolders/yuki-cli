@@ -6,10 +6,10 @@ pub mod sales;
 pub mod soap_client;
 pub mod vat;
 
-use std::borrow::Cow;
+use quick_xml::escape::resolve_xml_entity;
+use quick_xml::events::Event;
 
-use quick_xml::escape::EscapeError;
-use quick_xml::events::BytesText;
+use crate::error::YukiError;
 
 pub use soap_client::{SoapClient, SoapEnvelope};
 
@@ -18,9 +18,103 @@ pub(crate) fn local_name(name: &str) -> &str {
     name.rfind(':').map(|i| &name[i + 1..]).unwrap_or(name)
 }
 
-/// Decode XML entity escapes (`&amp;`, `&lt;`, ...) in an element's text
-/// content. `BytesText` carries its content pre-decoded to UTF-8 but still
-/// escaped, so this must run before the text is used.
-pub(crate) fn unescape_text<'a>(text: &'a BytesText<'_>) -> Result<Cow<'a, str>, EscapeError> {
-    quick_xml::escape::unescape(text.as_ref())
+/// Accumulates the text content of one element across reader events.
+///
+/// quick-xml (>= 0.38) splits text around entity and character references:
+/// `Smith &amp; Jones` arrives as `Text("Smith ")`, `GeneralRef("amp")`,
+/// `Text(" Jones")`. Feed every event inside the element to [`push`](Self::push)
+/// and read the value once with [`take`](Self::take) at the element's end.
+/// Readers must not enable `trim_text`, or the spaces around a reference are lost.
+#[derive(Debug, Default)]
+pub(crate) struct ElementText(String);
+
+impl ElementText {
+    /// Append the content of a text, CDATA or reference event; other events are ignored.
+    pub(crate) fn push(&mut self, event: &Event<'_>) -> Result<(), YukiError> {
+        match event {
+            Event::Text(e) => self.0.push_str(&e.xml10_content()),
+            Event::CData(e) => self.0.push_str(&e.xml10_content()),
+            Event::GeneralRef(e) => {
+                if let Some(ch) = e
+                    .resolve_char_ref()
+                    .map_err(|err| YukiError::Xml(err.to_string()))?
+                {
+                    self.0.push(ch);
+                } else if let Some(value) = resolve_xml_entity(e) {
+                    self.0.push_str(value);
+                } else {
+                    return Err(YukiError::Xml(format!(
+                        "unrecognized entity reference '&{};'",
+                        &**e
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Return the accumulated text, trimmed, and reset for the next element.
+    pub(crate) fn take(&mut self) -> String {
+        let text = std::mem::take(&mut self.0);
+        text.trim().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    use super::ElementText;
+
+    /// Collect the text of every `<v>` element, using `ElementText` the way parsers do.
+    fn values(xml: &str) -> Result<Vec<String>, crate::error::YukiError> {
+        let mut reader = Reader::from_str(xml);
+        let mut text = ElementText::default();
+        let mut in_value = false;
+        let mut out = Vec::new();
+        loop {
+            match reader.read_event().unwrap() {
+                Event::Start(e) if e.name().as_ref() == "v" => in_value = true,
+                Event::End(e) if e.name().as_ref() == "v" => {
+                    in_value = false;
+                    out.push(text.take());
+                }
+                Event::Eof => break,
+                event if in_value => text.push(&event)?,
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn joins_text_split_by_entity_references() {
+        let xml = "<r><v>Smith &amp; Jones fee</v><v>&lt;x&gt; &quot;q&quot; &apos;a&apos;</v></r>";
+        assert_eq!(values(xml).unwrap(), ["Smith & Jones fee", "<x> \"q\" 'a'"]);
+    }
+
+    #[test]
+    fn resolves_decimal_and_hex_character_references() {
+        let xml = "<r><v>caf&#233; &#x2713;&#65;</v></r>";
+        assert_eq!(values(xml).unwrap(), ["café ✓A"]);
+    }
+
+    #[test]
+    fn trims_once_and_keeps_inner_whitespace() {
+        let xml = "<r>\n  <v>\n   a &amp;  b \n </v>\n  <v>   </v>\n</r>";
+        assert_eq!(values(xml).unwrap(), ["a &  b", ""]);
+    }
+
+    #[test]
+    fn includes_cdata_sections() {
+        let xml = "<r><v>a <![CDATA[<b> & c]]> &amp; d</v></r>";
+        assert_eq!(values(xml).unwrap(), ["a <b> & c & d"]);
+    }
+
+    #[test]
+    fn rejects_unknown_entities() {
+        assert!(values("<r><v>&nbsp;</v></r>").is_err());
+    }
 }

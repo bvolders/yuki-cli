@@ -4,7 +4,7 @@ use quick_xml::events::Event;
 use crate::error::YukiError;
 
 use super::soap_client::{SoapClient, SoapEnvelope};
-use super::{local_name, unescape_text};
+use super::{ElementText, local_name};
 
 const BASE_URL: &str = "https://api.yukiworks.nl/ws/Archive.asmx";
 
@@ -268,7 +268,6 @@ impl ArchiveClient {
     /// The document ID is an XML attribute; all other fields are child text nodes.
     pub fn parse_archive_documents(xml: &str) -> Result<Vec<ArchiveDocument>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut documents = Vec::new();
         let mut in_document = false;
@@ -283,6 +282,7 @@ impl ArchiveClient {
             file_name: String::new(),
             reference: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -317,21 +317,10 @@ impl ArchiveClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) if in_document && !current_field.is_empty() => {
-                    let text = unescape_text(e)
-                        .map_err(|e| YukiError::Xml(e.to_string()))?
-                        .trim()
-                        .to_string();
-                    match current_field.as_str() {
-                        "Subject" => doc.subject = text,
-                        "DocumentDate" => doc.document_date = text,
-                        "Amount" => doc.amount = text,
-                        "Folder" => doc.folder = text,
-                        "ContactName" => doc.contact_name = text,
-                        "FileName" => doc.file_name = text,
-                        "Reference" => doc.reference = text,
-                        _ => {}
-                    }
+                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                    if in_document && !current_field.is_empty() =>
+                {
+                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
@@ -339,6 +328,17 @@ impl ArchiveClient {
                     match local {
                         "Subject" | "DocumentDate" | "Amount" | "Folder" | "ContactName"
                         | "FileName" | "Reference" => {
+                            let text = content.take();
+                            match current_field.as_str() {
+                                "Subject" => doc.subject = text,
+                                "DocumentDate" => doc.document_date = text,
+                                "Amount" => doc.amount = text,
+                                "Folder" => doc.folder = text,
+                                "ContactName" => doc.contact_name = text,
+                                "FileName" => doc.file_name = text,
+                                "Reference" => doc.reference = text,
+                                _ => {}
+                            }
                             current_field.clear();
                         }
                         "Document" => {
@@ -366,13 +366,13 @@ impl ArchiveClient {
     /// `<CostCategory ID="45100"><Description>...</Description></CostCategory>`
     pub fn parse_cost_categories(xml: &str) -> Result<Vec<CostCategory>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut categories = Vec::new();
         let mut current_id = String::new();
         let mut current_desc = String::new();
         let mut in_category = false;
         let mut in_description = false;
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -396,17 +396,19 @@ impl ArchiveClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) if in_description => {
-                    current_desc = unescape_text(e)
-                        .map_err(|e| YukiError::Xml(e.to_string()))?
-                        .trim()
-                        .to_string();
+                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                    if in_description =>
+                {
+                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
                     match local {
-                        "Description" => in_description = false,
+                        "Description" if in_description => {
+                            in_description = false;
+                            current_desc = content.take();
+                        }
                         "CostCategory" => {
                             if !current_id.is_empty() {
                                 categories.push(CostCategory {
@@ -435,13 +437,13 @@ impl ArchiveClient {
     /// `<PaymentMethod ID="4"><Description>...</Description></PaymentMethod>`
     pub fn parse_payment_methods(xml: &str) -> Result<Vec<PaymentMethod>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut methods = Vec::new();
         let mut current_id = String::new();
         let mut current_desc = String::new();
         let mut in_method = false;
         let mut in_description = false;
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -465,17 +467,19 @@ impl ArchiveClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) if in_description => {
-                    current_desc = unescape_text(e)
-                        .map_err(|e| YukiError::Xml(e.to_string()))?
-                        .trim()
-                        .to_string();
+                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                    if in_description =>
+                {
+                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
                     match local {
-                        "Description" => in_description = false,
+                        "Description" if in_description => {
+                            in_description = false;
+                            current_desc = content.take();
+                        }
                         "PaymentMethod" => {
                             if !current_id.is_empty() {
                                 methods.push(PaymentMethod {

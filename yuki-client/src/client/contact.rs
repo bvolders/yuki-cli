@@ -4,7 +4,7 @@ use quick_xml::events::Event;
 use crate::error::YukiError;
 
 use super::soap_client::{SoapClient, SoapEnvelope};
-use super::{local_name, unescape_text};
+use super::{ElementText, local_name};
 
 const BASE_URL: &str = "https://api.yukiworks.nl/ws/Contact.asmx";
 
@@ -111,7 +111,6 @@ const CONTACT_PAGE_SIZE: usize = 100;
 /// The contact ID is an XML attribute; all other fields are child text nodes.
 pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut contacts = Vec::new();
     let mut in_contact = false;
@@ -124,6 +123,7 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
         is_supplier: false,
         is_customer: false,
     };
+    let mut content = ElementText::default();
     let mut buf = Vec::new();
 
     loop {
@@ -153,25 +153,25 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
                     _ => {}
                 }
             }
-            Ok(Event::Text(ref e)) if in_contact && !current_field.is_empty() => {
-                let text = unescape_text(e)
-                    .map_err(|e| YukiError::Xml(e.to_string()))?
-                    .trim()
-                    .to_string();
-                match current_field.as_str() {
-                    "Type" => contact.contact_type = text,
-                    "Name" => contact.name = text,
-                    "Country" => contact.country = text,
-                    "IsSupplier" => contact.is_supplier = text.eq_ignore_ascii_case("true"),
-                    "IsCustomer" => contact.is_customer = text.eq_ignore_ascii_case("true"),
-                    _ => {}
-                }
+            Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                if in_contact && !current_field.is_empty() =>
+            {
+                content.push(event)?;
             }
             Ok(Event::End(ref e)) => {
                 let name = e.name();
                 let local = local_name(name.as_ref());
                 match local {
                     "Type" | "Name" | "Country" | "IsSupplier" | "IsCustomer" => {
+                        let text = content.take();
+                        match current_field.as_str() {
+                            "Type" => contact.contact_type = text,
+                            "Name" => contact.name = text,
+                            "Country" => contact.country = text,
+                            "IsSupplier" => contact.is_supplier = text.eq_ignore_ascii_case("true"),
+                            "IsCustomer" => contact.is_customer = text.eq_ignore_ascii_case("true"),
+                            _ => {}
+                        }
                         current_field.clear();
                     }
                     "Contact" => {
