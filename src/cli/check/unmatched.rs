@@ -477,8 +477,9 @@ fn consume_fifo(invoices: &mut Vec<(&str, Cents)>, amount: Cents) {
 ///
 /// On the creditors account an invoice is a credit and a payment a debit, each
 /// carrying the supplier as contact. Credit notes (debits from the purchase
-/// journal) first reduce the supplier's invoices; refunds (credits from the
-/// bank) are no invoices and are ignored ([`CreditorLine`]).
+/// journal) first reduce the supplier's invoices, unless a refund of the same
+/// supplier and amount paid them back; refunds (credits from the bank) are no
+/// invoices ([`CreditorLine`]).
 ///
 /// Payments are taken in date order. Each is covered by an open invoice of
 /// the same supplier with the same amount, or else by what is left of that
@@ -492,6 +493,7 @@ pub(super) fn match_creditor_ledger(
 ) -> CreditorLedger {
     let mut invoices: HashMap<&str, Vec<(&str, Cents)>> = HashMap::new();
     let mut credit_notes: Vec<(&str, Cents)> = Vec::new();
+    let mut refunds: Vec<(&str, Cents)> = Vec::new();
     let mut payments: Vec<(&GlTransactionWithContact, Cents)> = Vec::new();
     for tx in entries {
         let Some(amount) = Cents::parse(&tx.amount) else {
@@ -508,7 +510,14 @@ pub(super) fn match_creditor_ledger(
                 .push((tx.date.as_str(), -amount)),
             CreditorLine::CreditNote => credit_notes.push((contact, amount)),
             CreditorLine::Payment => payments.push((tx, amount)),
-            CreditorLine::Refund => {}
+            CreditorLine::Refund => refunds.push((contact, -amount)),
+        }
+    }
+    // A credit note the supplier paid back is settled by that refund, so it
+    // no longer reduces what is owed on the invoices.
+    for refund in refunds {
+        if let Some(i) = credit_notes.iter().position(|c| *c == refund) {
+            credit_notes.remove(i);
         }
     }
     for list in invoices.values_mut() {
@@ -1489,6 +1498,41 @@ mod tests {
         ];
         let mut ledger = match_creditor_ledger(&entries, "2026-07-01");
         assert!(!covered(&mut ledger, "2026-07-10", "80.00"));
+    }
+
+    #[test]
+    fn creditor_ledger_lets_a_refunded_credit_note_leave_invoices_alone() {
+        // A small credit note the supplier paid back in cash: once refunded it
+        // must not also eat into the next invoices, or every later payment
+        // drifts off its invoice by that amount.
+        let entries = vec![
+            typed(
+                "9",
+                tx("i1", "2025-10-21", "-600.00", "Factuur", "Supplier X"),
+            ),
+            typed(
+                "9",
+                tx("c1", "2025-12-05", "1.44", "Creditnota", "Supplier X"),
+            ),
+            typed(
+                "0",
+                tx("r1", "2025-12-22", "-1.44", CODA_TRANSFER, "Supplier X"),
+            ),
+            typed(
+                "0",
+                tx("p1", "2025-12-25", "600.00", CODA_CARD, "Supplier X"),
+            ),
+            typed(
+                "9",
+                tx("i2", "2026-02-02", "-500.00", "Factuur", "Supplier X"),
+            ),
+            typed(
+                "0",
+                tx("p2", "2026-04-02", "500.00", CODA_CARD, "Supplier X"),
+            ),
+        ];
+        let mut ledger = match_creditor_ledger(&entries, "2026-01-01");
+        assert!(covered(&mut ledger, "2026-04-02", "500.00"));
     }
 
     #[test]
