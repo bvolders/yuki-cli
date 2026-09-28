@@ -235,14 +235,24 @@ pub async fn run(
         .or(existing.as_ref().and_then(|c| c.region))
         .unwrap_or_default();
     note_unstored_region(region, region_flag, stored);
-    let saved_base_url = existing.as_ref().and_then(|c| c.base_url.clone());
-    // Same precedence as Config::api_root for the shared key.
-    let api_root = base_url
-        .or(region.map(Region::api_root))
-        .or(saved_base_url.as_deref())
-        .unwrap_or(stored.api_root());
+    // Start from what will be saved, so discovery resolves the endpoint exactly
+    // as later commands will. The run override is never saved.
+    let mut config = Config {
+        api_key,
+        default_admin: String::new(),
+        administrations: BTreeMap::new(),
+        // Preserve unmatched_ignore from the existing config if present.
+        unmatched_ignore: existing
+            .as_ref()
+            .map(|c| c.unmatched_ignore.clone())
+            .unwrap_or_default(),
+        region: stored_region(stored),
+        base_url: existing.as_ref().and_then(|c| c.base_url.clone()),
+        endpoint_override: None,
+    };
+    config.override_endpoint(region, base_url);
 
-    let admins = discover(&api_key, api_root).await?;
+    let admins = discover(&config.api_key, config.api_root(None)).await?;
     if admins.is_empty() {
         return Err(YukiError::NotFound(
             "no administrations found for this API key".to_string(),
@@ -322,17 +332,8 @@ pub async fn run(
         }
     }
 
-    let config = Config {
-        api_key,
-        default_admin: default_name.clone(),
-        administrations,
-        // Preserve unmatched_ignore from the existing config if present.
-        unmatched_ignore: existing.map(|c| c.unmatched_ignore).unwrap_or_default(),
-        region: stored_region(stored),
-        base_url: saved_base_url,
-        endpoint_override: None,
-    };
-
+    config.default_admin = default_name;
+    config.administrations = administrations;
     config.save_to(&path)?;
 
     eprintln!();
@@ -381,8 +382,11 @@ async fn add_key(
     let stamp = region_flag.filter(|r| *r != default_region);
     note_unstored_region(region, region_flag, default_region);
 
-    let mut probe = AdminEntry::new("", "");
-    probe.region = stamp;
+    // Resolve the endpoint as for an administration carrying the stamp.
+    let probe = AdminEntry {
+        region: stamp,
+        ..AdminEntry::new("", "")
+    };
     config.override_endpoint(region, base_url);
     let api_root = config.api_root(Some(&probe)).to_string();
 
