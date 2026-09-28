@@ -45,7 +45,14 @@ fn item(contact: &str, date: &str, open: &str) -> OutstandingItem {
         date: date.into(),
         amount: open.into(),
         open_amount: open.into(),
+        country: "BE".into(),
     }
+}
+
+fn foreign_invoice(contact: &str, date: &str, open: &str) -> OpenInvoice {
+    let mut item = item(contact, date, open);
+    item.country = "US".into();
+    OpenInvoice::from_item(&item).unwrap()
 }
 
 fn invoice(contact: &str, date: &str, open: &str) -> OpenInvoice {
@@ -261,7 +268,7 @@ fn collect_payments_uses_ledger_suppliers_and_skips_what_is_explained() {
         ..Default::default()
     };
     let ledger = match_creditor_ledger(&ledger_entries, "2026-03-01");
-    let payments = collect_payments(&banks, ledger, &transfers, &rules, "2026-03-01", "440000");
+    let payments = collect(&banks, ledger, &transfers, &rules, "2026-03-01", "440000").payments;
     let got: Vec<(&str, &str, Option<&str>, bool)> = payments
         .iter()
         .map(|p| {
@@ -295,7 +302,8 @@ fn rows_list_every_invoice_and_optionally_unallocated_payments() {
         payment("p2", "2026-05-02", "12.00", Some("Supplier Z")),
     ];
     let result = suggest(&invoices, &payments);
-    let (headers, rows) = rows(&invoices, &payments, &result, false);
+    let paid_from_bank = vec![normalize_name("Supplier H")];
+    let (headers, rows) = rows_for(&invoices, &payments, &result, &paid_from_bank);
     assert_eq!(headers[0], "Supplier");
     assert_eq!(rows.len(), 2);
     let conf = headers.iter().position(|h| h == "Confidence").unwrap();
@@ -312,7 +320,9 @@ fn rows_with(
     payments: &[Payment],
     result: &Matches,
 ) -> (Vec<String>, Vec<Vec<String>>) {
-    rows(invoices, payments, result, true)
+    let mut rows = rows_for(invoices, payments, result, &[]);
+    unallocated_rows(payments, result, &mut rows.1);
+    rows
 }
 
 /// A marketplace order paid in one card payment but invoiced per seller:
@@ -358,7 +368,7 @@ fn one_payment_adding_up_invoices_of_mixed_suppliers_is_medium() {
         assert_eq!(s.invoices, vec![1, 2]);
     }
     assert!(result.unused.is_empty());
-    let (headers, rows) = rows(&invoices, &payments, &result, false);
+    let (headers, rows) = rows_for(&invoices, &payments, &result, &[]);
     let reason = headers.iter().position(|h| h == "Reason").unwrap();
     assert!(rows[1][reason].starts_with("one payment adds up 2 invoices of several suppliers"));
     assert!(rows[0][reason].starts_with("one payment adds up 3 invoices of the supplier"));
@@ -374,4 +384,85 @@ fn invoices_are_only_added_up_close_to_the_payment() {
     let payments = vec![payment("b1", "2026-08-29", "15.00", Some("Marketplace"))];
     let result = suggest(&invoices, &payments);
     assert!(result.suggestions.iter().all(Option::is_none));
+}
+
+#[test]
+fn a_foreign_invoice_matches_a_supplier_payment_within_the_fx_tolerance_as_medium() {
+    // USD 20 booked at 17.22, charged at 17.62: 2.3% off.
+    let invoices = vec![foreign_invoice("Hosting Inc", "2026-06-07", "17.22")];
+    let payments = vec![payment("p1", "2026-06-07", "17.62", Some("Hosting Inc"))];
+    let result = suggest(&invoices, &payments);
+    let s = result.suggestions[0].as_ref().unwrap();
+    assert_eq!(s.confidence, Confidence::Medium);
+    assert!(s.fx);
+    let (headers, rows) = rows_for(&invoices, &payments, &result, &[]);
+    let reason = headers.iter().position(|h| h == "Reason").unwrap();
+    assert!(rows[0][reason].starts_with("FX:"), "{}", rows[0][reason]);
+}
+
+#[test]
+fn the_fx_tolerance_is_three_percent_or_one_euro_whichever_is_larger() {
+    assert_eq!(fx_tolerance(Cents(1722)), Cents(100));
+    assert_eq!(fx_tolerance(Cents(100_000)), Cents(3000));
+    let invoices = vec![foreign_invoice("Hosting Inc", "2026-06-07", "17.22")];
+    let too_far = vec![payment("p1", "2026-06-07", "18.23", Some("Hosting Inc"))];
+    assert_eq!(confidence_of(&suggest(&invoices, &too_far), 0), None);
+    // A nameless payment near a foreign amount is too weak to suggest.
+    let nameless = vec![payment("p1", "2026-06-07", "17.62", None)];
+    assert_eq!(confidence_of(&suggest(&invoices, &nameless), 0), None);
+}
+
+#[test]
+fn euro_invoices_stay_exact() {
+    let invoices = vec![invoice("Supplier A", "2026-06-07", "17.22")];
+    let payments = vec![payment("p1", "2026-06-07", "17.62", Some("Supplier A"))];
+    assert_eq!(confidence_of(&suggest(&invoices, &payments), 0), None);
+    assert!(!invoices[0].fx);
+    let mut unknown = item("Supplier A", "2026-06-07", "17.22");
+    unknown.country = String::new();
+    assert!(!OpenInvoice::from_item(&unknown).unwrap().fx);
+}
+
+#[test]
+fn an_unpaid_invoice_of_a_supplier_never_paid_from_the_bank_is_probably_paid_by_card() {
+    let invoices = vec![
+        invoice("Card Supplier", "2026-09-07", "17.22"),
+        invoice("Bank Supplier", "2026-09-07", "50.00"),
+    ];
+    let result = suggest(&invoices, &[]);
+    let bank_suppliers = vec![normalize_name("Bank Supplier BV")];
+    let (headers, rows) = rows_for(&invoices, &[], &result, &bank_suppliers);
+    let conf = headers.iter().position(|h| h == "Confidence").unwrap();
+    let reason = headers.iter().position(|h| h == "Reason").unwrap();
+    assert_eq!(rows[0][conf], "card");
+    assert_eq!(
+        rows[0][reason],
+        "probably paid by card: no bank line to match"
+    );
+    assert_eq!(rows[1][conf], "none");
+}
+
+#[test]
+fn collect_payments_records_every_supplier_paid_from_the_bank() {
+    // Even a payment a closed invoice explains shows the supplier is paid
+    // from the bank.
+    let banks = vec![(
+        "550000".to_string(),
+        vec![tx("b1", "2026-06-01", "-9.99", CODA_CARD, "")],
+    )];
+    let ledger_entries = vec![
+        ledger_line("9", "i1", "2026-05-31", "-9.99", "Supplier T"),
+        ledger_line("0", "l1", "2026-06-01", "9.99", "Supplier T"),
+    ];
+    let ledger = match_creditor_ledger(&ledger_entries, "2026-03-01");
+    let collected = collect(
+        &banks,
+        ledger,
+        &[],
+        &UnmatchedRules::default(),
+        "2026-03-01",
+        "440000",
+    );
+    assert!(collected.payments.is_empty());
+    assert_eq!(collected.bank_suppliers, vec!["supplier t".to_string()]);
 }

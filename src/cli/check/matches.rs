@@ -30,6 +30,20 @@ const FAR_DAYS: i64 = 90;
 const MAX_GROUP: usize = 4;
 /// Closest items considered for adding up, keeping the search cheap.
 const GROUP_CANDIDATES: usize = 12;
+/// Countries that invoice in euro. An invoice of a supplier elsewhere is
+/// taken to be in another currency: Yuki books it at its own rate, the card
+/// is charged at another, so its amount only matches within [`fx_tolerance`].
+/// The outstanding item carries no currency, only the contact's country.
+const EURO_COUNTRIES: &[&str] = &[
+    "AT", "BE", "BG", "CY", "DE", "EE", "ES", "FI", "FR", "GR", "EL", "HR", "IE", "IT", "LT", "LU",
+    "LV", "MT", "NL", "PT", "SI", "SK",
+];
+
+/// How far a payment may be off a foreign-currency invoice: 3% or 1.00,
+/// whichever is larger.
+pub(super) fn fx_tolerance(open: Cents) -> Cents {
+    Cents((open.0 * 3 / 100).max(100))
+}
 
 /// How sure a suggestion is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,6 +75,8 @@ pub(super) struct OpenInvoice {
     pub(super) contact: String,
     pub(super) date: String,
     pub(super) open: Cents,
+    /// Probably not in euro (a supplier outside the euro area).
+    pub(super) fx: bool,
 }
 
 impl OpenInvoice {
@@ -72,6 +88,10 @@ impl OpenInvoice {
             contact: item.contact_name.clone(),
             date: day(&item.date).to_string(),
             open,
+            fx: {
+                let country = item.country.trim().to_ascii_uppercase();
+                !country.is_empty() && !EURO_COUNTRIES.contains(&country.as_str())
+            },
         })
     }
 }
@@ -106,6 +126,8 @@ pub(super) struct Suggestion {
     pub(super) confidence: Confidence,
     /// Largest distance in days between the invoice and a payment.
     pub(super) days: i64,
+    /// Matched a foreign-currency invoice within [`fx_tolerance`], not exactly.
+    pub(super) fx: bool,
 }
 
 /// Suggestions per invoice (same order), and the payments no invoice took.
@@ -201,7 +223,8 @@ pub(super) fn without_open_invoices(
         .collect()
 }
 
-/// Payments from `from` on that no closed invoice explains.
+/// Payments from `from` on that no closed invoice explains, and who the bank
+/// paid.
 ///
 /// A bank debit whose creditors-account line is covered paid a closed
 /// invoice and is skipped; an uncovered one is named by that supplier. A
@@ -210,16 +233,17 @@ pub(super) fn without_open_invoices(
 /// ignored name; otherwise its bank name (if any) is its supplier. Ledger
 /// payments whose bank line is not on a scanned account (e.g. a credit
 /// card) follow, with `ledger_account` as their bank.
-pub(super) fn collect_payments(
+pub(super) fn collect(
     banks: &[(String, Vec<GlTransactionWithContact>)],
     mut ledger: CreditorLedger,
     transfer_entries: &[GlTransactionWithContact],
     rules: &UnmatchedRules,
     from: &str,
     ledger_account: &str,
-) -> Vec<Payment> {
+) -> Collected {
     let mut own_transfers = OwnTransfers::new(banks, transfer_entries);
     let mut payments = Vec::new();
+    let mut bank_suppliers = Vec::new();
     for (account, txs) in banks {
         for tx in txs {
             let Some(amount) = Cents::parse(&tx.amount).filter(|a| *a < Cents::ZERO) else {
@@ -231,6 +255,13 @@ pub(super) fn collect_payments(
             let claimed = ledger.claim(&key, &counterparty);
             if day(&tx.date) < from {
                 continue;
+            }
+            if let Some(name) = claimed
+                .as_ref()
+                .map(|p| p.contact.clone())
+                .or_else(|| bank_counterparty_name(tx))
+            {
+                bank_suppliers.push(normalize_name(&name));
             }
             let (supplier, on_ledger) = match claimed {
                 Some(p) if p.covered => continue,
@@ -289,7 +320,22 @@ pub(super) fn collect_payments(
         ))
     });
     payments.extend(ledger_only);
-    payments
+    bank_suppliers.sort();
+    bank_suppliers.dedup();
+    Collected {
+        payments,
+        bank_suppliers,
+    }
+}
+
+/// What [`collect`] found.
+pub(super) struct Collected {
+    /// Candidate payments.
+    pub(super) payments: Vec<Payment>,
+    /// Every supplier (normalized) a scanned bank account paid in the window,
+    /// candidate or not. An open invoice of a supplier missing here was
+    /// probably paid by credit card, whose purchases have no bank line.
+    pub(super) bank_suppliers: Vec<String>,
 }
 
 /// How a payment's supplier relates to an invoice's.
@@ -314,6 +360,7 @@ struct Candidate {
     payments: Vec<usize>,
     confidence: Confidence,
     days: i64,
+    fx: bool,
 }
 
 /// Subsets of 2..=[`MAX_GROUP`] of `pool` whose amounts sum to `target`
@@ -355,6 +402,8 @@ fn closest(mut pool: Vec<(i64, usize)>) -> Vec<usize> {
 
 /// Every candidate pairing, scored.
 ///
+/// - one payment, one invoice of a foreign supplier, same supplier, within
+///   [`fx_tolerance`] and [`CLOSE_DAYS`]: `medium` (FX);
 /// - one payment, one invoice: same amount; `high` with the same supplier
 ///   within [`CLOSE_DAYS`], `medium` within [`FAR_DAYS`], `low` when the
 ///   payment names no supplier (within [`CLOSE_DAYS`]);
@@ -377,6 +426,19 @@ fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> 
         for (p, payment) in payments.iter().enumerate() {
             let d = days(i, p);
             let relation = name_relation(payment, &names[i]);
+            let fx_close = invoice.fx
+                && payment.amount != invoice.open
+                && (payment.amount.0 - invoice.open.0).abs() <= fx_tolerance(invoice.open).0;
+            if fx_close && relation == Name::Same && d <= CLOSE_DAYS {
+                found.push(Candidate {
+                    invoices: vec![i],
+                    payments: vec![p],
+                    confidence: Confidence::Medium,
+                    days: d,
+                    fx: true,
+                });
+                continue;
+            }
             let confidence = match (payment.amount == invoice.open, relation) {
                 (true, Name::Same) if d <= CLOSE_DAYS => Some(Confidence::High),
                 (true, Name::Same) if d <= FAR_DAYS => Some(Confidence::Medium),
@@ -393,6 +455,7 @@ fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> 
                     payments: vec![p],
                     confidence,
                     days: d,
+                    fx: false,
                 });
             }
         }
@@ -403,6 +466,7 @@ fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> 
                 invoices: vec![i],
                 payments: set,
                 confidence: Confidence::Medium,
+                fx: false,
             });
         }
     }
@@ -434,6 +498,7 @@ fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> 
                 } else {
                     Confidence::Medium
                 },
+                fx: false,
             });
         }
     }
@@ -451,6 +516,7 @@ pub(super) fn suggest(invoices: &[OpenInvoice], payments: &[Payment]) -> Matches
         b.confidence
             .cmp(&a.confidence)
             .then(a.days.cmp(&b.days))
+            .then(a.fx.cmp(&b.fx))
             .then((a.payments.len() + a.invoices.len()).cmp(&(b.payments.len() + b.invoices.len())))
             .then(a.invoices.cmp(&b.invoices))
             .then(a.payments.cmp(&b.payments))
@@ -471,6 +537,7 @@ pub(super) fn suggest(invoices: &[OpenInvoice], payments: &[Payment]) -> Matches
             invoices: c.invoices,
             confidence: c.confidence,
             days: c.days,
+            fx: c.fx,
         };
         for &i in &suggestion.invoices {
             suggestions[i] = Some(suggestion.clone());
@@ -511,6 +578,11 @@ fn reason(s: &Suggestion, payments: &[Payment]) -> String {
             s.invoices.len()
         );
     }
+    if s.fx {
+        return format!(
+            "FX: foreign-currency invoice, amount within 3% (min 1.00), same supplier, {apart}{booked}"
+        );
+    }
     match (s.payments.len(), first.supplier.is_some()) {
         (1, true) => format!("same amount and supplier, {apart}{booked}"),
         (1, false) => format!("same amount, payment names no supplier, {apart}"),
@@ -518,13 +590,14 @@ fn reason(s: &Suggestion, payments: &[Payment]) -> String {
     }
 }
 
-/// Table rows: one per open invoice, then (with `unallocated`) the supplier
-/// payments no invoice took.
-pub(super) fn rows(
+/// Table rows, one per open invoice. One without a candidate is `card` when
+/// its supplier is missing from `bank_suppliers` (never paid from a scanned
+/// bank account), else `none`.
+pub(super) fn rows_for(
     invoices: &[OpenInvoice],
     payments: &[Payment],
     matches: &Matches,
-    unallocated: bool,
+    bank_suppliers: &[String],
 ) -> (Vec<String>, Vec<Vec<String>>) {
     let headers = [
         "Supplier",
@@ -548,7 +621,7 @@ pub(super) fn rows(
             .collect::<Vec<_>>()
             .join("; ")
     };
-    let mut rows: Vec<Vec<String>> = invoices
+    let rows: Vec<Vec<String>> = invoices
         .iter()
         .zip(&matches.suggestions)
         .map(|(invoice, s)| {
@@ -575,43 +648,49 @@ pub(super) fn rows(
                         reason(s, payments),
                     ]);
                 }
-                None => row.extend(
-                    [
-                        "none",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "no candidate payment: probably unpaid",
-                    ]
-                    .map(str::to_string),
-                ),
+                None => {
+                    let name = normalize_name(&invoice.contact);
+                    let from_bank = bank_suppliers
+                        .iter()
+                        .any(|b| normalized_names_match(b, &name));
+                    let (status, why) = if from_bank {
+                        ("none", "no candidate payment: probably unpaid")
+                    } else {
+                        ("card", "probably paid by card: no bank line to match")
+                    };
+                    row.extend([status, "", "", "", "", "", why].map(str::to_string));
+                }
             }
             row
         })
         .collect();
-    if unallocated {
-        for &p in &matches.unused {
-            let payment = &payments[p];
-            let Some(supplier) = payment.supplier.as_ref().filter(|_| payment.on_ledger) else {
-                continue;
-            };
-            rows.push(vec![
-                supplier.clone(),
-                String::new(),
-                String::new(),
-                "unallocated".into(),
-                payment.date.clone(),
-                payment.amount.to_string(),
-                payment.bank.clone(),
-                payment.id.clone(),
-                payment.counterparty.clone(),
-                "paid to the supplier, no open invoice matches".into(),
-            ]);
-        }
-    }
     (headers, rows)
+}
+
+/// Append the payments booked to a supplier that no open invoice took.
+pub(super) fn unallocated_rows(
+    payments: &[Payment],
+    matches: &Matches,
+    rows: &mut Vec<Vec<String>>,
+) {
+    for &p in &matches.unused {
+        let payment = &payments[p];
+        let Some(supplier) = payment.supplier.as_ref().filter(|_| payment.on_ledger) else {
+            continue;
+        };
+        rows.push(vec![
+            supplier.clone(),
+            String::new(),
+            String::new(),
+            "unallocated".into(),
+            payment.date.clone(),
+            payment.amount.to_string(),
+            payment.bank.clone(),
+            payment.id.clone(),
+            payment.counterparty.clone(),
+            "paid to the supplier, no open invoice matches".into(),
+        ]);
+    }
 }
 
 /// Suggest which payments already made settle the open purchase invoices.
@@ -645,8 +724,14 @@ pub async fn matches(
     );
     let mut calls = 2 + 1;
 
-    let (payments, window) = match Window::for_invoices(&invoices, &today()) {
-        None => (Vec::new(), None),
+    let (collected, window) = match Window::for_invoices(&invoices, &today()) {
+        None => (
+            Collected {
+                payments: Vec::new(),
+                bank_suppliers: Vec::new(),
+            },
+            None,
+        ),
         Some(window) => {
             if !quiet {
                 for account in &setup.bank_accounts {
@@ -700,7 +785,7 @@ pub async fn matches(
                 &window.payments_from,
             );
             let ledger_account = setup.creditor_accounts.join(",");
-            let payments = collect_payments(
+            let collected = collect(
                 &banks,
                 ledger,
                 &transfer_entries.concat(),
@@ -708,34 +793,32 @@ pub async fn matches(
                 &window.payments_from,
                 &ledger_account,
             );
-            (payments, Some(window))
+            (collected, Some(window))
         }
     };
 
+    let payments = collected.payments;
     let result = suggest(&invoices, &payments);
+    let (headers, mut rows) = rows_for(&invoices, &payments, &result, &collected.bank_suppliers);
     if !quiet {
         eprintln!("API calls made: {calls}");
-        let count = |c: Option<Confidence>| {
-            result
-                .suggestions
-                .iter()
-                .filter(|s| s.as_ref().map(|s| s.confidence) == c)
-                .count()
-        };
+        let count = |label: &str| rows.iter().filter(|r| r[3] == label).count();
         let window = window.map_or(String::new(), |w| {
             format!(" (payments {} to {})", w.payments_from, w.to)
         });
         eprintln!(
-            "{} open invoices{window}: {} high, {} medium, {} low, {} without a candidate",
+            "{} open invoices{window}: {} high, {} medium, {} low; no candidate: {} probably paid by card, {} probably unpaid",
             invoices.len(),
-            count(Some(Confidence::High)),
-            count(Some(Confidence::Medium)),
-            count(Some(Confidence::Low)),
-            count(None),
+            count("high"),
+            count("medium"),
+            count("low"),
+            count("card"),
+            count("none"),
         );
     }
-
-    let (headers, mut rows) = rows(&invoices, &payments, &result, unallocated);
+    if unallocated {
+        unallocated_rows(&payments, &result, &mut rows);
+    }
     let fmt = OutputFormat::from_flag(format, is_tty());
     if matches!(fmt, OutputFormat::Table) {
         let reason = headers.len() - 1;

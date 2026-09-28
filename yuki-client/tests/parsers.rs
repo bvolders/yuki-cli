@@ -467,6 +467,35 @@ fn parses_outstanding_creditor_items() {
     assert_eq!(items[0].contact_name, "Supplier X");
     assert_eq!(items[0].amount, "250.00");
     assert_eq!(items[0].open_amount, "250.00");
+    assert_eq!(items[0].country, "");
+}
+
+#[test]
+fn parses_the_supplier_country_of_outstanding_items() {
+    // Real shape: the address block follows the amounts, empty fields as <X />.
+    let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <OutstandingCreditorItemsResponse xmlns="http://www.theyukicompany.com/">
+      <OutstandingCreditorItemsResult>
+        <Item ID="item-1">
+          <Date>2026-09-07</Date>
+          <Contact>Hosting Inc</Contact>
+          <OpenAmount>17.22</OpenAmount>
+          <OriginalAmount>17.22</OriginalAmount>
+          <Type ID="2">Aankoopfactuur</Type>
+          <PaymentMethod>Creditcard</PaymentMethod>
+          <Postcode />
+          <Country>US</Country>
+        </Item>
+      </OutstandingCreditorItemsResult>
+    </OutstandingCreditorItemsResponse>
+  </soap:Body>
+</soap:Envelope>"#;
+    let items =
+        AccountingClient::parse_outstanding_items(xml, "OutstandingCreditorItemsResult").unwrap();
+    assert_eq!(items[0].country, "US");
+    assert_eq!(items[0].open_amount, "17.22");
 }
 
 #[test]

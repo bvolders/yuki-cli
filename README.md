@@ -346,9 +346,15 @@ transfers, ignored descriptions and no-document bookings are skipped as in
 | `high` | same amount and supplier, at most 30 days apart; or one payment to a supplier adding up several of its invoices (within 7 days) |
 | `medium` | same amount and supplier, 31 to 90 days apart; several supplier payments adding up to one invoice; or one payment adding up invoices of several suppliers (the payment's supplier within 7 days, or any supplier dated that day, as with a marketplace order invoiced per seller) |
 | `low` | same amount, the payment names no supplier, at most 30 days apart |
+| `card` | no candidate, and the supplier was never paid from a scanned bank account in the window: probably paid by credit card, whose purchases have no bank line |
 | `none` | no candidate payment: probably unpaid |
 
-Amounts must match to the cent; sums add up to four items. Each payment and each
+Amounts must match to the cent; sums add up to four items. The exception is an
+invoice of a supplier outside the euro area (the open item carries the
+supplier's country, not the currency): Yuki books it at its own exchange rate
+and the card is charged at another, so a payment of that supplier within 3% or
+1.00 (whichever is larger) and 30 days is suggested as `medium`, with a reason
+starting `FX:`. Each payment and each
 invoice is used once, strongest confidence first, then closest in date.
 `--unallocated` adds the supplier payments no open invoice took.
 

@@ -1380,6 +1380,7 @@ mod tests {
             date: String::new(),
             amount: "100.00".into(),
             open_amount: "100.00".into(),
+            ..Default::default()
         }];
         let found = find_unmatched(
             &banks,

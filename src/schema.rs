@@ -374,7 +374,7 @@ pub fn generate() -> Value {
                     {"name": "supplier", "type": "string"},
                     {"name": "invoice_date", "type": "string"},
                     {"name": "open", "type": "string"},
-                    {"name": "confidence", "type": "string", "description": "high, medium, low, none (no candidate: probably unpaid) or unallocated."},
+                    {"name": "confidence", "type": "string", "description": "high, medium, low, card (no candidate; supplier never paid from the bank, probably by credit card), none (no candidate: probably unpaid) or unallocated."},
                     {"name": "payment_date", "type": "string"},
                     {"name": "paid", "type": "string"},
                     {"name": "bank", "type": "string"},

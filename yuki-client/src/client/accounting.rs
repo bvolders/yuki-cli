@@ -17,13 +17,15 @@ pub struct Administration {
 }
 
 /// An outstanding debtor or creditor item.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OutstandingItem {
     pub contact_name: String,
     pub description: String,
     pub date: String,
     pub amount: String,
     pub open_amount: String,
+    /// The contact's country code (e.g. `BE`, `US`); empty when not set.
+    pub country: String,
 }
 
 /// A general ledger transaction.
@@ -662,13 +664,7 @@ impl AccountingClient {
         let mut in_result = false;
         let mut in_item = false;
         let mut field: Option<String> = None;
-        let mut current = OutstandingItem {
-            contact_name: String::new(),
-            description: String::new(),
-            date: String::new(),
-            amount: String::new(),
-            open_amount: String::new(),
-        };
+        let mut current = OutstandingItem::default();
         let mut content = ElementText::default();
         let mut buf = Vec::new();
 
@@ -680,16 +676,10 @@ impl AccountingClient {
                         tag if tag == result_tag => in_result = true,
                         "Item" if in_result => {
                             in_item = true;
-                            current = OutstandingItem {
-                                contact_name: String::new(),
-                                description: String::new(),
-                                date: String::new(),
-                                amount: String::new(),
-                                open_amount: String::new(),
-                            };
+                            current = OutstandingItem::default();
                         }
                         "Contact" | "ContactName" | "Description" | "Date" | "Amount"
-                        | "OriginalAmount" | "OpenAmount"
+                        | "OriginalAmount" | "OpenAmount" | "Country"
                             if in_item =>
                         {
                             field = Some(local);
@@ -701,7 +691,7 @@ impl AccountingClient {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "Contact" | "ContactName" | "Description" | "Date" | "Amount"
-                        | "OriginalAmount" | "OpenAmount" => {
+                        | "OriginalAmount" | "OpenAmount" | "Country" => {
                             let text = content.take();
                             if let Some(f) = field.take() {
                                 match f.as_str() {
@@ -710,6 +700,7 @@ impl AccountingClient {
                                     "Date" => current.date = text,
                                     "Amount" | "OriginalAmount" => current.amount = text,
                                     "OpenAmount" => current.open_amount = text,
+                                    "Country" => current.country = text,
                                     _ => {}
                                 }
                             }
