@@ -48,7 +48,8 @@ pub(super) fn fx_tolerance(open: Cents) -> Cents {
 /// How sure a suggestion is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Confidence {
-    /// Same amount, but the payment names no supplier.
+    /// Same amount, but the payment names no supplier (one invoice, or
+    /// several dated the payment's day).
     Low,
     /// Same supplier and amount far apart in date; several payments of the
     /// supplier adding up to one invoice; or one payment adding up invoices
@@ -434,7 +435,8 @@ fn closest(mut pool: Vec<(i64, usize)>) -> Vec<usize> {
 /// - one payment adding up several invoices, each of the payment's supplier
 ///   within [`GROUP_DAYS`] or of any supplier dated the payment's day (a
 ///   marketplace order split per seller): `high` when all are the payment's
-///   supplier, else `medium`.
+///   supplier, `medium` when some are, never when the payment names none of
+///   them; a payment naming nobody adds up only same-day invoices, as `low`.
 fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> {
     let names: Vec<String> = invoices
         .iter()
@@ -500,26 +502,33 @@ fn candidates(invoices: &[OpenInvoice], payments: &[Payment]) -> Vec<Candidate> 
                 .enumerate()
                 .filter(|(i, invoice)| {
                     invoice.open < payment.amount
-                        && ((days(*i, p) <= GROUP_DAYS
-                            && name_relation(payment, &names[*i]) == Name::Same)
-                            || invoice.date == payment.date)
+                        && match name_relation(payment, &names[*i]) {
+                            Name::Same => days(*i, p) <= GROUP_DAYS,
+                            // Another seller's part of a same-day order.
+                            Name::Other | Name::Unknown => invoice.date == payment.date,
+                        }
                 })
                 .map(|(i, _)| (days(i, p), i))
                 .collect(),
         );
         for set in subsets(&pool, &|i| invoices[i].open.0, payment.amount.0) {
-            let all_same = set
+            let same = set
                 .iter()
-                .all(|&i| name_relation(payment, &names[i]) == Name::Same);
+                .filter(|&&i| name_relation(payment, &names[i]) == Name::Same)
+                .count();
+            let confidence = match (&payment.supplier, same) {
+                // A nameless payment may be anyone's.
+                (None, _) => Confidence::Low,
+                // It names someone else: it pays none of them.
+                (Some(_), 0) => continue,
+                (Some(_), n) if n == set.len() => Confidence::High,
+                (Some(_), _) => Confidence::Medium,
+            };
             found.push(Candidate {
                 days: set.iter().map(|&i| days(i, p)).max().unwrap_or(0),
                 invoices: set,
                 payments: vec![p],
-                confidence: if all_same {
-                    Confidence::High
-                } else {
-                    Confidence::Medium
-                },
+                confidence,
                 fx: false,
             });
         }
@@ -591,12 +600,13 @@ fn reason(s: &Suggestion, payments: &[Payment]) -> String {
         format!("within {} days", s.days)
     };
     if s.invoices.len() > 1 {
-        let suppliers = match s.confidence {
-            Confidence::High => "of the supplier",
-            _ => "of several suppliers",
+        let (payment, suppliers) = match s.confidence {
+            Confidence::High => ("payment", "of the supplier"),
+            Confidence::Medium => ("payment", "of several suppliers"),
+            Confidence::Low => ("nameless payment", "dated that day"),
         };
         return format!(
-            "one payment adds up {} invoices {suppliers}, {within}{booked}",
+            "one {payment} adds up {} invoices {suppliers}, {within}{booked}",
             s.invoices.len()
         );
     }

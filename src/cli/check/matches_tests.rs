@@ -522,3 +522,42 @@ fn a_supplier_name_inside_another_word_is_not_the_same_supplier() {
     let payments = vec![payment("p1", "2026-06-11", "31.40", Some("ING"))];
     assert_eq!(confidence_of(&suggest(&invoices, &payments), 0), None);
 }
+
+#[test]
+fn a_payment_naming_another_supplier_never_adds_up_same_day_invoices() {
+    let invoices = vec![
+        invoice("Seller X BV", "2026-05-04", "10.10"),
+        invoice("Seller Y BV", "2026-05-04", "20.20"),
+    ];
+    let payments = vec![payment(
+        "p1",
+        "2026-05-04",
+        "30.30",
+        Some("Janssens-Peeters"),
+    )];
+    let result = suggest(&invoices, &payments);
+    assert!(result.suggestions.iter().all(Option::is_none));
+    assert_eq!(result.unused, vec![0]);
+}
+
+#[test]
+fn a_nameless_payment_adding_up_same_day_invoices_is_low() {
+    let invoices = vec![
+        invoice("Seller X BV", "2026-05-04", "10.10"),
+        invoice("Seller Y BV", "2026-05-04", "20.20"),
+    ];
+    let payments = vec![payment("p1", "2026-05-04", "30.30", None)];
+    let result = suggest(&invoices, &payments);
+    for i in [0, 1] {
+        let s = result.suggestions[i].as_ref().unwrap();
+        assert_eq!(s.confidence, Confidence::Low, "invoice {i}");
+        assert_eq!(s.invoices, vec![0, 1]);
+    }
+    let (headers, rows) = rows_for(&invoices, &payments, &result, &PaidVia::default());
+    let reason = headers.iter().position(|h| h == "Reason").unwrap();
+    assert!(
+        rows[0][reason].starts_with("one nameless payment adds up 2 invoices"),
+        "{}",
+        rows[0][reason]
+    );
+}
