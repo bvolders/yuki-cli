@@ -53,7 +53,7 @@ pub async fn list(
         // Default to sales invoices when type is "sales", "debtor", or unspecified
         _ => {
             let target = config.target(admin)?;
-            let mut client = SalesClient::new();
+            let mut client = SalesClient::new().with_api_root(target.api_root);
             client.authenticate(target.api_key).await?;
             let items = client.get_sales_items().await?;
 
@@ -82,7 +82,7 @@ pub async fn document(
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = AccountingInfoClient::new();
+    let mut client = AccountingInfoClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let xml = client.get_transaction_document(target.admin_id, id).await?;
 
@@ -110,7 +110,7 @@ pub async fn show(
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = AccountingInfoClient::new();
+    let mut client = AccountingInfoClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let details = client.get_transaction_details(id).await?;
 

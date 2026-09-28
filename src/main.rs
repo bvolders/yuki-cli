@@ -100,6 +100,14 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), AppError> {
     let format = cli.output.as_deref();
+    // An empty YUKI_BASE_URL means unset, not a root of "".
+    let base_url = cli.base_url.clone().filter(|u| !u.trim().is_empty());
+    let region = cli.region;
+    let load = || -> Result<Config, YukiError> {
+        let mut config = Config::load()?;
+        config.override_endpoint(region, base_url.as_deref());
+        Ok(config)
+    };
 
     match cli.command {
         Commands::Init {
@@ -111,6 +119,8 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 api_key.as_deref(),
                 default_admin.as_deref().or(cli.admin.as_deref()),
                 add,
+                region,
+                base_url.as_deref(),
             )
             .await?;
         }
@@ -125,11 +135,13 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     api_key.as_deref(),
                     default_admin.as_deref().or(cli.admin.as_deref()),
                     add,
+                    region,
+                    base_url.as_deref(),
                 )
                 .await?;
             }
             AuthCommands::Status { offline } => {
-                let config = Config::load()?;
+                let config = load()?;
                 yuki_cli::cli::account::auth_status(
                     &config,
                     cli.admin.as_deref(),
@@ -140,7 +152,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 .await?;
             }
             AuthCommands::Logout => {
-                let mut config = Config::load()?;
+                let mut config = load()?;
                 yuki_cli::cli::account::auth_logout(
                     &mut config,
                     cli.admin.as_deref(),
@@ -151,7 +163,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         },
 
         Commands::Profile { command } => {
-            let mut config = Config::load()?;
+            let mut config = load()?;
             match command {
                 ProfileCommands::List => {
                     yuki_cli::cli::account::profile_list(&config, format, cli.quiet);
@@ -172,7 +184,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 
         Commands::Config { command } => match command {
             ConfigCommands::Show => {
-                let config = Config::load()?;
+                let config = load()?;
                 yuki_cli::cli::account::config_show(&config, format, cli.quiet);
             }
             ConfigCommands::Path => {
@@ -181,7 +193,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         },
 
         Commands::Doctor { offline } => {
-            let config = Config::load()?;
+            let config = load()?;
             yuki_cli::cli::account::doctor(
                 &config,
                 cli.admin.as_deref(),
@@ -193,7 +205,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Admin { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             match command {
                 AdminCommands::List {
                     local,
@@ -221,7 +233,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Vat { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 VatCommands::Returns { year } => {
@@ -234,7 +246,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Contacts { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 ContactCommands::Search { query } => {
@@ -263,7 +275,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Accounts { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 AccountCommands::Balance { account, period } => {
@@ -312,7 +324,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Projects { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 ProjectCommands::List => {
@@ -337,7 +349,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Invoices { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 InvoiceCommands::List {
@@ -371,7 +383,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Documents { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 DocumentCommands::List {
@@ -417,7 +429,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Check { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 CheckCommands::Btw { period } => {
@@ -479,7 +491,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         }
 
         Commands::Upload { command } => {
-            let config = Config::load()?;
+            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
                 UploadCommands::File {

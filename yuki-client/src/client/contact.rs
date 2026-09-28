@@ -4,9 +4,9 @@ use quick_xml::events::Event;
 use crate::error::YukiError;
 
 use super::soap_client::{SoapClient, SoapEnvelope};
-use super::{local_name, unescape_text};
+use super::{Region, local_name, service_url, unescape_text};
 
-const BASE_URL: &str = "https://api.yukiworks.nl/ws/Contact.asmx";
+const SERVICE: &str = "Contact.asmx";
 
 /// A Yuki contact (customer or supplier).
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ pub struct ContactClient {
 impl ContactClient {
     pub fn new() -> Self {
         Self {
-            soap: SoapClient::new(BASE_URL),
+            soap: SoapClient::new(&service_url(Region::default().api_root(), SERVICE)),
         }
     }
 
@@ -35,8 +35,24 @@ impl ContactClient {
     /// share a single pooled client across all service clients.
     pub fn with_client(http: reqwest::Client) -> Self {
         Self {
-            soap: SoapClient::with_client(BASE_URL, http),
+            soap: SoapClient::with_client(
+                &service_url(Region::default().api_root(), SERVICE),
+                http,
+            ),
         }
+    }
+
+    /// Target another Yuki deployment, e.g. `Region::Be.api_root()`, or any root
+    /// such as a local mock. The service path is appended to `api_root`.
+    #[must_use]
+    pub fn with_api_root(mut self, api_root: &str) -> Self {
+        self.soap.base_url = service_url(api_root, SERVICE);
+        self
+    }
+
+    /// The endpoint this client posts to.
+    pub fn base_url(&self) -> &str {
+        &self.soap.base_url
     }
 
     fn require_session(&self) -> Result<&str, YukiError> {

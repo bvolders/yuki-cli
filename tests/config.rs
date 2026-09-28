@@ -1,3 +1,4 @@
+use yuki_cli::client::Region;
 use yuki_cli::config::{AdminEntry, Config};
 
 /// Build a config from a shared key, a default administration, and entries.
@@ -14,6 +15,9 @@ fn config_with(
             .map(|(name, entry)| (name.to_string(), entry))
             .collect(),
         unmatched_ignore: Vec::new(),
+        region: None,
+        base_url: None,
+        endpoint_override: None,
     }
 }
 
@@ -473,4 +477,121 @@ admin_id = "admin-1"
 
     let config = Config::load_from(&path).unwrap();
     assert!(config.unmatched_ignore.is_empty());
+}
+
+#[test]
+fn a_config_without_region_targets_the_netherlands() {
+    let config = config_with("key", "a", [("a", AdminEntry::new("d", "x"))]);
+    let target = config.target(None).unwrap();
+    assert_eq!(target.api_root, "https://api.yukiworks.nl/ws");
+}
+
+#[test]
+fn loads_top_level_and_per_administration_regions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+api_key = "shared-key"
+default_admin = "brussels"
+region = "be"
+
+[administrations.brussels]
+domain_id = "d1"
+admin_id = "a1"
+
+[administrations.amsterdam]
+domain_id = "d2"
+admin_id = "a2"
+api_key = "nl-key"
+region = "nl"
+"#,
+    )
+    .unwrap();
+
+    let config = Config::load_from(&path).unwrap();
+    assert_eq!(config.region, Some(Region::Be));
+    assert_eq!(
+        config.target(Some("brussels")).unwrap().api_root,
+        "https://api.yukiworks.be/ws"
+    );
+    assert_eq!(
+        config.target(Some("amsterdam")).unwrap().api_root,
+        "https://api.yukiworks.nl/ws"
+    );
+
+    let keys = config.access_keys();
+    assert_eq!(keys[0].api_key, "shared-key");
+    assert_eq!(keys[0].api_root, "https://api.yukiworks.be/ws");
+    assert_eq!(keys[1].api_key, "nl-key");
+    assert_eq!(keys[1].api_root, "https://api.yukiworks.nl/ws");
+}
+
+#[test]
+fn rejects_an_unknown_region() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "api_key = \"k\"\ndefault_admin = \"a\"\nregion = \"de\"\n[administrations]\n",
+    )
+    .unwrap();
+
+    let err = Config::load_from(&path).unwrap_err().to_string();
+    assert!(err.contains("unknown region 'de'"), "{err}");
+}
+
+#[test]
+fn base_url_beats_regions_and_the_runtime_override_beats_both() {
+    let mut entry = AdminEntry::new("d", "x");
+    entry.region = Some(Region::Nl);
+    let mut config = config_with("key", "a", [("a", entry)]);
+    config.region = Some(Region::Nl);
+    config.base_url = Some("http://file.example/ws".into());
+    assert_eq!(
+        config.target(None).unwrap().api_root,
+        "http://file.example/ws"
+    );
+
+    config.override_endpoint(Some(Region::Be), None);
+    assert_eq!(
+        config.target(None).unwrap().api_root,
+        "https://api.yukiworks.be/ws"
+    );
+
+    config.override_endpoint(Some(Region::Nl), Some("http://127.0.0.1:1/ws"));
+    assert_eq!(
+        config.target(None).unwrap().api_root,
+        "http://127.0.0.1:1/ws"
+    );
+}
+
+#[test]
+fn neither_region_nor_override_is_written_for_a_dutch_config() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = config_with("key", "a", [("a", AdminEntry::new("d", "x"))]);
+    config.override_endpoint(Some(Region::Be), Some("http://127.0.0.1:1/ws"));
+    config.save_to(&path).unwrap();
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("region"), "{saved}");
+    assert!(!saved.contains("base_url"), "{saved}");
+    assert!(!saved.contains("127.0.0.1"), "{saved}");
+}
+
+#[test]
+fn region_roundtrips_through_save() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut entry = AdminEntry::new("d", "x");
+    entry.region = Some(Region::Nl);
+    let mut config = config_with("key", "a", [("a", entry)]);
+    config.region = Some(Region::Be);
+    config.save_to(&path).unwrap();
+
+    let loaded = Config::load_from(&path).unwrap();
+    assert_eq!(loaded.region, Some(Region::Be));
+    assert_eq!(loaded.administrations["a"].region, Some(Region::Nl));
 }

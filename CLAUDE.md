@@ -34,7 +34,7 @@ src/period.rs            Period string → (start_date, end_date) conversion
 
 ### SOAP Client Pattern
 
-Each service client (accounting, archive, vat, contact, sales) wraps `SoapClient` with a specific base URL (`https://api.yukiworks.nl/ws/{Service}.asmx`). The flow is always: `authenticate()` → `set_current_domain()` → operation calls. The `setup_domain()` helper in `cli/mod.rs` handles the first two steps.
+Each service client (accounting, archive, vat, contact, sales) wraps `SoapClient` with a service URL `{api_root}/{Service}.asmx`. `api_root` defaults to `Region::Nl` (`https://api.yukiworks.nl/ws`); CLI handlers pass `target.api_root` via `.with_api_root()`, resolved by `Config::api_root()` (override flag/env > `base_url` > admin `region` > top-level `region` > nl). The flow is always: `authenticate()` → `set_current_domain()` → operation calls. The `setup_domain()` helper in `cli/mod.rs` handles the first two steps.
 
 `SoapEnvelope` is a builder: `.new("Op").session(sid).param("key", "val").build()` produces the XML envelope. All operations require `administrationID` as a parameter.
 

@@ -10,7 +10,7 @@ pub async fn returns(
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = VatClient::new();
+    let mut client = VatClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let all_returns = client.vat_return_list(target.admin_id).await?;
 
@@ -54,7 +54,7 @@ pub async fn codes(
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = VatClient::new();
+    let mut client = VatClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let vat_codes = client.active_vat_codes(target.admin_id).await?;
 

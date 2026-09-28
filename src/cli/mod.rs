@@ -10,8 +10,10 @@ pub mod projects;
 pub mod upload;
 pub mod vat;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 
+use crate::client::Region;
 use crate::client::accounting::AccountingClient;
 use crate::config::{Config, Target};
 use crate::error::YukiError;
@@ -25,7 +27,7 @@ pub async fn setup_domain<'a>(
     admin: Option<&str>,
 ) -> Result<(AccountingClient, Target<'a>), YukiError> {
     let target = config.target(admin)?;
-    let mut client = AccountingClient::new();
+    let mut client = AccountingClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     client.set_current_domain(target.domain_id).await?;
     Ok((client, target))
@@ -54,6 +56,21 @@ pub struct Cli {
     /// Skip confirmation prompts (for use in scripts and pipelines).
     #[arg(long = "yes", short = 'y', global = true)]
     pub yes: bool,
+
+    /// Yuki deployment: nl (api.yukiworks.nl, default) or be (api.yukiworks.be).
+    /// Overrides the configured region; `yuki init` stores it.
+    #[arg(
+        long,
+        global = true,
+        env = "YUKI_REGION",
+        value_parser = PossibleValuesParser::new(["nl", "be"])
+            .map(|s| s.parse::<Region>().expect("validated by PossibleValuesParser")),
+    )]
+    pub region: Option<Region>,
+
+    /// Full API root, e.g. https://api.yukiworks.be/ws. Overrides --region.
+    #[arg(long, global = true, env = "YUKI_BASE_URL")]
+    pub base_url: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,

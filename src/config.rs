@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::client::Region;
 use crate::error::YukiError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +26,15 @@ pub struct AdminEntry {
     /// `api_key` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+
+    /// Yuki deployment this administration lives on, when it differs from the
+    /// top-level `region`. Set by `yuki init --add --region ...`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "region_serde"
+    )]
+    pub region: Option<Region>,
 }
 
 impl AdminEntry {
@@ -34,6 +44,7 @@ impl AdminEntry {
             admin_id: admin_id.into(),
             name: None,
             api_key: None,
+            region: None,
         }
     }
 
@@ -63,12 +74,15 @@ pub struct Target<'a> {
     pub domain_id: &'a str,
     pub admin_id: &'a str,
     pub api_key: &'a str,
+    /// API root the key is valid on, e.g. `https://api.yukiworks.be/ws`.
+    pub api_root: &'a str,
 }
 
 /// A distinct access key, with the administrations configured to use it.
 #[derive(Debug, Clone)]
 pub struct AccessKey<'a> {
     pub api_key: &'a str,
+    pub api_root: &'a str,
     pub admins: Vec<&'a str>,
 }
 
@@ -82,6 +96,42 @@ pub struct Config {
     /// Matched case-insensitively as substrings against the counterparty name.
     #[serde(default)]
     pub unmatched_ignore: Vec<String>,
+    /// Yuki deployment for administrations that do not name their own.
+    /// Absent means the Netherlands, so existing configurations are unaffected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "region_serde"
+    )]
+    pub region: Option<Region>,
+    /// Full API root (e.g. `https://api.yukiworks.be/ws`) that overrides every
+    /// region. An escape hatch for new deployments and local mocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// API root from `--region`/`--base-url` or `YUKI_REGION`/`YUKI_BASE_URL`.
+    /// Wins over everything in the file and is never written back to it.
+    #[serde(skip)]
+    pub endpoint_override: Option<String>,
+}
+
+/// `Option<Region>` as a plain `"nl"`/`"be"` string.
+mod region_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::client::Region;
+
+    pub fn serialize<S: Serializer>(region: &Option<Region>, s: S) -> Result<S::Ok, S::Error> {
+        match region {
+            Some(r) => s.serialize_str(r.as_str()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Region>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|v| v.parse().map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 impl Config {
@@ -149,6 +199,35 @@ impl Config {
         }
     }
 
+    /// Apply `--region`/`--base-url` (or their environment variables) for this run.
+    /// A base URL beats a region.
+    pub fn override_endpoint(&mut self, region: Option<Region>, base_url: Option<&str>) {
+        if let Some(url) = base_url.filter(|u| !u.trim().is_empty()) {
+            self.endpoint_override = Some(url.trim().to_string());
+        } else if let Some(region) = region {
+            self.endpoint_override = Some(region.api_root().to_string());
+        }
+    }
+
+    /// API root for `entry`, or for the shared key when `None`.
+    ///
+    /// Precedence: runtime override, top-level `base_url`, the administration's
+    /// `region`, the top-level `region`, and finally the Netherlands.
+    pub fn api_root(&self, entry: Option<&AdminEntry>) -> &str {
+        if let Some(url) = self
+            .endpoint_override
+            .as_deref()
+            .or(self.base_url.as_deref())
+        {
+            return url;
+        }
+        entry
+            .and_then(|e| e.region)
+            .or(self.region)
+            .unwrap_or_default()
+            .api_root()
+    }
+
     /// Resolve the administration a command should run against.
     ///
     /// Falls back to the shared `api_key` when the administration has no key of its
@@ -174,6 +253,7 @@ impl Config {
             domain_id: &entry.domain_id,
             admin_id: &entry.admin_id,
             api_key,
+            api_root: self.api_root(Some(entry)),
         })
     }
 
@@ -188,6 +268,7 @@ impl Config {
         if !self.api_key.is_empty() {
             keys.push(AccessKey {
                 api_key: &self.api_key,
+                api_root: self.api_root(None),
                 admins: Vec::new(),
             });
         }
@@ -201,6 +282,7 @@ impl Config {
                 Some(existing) => existing.admins.push(name.as_str()),
                 None => keys.push(AccessKey {
                     api_key,
+                    api_root: self.api_root(Some(entry)),
                     admins: vec![name.as_str()],
                 }),
             }

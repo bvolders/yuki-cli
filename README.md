@@ -49,6 +49,23 @@ To rotate your API key later:
 yuki init --api-key <new-key>
 ```
 
+### Belgium
+
+Yuki Belgium runs on its own host (`api.yukiworks.be`), and a Belgian key only works
+there. Pass `--region be` to `init`; it is stored in the config, so later commands
+need nothing extra:
+
+```sh
+yuki init --region be
+```
+
+The default is `nl`, so existing configurations are unaffected. `--region` (or
+`YUKI_REGION`) overrides the stored region for a single run. An administration added
+with `yuki init --add --region <other>` records its own region, so Dutch and Belgian
+books can live in one config. `--base-url <root>` (or `YUKI_BASE_URL`, or `base_url`
+in the config file) points every service at an arbitrary root such as
+`https://api.yukiworks.be/ws` and wins over any region.
+
 ### Reaching more than one administration
 
 Yuki issues an access key *inside* one administration and scopes the session it opens
@@ -186,6 +203,8 @@ yuki upload payment-methods                             # List payment method ID
 | `--output text\|json` | Output format (auto-detects TTY) |
 | `--quiet` | Suppress informational output |
 | `--yes` | Confirm destructive operations |
+| `--region nl\|be` | Yuki deployment (env `YUKI_REGION`; stored by `init`) |
+| `--base-url <root>` | Full API root, overrides `--region` (env `YUKI_BASE_URL`) |
 
 ## Periods
 

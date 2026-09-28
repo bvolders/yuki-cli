@@ -3,6 +3,7 @@ use std::io::{self, BufRead, Write};
 
 use owo_colors::OwoColorize;
 
+use crate::client::Region;
 use crate::client::accounting::{AccountingClient, Administration};
 use crate::config::{AdminEntry, Config};
 use crate::error::YukiError;
@@ -78,11 +79,17 @@ fn read_line(stdin: &io::Stdin) -> String {
         .unwrap_or_default()
 }
 
+/// The region `yuki init` stores: only a non-default one, so a Dutch
+/// configuration stays exactly as it was before regions existed.
+fn stored_region(region: Region) -> Option<Region> {
+    (region != Region::default()).then_some(region)
+}
+
 /// Authenticate with `api_key` and list the administrations it reaches.
-async fn discover(api_key: &str) -> Result<Vec<Administration>, YukiError> {
+async fn discover(api_key: &str, api_root: &str) -> Result<Vec<Administration>, YukiError> {
     eprint!("Authenticating...");
     io::stderr().flush().ok();
-    let mut client = AccountingClient::new();
+    let mut client = AccountingClient::new().with_api_root(api_root);
     match client.authenticate(api_key).await {
         Ok(_) => eprintln!(" {}", sym_ok()),
         Err(e) => {
@@ -109,6 +116,8 @@ pub async fn run(
     api_key: Option<&str>,
     default_admin: Option<&str>,
     add: bool,
+    region: Option<Region>,
+    base_url: Option<&str>,
 ) -> Result<(), YukiError> {
     let stdin = io::stdin();
     let path = Config::default_path();
@@ -123,8 +132,13 @@ pub async fn run(
             return Err(YukiError::Config("API key cannot be empty".to_string()));
         }
 
+        if let Some(region) = region {
+            config.region = stored_region(region);
+        }
+        config.override_endpoint(None, base_url);
+
         eprintln!("Verifying new API key...");
-        let mut client = AccountingClient::new();
+        let mut client = AccountingClient::new().with_api_root(config.api_root(None));
         client.authenticate(&key).await?;
 
         config.api_key = key;
@@ -148,10 +162,20 @@ pub async fn run(
     }
 
     if add {
-        return add_key(&path, &api_key, default_admin).await;
+        return add_key(&path, &api_key, default_admin, region, base_url).await;
     }
 
-    let admins = discover(&api_key).await?;
+    let existing = Config::load_from(&path).ok();
+    // A re-run keeps the stored region unless told otherwise.
+    let region = region
+        .or(existing.as_ref().and_then(|c| c.region))
+        .unwrap_or_default();
+    let saved_base_url = existing.as_ref().and_then(|c| c.base_url.clone());
+    let api_root = base_url
+        .or(saved_base_url.as_deref())
+        .unwrap_or(region.api_root());
+
+    let admins = discover(&api_key, api_root).await?;
     if admins.is_empty() {
         return Err(YukiError::NotFound(
             "no administrations found for this API key".to_string(),
@@ -199,7 +223,6 @@ pub async fn run(
     };
 
     let administrations = to_entries(&admins);
-    let existing = Config::load_from(&path).ok();
 
     // A plain init replaces the administration map, so anything this key cannot reach
     // is about to disappear. Say which, rather than let a second set of books vanish.
@@ -235,6 +258,9 @@ pub async fn run(
         administrations,
         // Preserve unmatched_ignore from the existing config if present.
         unmatched_ignore: existing.map(|c| c.unmatched_ignore).unwrap_or_default(),
+        region: stored_region(region),
+        base_url: saved_base_url,
+        endpoint_override: None,
     };
 
     config.save_to(&path)?;
@@ -264,6 +290,8 @@ async fn add_key(
     path: &std::path::Path,
     api_key: &str,
     default_admin: Option<&str>,
+    region: Option<Region>,
+    base_url: Option<&str>,
 ) -> Result<(), YukiError> {
     // Distinguish "nothing to add to" from a config that exists but will not parse;
     // the second is a different problem and keeps its own error.
@@ -275,14 +303,28 @@ async fn add_key(
     }
     let mut config = Config::load_from(path)?;
 
-    let admins = discover(api_key).await?;
+    // Administrations on another deployment than the configured default carry
+    // their own region, so a Dutch and a Belgian set of books can coexist.
+    let default_region = config.region.unwrap_or_default();
+    let region = region.unwrap_or(default_region);
+    let api_root = base_url
+        .or(config.base_url.as_deref())
+        .unwrap_or(region.api_root());
+
+    let admins = discover(api_key, api_root).await?;
     if admins.is_empty() {
         return Err(YukiError::NotFound(
             "no administrations found for this API key".to_string(),
         ));
     }
 
-    let (added, updated) = config.merge_administrations(to_entries(&admins), api_key);
+    let mut entries = to_entries(&admins);
+    if region != default_region {
+        for entry in entries.values_mut() {
+            entry.region = Some(region);
+        }
+    }
+    let (added, updated) = config.merge_administrations(entries, api_key);
 
     if let Some(name) = default_admin {
         let key = safe_name(name);
@@ -345,5 +387,12 @@ mod tests {
         assert_eq!(entry.domain_id, "domain-1");
         // Discovery does not decide which key an entry belongs to; merging does.
         assert_eq!(entry.api_key, None);
+        assert_eq!(entry.region, None);
+    }
+
+    #[test]
+    fn only_a_non_default_region_is_stored() {
+        assert_eq!(stored_region(Region::Nl), None);
+        assert_eq!(stored_region(Region::Be), Some(Region::Be));
     }
 }

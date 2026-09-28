@@ -30,6 +30,17 @@ pub fn generate() -> Value {
                 "type": "boolean",
                 "description": "Skip confirmation prompts (for use in scripts and pipelines).",
                 "default": false
+            },
+            {
+                "name": "--region",
+                "type": "string",
+                "description": "Yuki deployment (env: YUKI_REGION). Overrides the configured region; init stores it.",
+                "enum": ["nl", "be"]
+            },
+            {
+                "name": "--base-url",
+                "type": "url",
+                "description": "Full API root, e.g. https://api.yukiworks.be/ws (env: YUKI_BASE_URL). Overrides --region."
             }
         ],
         "commands": [

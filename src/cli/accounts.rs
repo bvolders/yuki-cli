@@ -87,7 +87,7 @@ pub async fn scheme(
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = AccountingInfoClient::new();
+    let mut client = AccountingInfoClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let accounts = client.get_gl_account_scheme(target.admin_id).await?;
 
@@ -120,7 +120,7 @@ pub async fn start_balance(
         }
     };
     let target = config.target(admin)?;
-    let mut client = AccountingInfoClient::new();
+    let mut client = AccountingInfoClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let balances = client
         .get_start_balance_by_gl_account(target.admin_id, bookyear)

@@ -96,7 +96,7 @@ async fn remote_rows(config: &Config) -> Result<Vec<Row>, YukiError> {
     let mut first_failure: Option<YukiError> = None;
 
     for key in &keys {
-        let mut client = AccountingClient::new();
+        let mut client = AccountingClient::new().with_api_root(key.api_root);
         let outcome = match client.authenticate(key.api_key).await {
             Ok(_) => client.administrations().await,
             Err(e) => Err(e),
@@ -251,6 +251,9 @@ mod tests {
                 .map(|(name, entry)| (name.to_string(), entry))
                 .collect(),
             unmatched_ignore: Vec::new(),
+            region: None,
+            base_url: None,
+            endpoint_override: None,
         }
     }
 

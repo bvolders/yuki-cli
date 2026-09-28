@@ -2,6 +2,7 @@ pub mod accounting;
 pub mod accounting_info;
 pub mod archive;
 pub mod contact;
+mod region;
 pub mod sales;
 pub mod soap_client;
 pub mod vat;
@@ -11,6 +12,8 @@ use std::borrow::Cow;
 use quick_xml::escape::EscapeError;
 use quick_xml::events::BytesText;
 
+pub use region::Region;
+pub(crate) use region::service_url;
 pub use soap_client::{SoapClient, SoapEnvelope};
 
 /// Strip any XML namespace prefix, returning only the local name.

@@ -10,7 +10,7 @@ pub async fn list(
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = AccountingInfoClient::new();
+    let mut client = AccountingInfoClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let projects = client.get_projects(target.admin_id).await?;
 
@@ -39,7 +39,7 @@ pub async fn balance(
     let (start, end) = resolve_period(period)?;
     let gl_code = account.unwrap_or("");
     let target = config.target(admin)?;
-    let mut client = AccountingInfoClient::new();
+    let mut client = AccountingInfoClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let balances = client
         .get_project_balance(target.admin_id, project, gl_code, &start, &end)
