@@ -480,7 +480,7 @@ admin_id = "admin-1"
 }
 
 #[test]
-fn a_config_without_region_targets_the_netherlands() {
+fn a_legacy_config_without_region_falls_back_to_the_netherlands() {
     let config = config_with("key", "a", [("a", AdminEntry::new("d", "x"))]);
     let target = config.target(None).unwrap();
     assert_eq!(target.api_root, "https://api.yukiworks.nl/ws");
@@ -744,4 +744,58 @@ bank_accounts = ["550002"]
     nl.region = Some(Region::Nl);
     config.merge_administrations([("a", nl)], "k");
     assert_eq!(config.administrations["a"].region, Some(Region::Nl));
+}
+
+#[test]
+fn a_per_administration_base_url_beats_every_saved_setting_but_the_runtime_override() {
+    let mut other = AdminEntry::new("d-x", "x-x");
+    other.base_url = Some("https://api.yukiworks.example/ws".into());
+    // A stale region stamp must not pull it back onto a known host.
+    other.region = Some(Region::Be);
+    let mut config = config_with(
+        "key",
+        "nl",
+        [("nl", AdminEntry::new("d-nl", "x-nl")), ("other", other)],
+    );
+    config.region = Some(Region::Nl);
+    config.base_url = Some("http://proxy.example/ws".into());
+
+    assert_eq!(
+        config.target(Some("other")).unwrap().api_root,
+        "https://api.yukiworks.example/ws"
+    );
+    assert_eq!(
+        config.target(Some("nl")).unwrap().api_root,
+        "http://proxy.example/ws"
+    );
+
+    config.override_endpoint(None, Some("http://127.0.0.1:1/ws"));
+    assert_eq!(
+        config.target(Some("other")).unwrap().api_root,
+        "http://127.0.0.1:1/ws"
+    );
+}
+
+#[test]
+fn a_rediscovered_administration_takes_the_endpoint_it_was_found_on() {
+    let mut earlier = AdminEntry::new("d", "x");
+    earlier.base_url = Some("https://api.yukiworks.example/ws".into());
+    let mut config = config_with("k", "a", [("a", earlier)]);
+
+    // Found on a known region: the old URL goes, or it would still win.
+    let mut be = AdminEntry::new("d", "x");
+    be.region = Some(Region::Be);
+    config.merge_administrations([("a", be)], "k");
+    let a = &config.administrations["a"];
+    assert_eq!((a.region, a.base_url.as_deref()), (Some(Region::Be), None));
+
+    // Found on another URL: the region stamp goes.
+    let mut url = AdminEntry::new("d", "x");
+    url.base_url = Some("https://api.yukiworks.example/ws".into());
+    config.merge_administrations([("a", url)], "k");
+    let a = &config.administrations["a"];
+    assert_eq!(
+        (a.region, a.base_url.as_deref()),
+        (None, Some("https://api.yukiworks.example/ws"))
+    );
 }

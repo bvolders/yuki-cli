@@ -27,10 +27,16 @@ pub struct AdminEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 
-    /// Yuki deployment this administration lives on, when it differs from the
-    /// top-level `region`. Set by `yuki init --add --region ...`.
+    /// Yuki deployment this administration lives on. Recorded by
+    /// `yuki init --add` (detected from the key, or `--region`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<Region>,
+
+    /// API root for a deployment outside the known regions, recorded by
+    /// `yuki init --add` when the key was verified against a URL the user gave.
+    /// Beats the administration's `region`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 
     /// Per-administration settings this build does not know about, kept
     /// verbatim so an older or newer `yuki` never drops them on save.
@@ -46,6 +52,7 @@ impl AdminEntry {
             name: None,
             api_key: None,
             region: None,
+            base_url: None,
             extra: toml::Table::new(),
         }
     }
@@ -65,7 +72,9 @@ impl AdminEntry {
     /// Fold a freshly discovered entry for the same administration into this one.
     ///
     /// Discovery only knows identifiers, the display name and (for `--add`) the
-    /// key and an explicit region; everything else the user configured survives.
+    /// key and the endpoint it was found on; everything else the user
+    /// configured survives. An endpoint, when known, replaces both the stored
+    /// region and URL, so a stale one of the two cannot win over it.
     pub fn refresh(&mut self, discovered: AdminEntry) {
         self.domain_id = discovered.domain_id;
         self.admin_id = discovered.admin_id;
@@ -73,8 +82,9 @@ impl AdminEntry {
             self.name = discovered.name;
         }
         self.api_key = discovered.api_key;
-        if discovered.region.is_some() {
+        if discovered.region.is_some() || discovered.base_url.is_some() {
             self.region = discovered.region;
+            self.base_url = discovered.base_url;
         }
     }
 }
@@ -115,7 +125,9 @@ pub struct Config {
     #[serde(default)]
     pub unmatched_ignore: Vec<String>,
     /// Yuki deployment for administrations that do not name their own.
-    /// Absent means the Netherlands, so existing configurations are unaffected.
+    /// `yuki init` records it, detected from the key or given as `--region`.
+    /// Absent only in configurations written before init recorded it; those
+    /// fall back to the Netherlands, the one host that existed then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<Region>,
     /// Full API root (e.g. `https://api.yukiworks.be/ws`) that overrides every
@@ -234,26 +246,28 @@ impl Config {
     /// Layers, highest first:
     /// 1. the runtime override (`--base-url`/`--region` or their env vars), for
     ///    every administration and every key alike;
-    /// 2. the administration's own `region`;
-    /// 3. the top-level `base_url`;
-    /// 4. the top-level `region`;
-    /// 5. the Netherlands.
+    /// 2. the administration's own `base_url`;
+    /// 3. the administration's own `region`;
+    /// 4. the top-level `base_url`;
+    /// 5. the top-level `region`;
+    /// 6. the Netherlands, as the legacy fallback for a configuration that
+    ///    predates recorded regions.
     ///
     /// The API root comes from the first layer present. The region comes from
     /// the first layer that names one: a URL that is not a known deployment's
     /// root (a proxy, a mock) says nothing about the country and is skipped.
-    /// A saved `base_url` replaces the default endpoint only, so it cannot pull
-    /// an administration that names its own region onto another deployment.
-    pub fn endpoint(&self, entry: Option<&AdminEntry>) -> Endpoint<'_> {
+    /// A saved top-level `base_url` replaces the default endpoint only, so it
+    /// cannot pull an administration that names its own endpoint elsewhere.
+    pub fn endpoint<'a>(&'a self, entry: Option<&'a AdminEntry>) -> Endpoint<'a> {
         let region_layer = |r: Region| (r.api_root(), Some(r));
+        let url_layer = |url: &'a str| (url, Region::from_api_root(url));
         let layers = [
             self.endpoint_override
                 .as_ref()
                 .map(|o| (o.api_root.as_str(), o.region)),
+            entry.and_then(|e| e.base_url.as_deref()).map(url_layer),
             entry.and_then(|e| e.region).map(region_layer),
-            self.base_url
-                .as_deref()
-                .map(|url| (url, Region::from_api_root(url))),
+            self.base_url.as_deref().map(url_layer),
             self.region.map(region_layer),
             Some(region_layer(Region::default())),
         ];
@@ -266,7 +280,7 @@ impl Config {
     }
 
     /// API root for `entry`; see [`Config::endpoint`].
-    pub fn api_root(&self, entry: Option<&AdminEntry>) -> &str {
+    pub fn api_root<'a>(&'a self, entry: Option<&'a AdminEntry>) -> &'a str {
         self.endpoint(entry).api_root
     }
 

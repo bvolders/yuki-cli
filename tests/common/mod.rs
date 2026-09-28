@@ -19,7 +19,8 @@ pub fn yuki_with_env(home: &TempDir, args: &[&str], env: &[(&str, &str)]) -> Out
         .args(args)
         .env("HOME", home.path())
         .env_remove("YUKI_REGION")
-        .env_remove("YUKI_BASE_URL");
+        .env_remove("YUKI_BASE_URL")
+        .env_remove("YUKI_PROBE_ROOTS");
     for (key, value) in env {
         command.env(key, value);
     }

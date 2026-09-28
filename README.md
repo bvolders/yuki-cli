@@ -28,7 +28,7 @@ PyPI and Cargo installations provide both `yuki` and `yuki-cli` as executable na
 ## Setup
 
 1. Get a Yuki API key from your Yuki portal under **Settings > API keys**.
-2. Run `yuki init` and paste your key when prompted. The CLI discovers your administrations and writes the config to `~/.config/yuki/config.toml`.
+2. Run `yuki init` and paste your key when prompted. The CLI detects the key's region (Netherlands or Belgium), discovers your administrations and writes the config to `~/.config/yuki/config.toml`.
 
 ```sh
 yuki init
@@ -49,21 +49,32 @@ To rotate your API key later:
 yuki init --api-key <new-key>
 ```
 
-### Belgium
+### Regions
 
-Yuki Belgium runs on its own host (`api.yukiworks.be`), and a Belgian key only works
-there. Pass `--region be` to `init`; it is stored in the config, so later commands
-need nothing extra:
+Yuki runs a separate API host per country — `api.yukiworks.nl` and
+`api.yukiworks.be` — and an access key only works on its own country's host.
+`yuki init` finds out which by trying the key on every known host at once, and
+records the answer in the config, so later commands need nothing extra:
 
-```sh
-yuki init --region be
+```text
+Detecting region... ✔
+Detected Yuki Belgium (api.yukiworks.be)
 ```
 
-The default is `nl`, so existing configurations are unaffected. `--region` (or
-`YUKI_REGION`) overrides the stored region for a single run. `init` persists a region
-only when it is passed as the `--region` flag; an exported `YUKI_REGION` or
-`YUKI_BASE_URL` is used for that run and never written to the config. An
-administration added with `yuki init --add --region <other>` records its own region,
+A host answering "Invalid access key" is simply not the key's region. Any other
+failure (unreachable, blocked, rate limited) is reported rather than skipped, and
+`init` stops. If no known host accepts the key, or more than one does, `init` asks
+`Yuki region [nl/be/other]:` with no default when run at a terminal; `other` takes a
+full API root for a deployment outside the known ones, verifies the key there, and
+stores it as `base_url`. Without a terminal it stops instead: an unknown key is the
+usual authentication error (exit 2), an ambiguous one a configuration error asking
+for `--region`.
+
+Passing `--region nl|be` or `--base-url <root>` (or exporting `YUKI_REGION` /
+`YUKI_BASE_URL`) skips detection. `init` persists a region only when it was detected,
+chosen, or passed as the `--region` flag; an exported `YUKI_REGION` or `YUKI_BASE_URL`
+is used for that run and never written to the config. `yuki init --add` detects per
+key and records the region (or `base_url`) on the administrations that key reaches,
 so Dutch and Belgian books can live in one config. Re-running `yuki init` keeps the
 per-administration settings (region, and any other keys in its table) of every
 administration the key still reaches.
@@ -73,10 +84,11 @@ The endpoint is resolved in this order, highest first:
 1. `--base-url` / `YUKI_BASE_URL`, then `--region` / `YUKI_REGION` — for this run,
    for every administration and every key (so `admin list` in a mixed config reports
    the other deployment's keys as failing);
-2. the administration's own `region`;
+2. the administration's own `base_url`, then its own `region`;
 3. `base_url` in the config file (replaces the default endpoint only);
 4. the top-level `region`;
-5. `nl`.
+5. `nl` — a legacy fallback, only for a config written before `init` recorded the
+   region.
 
 Country conventions (chart of accounts, bank formats) follow the same order; a base
 URL that is not a known Yuki root (a proxy, a mock) is skipped for that purpose.
@@ -218,7 +230,7 @@ yuki upload payment-methods                             # List payment method ID
 | `--output text\|json` | Output format (auto-detects TTY) |
 | `--quiet` | Suppress informational output |
 | `--yes` | Confirm destructive operations |
-| `--region nl\|be` | Yuki deployment (env `YUKI_REGION`; only the flag is stored by `init`) |
+| `--region nl\|be` | Yuki deployment; `init` detects it from the key when omitted (env `YUKI_REGION`; only the flag is stored by `init`) |
 | `--base-url <root>` | Full API root, overrides `--region` (env `YUKI_BASE_URL`) |
 
 ## Periods

@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, Write};
+use std::fmt::Display;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 use owo_colors::OwoColorize;
+use tokio::task::JoinSet;
 
 use crate::client::Region;
 use crate::client::accounting::{AccountingClient, Administration};
@@ -69,27 +72,28 @@ fn to_entries(admins: &[Administration]) -> BTreeMap<String, AdminEntry> {
         .collect()
 }
 
-fn read_line(stdin: &io::Stdin) -> String {
-    stdin
-        .lock()
-        .lines()
-        .next()
-        .and_then(|l| l.ok())
-        .map(|l| l.trim().to_string())
-        .unwrap_or_default()
+/// The next line of `input`, trimmed; `None` at end of input.
+fn next_line(input: &mut impl BufRead) -> Option<String> {
+    let mut line = String::new();
+    match input.read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line.trim().to_string()),
+    }
 }
 
-/// The region `yuki init` stores: only a non-default one, so a Dutch
-/// configuration stays exactly as it was before regions existed.
-fn stored_region(region: Region) -> Option<Region> {
-    (region != Region::default()).then_some(region)
+fn read_line(input: &mut impl BufRead) -> String {
+    next_line(input).unwrap_or_default()
 }
 
 /// Tell the user an environment region was used for this run but not stored.
-fn note_unstored_region(region: Option<Region>, region_flag: Option<Region>, stored: Region) {
+fn note_unstored_region(
+    region: Option<Region>,
+    region_flag: Option<Region>,
+    stored: Option<Region>,
+) {
     if let Some(region) = region
         && region_flag.is_none()
-        && region != stored
+        && Some(region) != stored
     {
         eprintln!(
             "{}",
@@ -132,19 +136,299 @@ fn rebuild_administrations(
         .collect()
 }
 
-/// Authenticate with `api_key` and list the administrations it reaches.
-async fn discover(api_key: &str, api_root: &str) -> Result<Vec<Administration>, YukiError> {
+/// Where `yuki init` reads its answers, and where it looks for a key's region.
+pub struct InitIo<R> {
+    /// The configuration file to create or update.
+    pub path: PathBuf,
+    /// The key, when not passed as a flag, and every answer are read from here.
+    pub input: R,
+    /// Whether `input` is a person at a terminal, who may be asked a question
+    /// that has no safe default. Piped input is never asked one.
+    pub interactive: bool,
+    /// Every region a key is tried on, with the root to try it at.
+    pub probes: Vec<(Region, String)>,
+}
+
+/// Hidden: replaces the roots region detection tries, as `code=root,...`, so
+/// tests can stand one local mock in for every region. It only redirects where
+/// the key is sent, as `YUKI_BASE_URL` already can.
+const PROBE_ROOTS_VAR: &str = "YUKI_PROBE_ROOTS";
+
+/// The roots region detection tries: every known region's public host, or
+/// exactly the ones `spec` (the value of `YUKI_PROBE_ROOTS`) lists.
+pub fn probe_roots(spec: Option<&str>) -> Result<Vec<(Region, String)>, YukiError> {
+    let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Region::ALL
+            .iter()
+            .map(|r| (*r, r.api_root().to_string()))
+            .collect());
+    };
+    spec.split(',')
+        .map(|pair| {
+            let bad = || {
+                YukiError::Config(format!(
+                    "{PROBE_ROOTS_VAR}: expected code=root, got '{pair}'"
+                ))
+            };
+            let (code, root) = pair.split_once('=').ok_or_else(bad)?;
+            let region = Region::from_code(code.trim()).ok_or_else(bad)?;
+            Ok((region, root.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Where a key was found to work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Deployment<T> {
+    /// One of the candidates [`detect`] was given.
+    Known(T),
+    /// A root the user typed, for a deployment outside the known ones.
+    BaseUrl(String),
+}
+
+/// The outcome of [`detect`]: where the key works, and a client already
+/// authenticated there, so discovery does not authenticate a second time.
+pub struct Detected<T> {
+    pub deployment: Deployment<T>,
+    pub client: AccountingClient,
+}
+
+enum Probe {
+    Accepted(AccountingClient),
+    /// The host answered that it does not know this key.
+    Rejected,
+    /// The host could not say: unreachable, blocked, rate limited, and so on.
+    Failed(YukiError),
+}
+
+/// Whether `e` is Yuki saying the key does not exist on the host asked,
+/// which is what every other region's host answers for a valid key.
+fn rejects_key(e: &YukiError) -> bool {
+    matches!(e, YukiError::AuthFailed(m) if m.to_ascii_lowercase().contains("invalid access key"))
+}
+
+/// Authenticate `api_key` at every candidate root at once.
+async fn probe_all<T>(api_key: &str, candidates: &[(T, String)]) -> Vec<Probe> {
+    let mut tasks = JoinSet::new();
+    for (i, (_, root)) in candidates.iter().enumerate() {
+        let (key, root) = (api_key.to_string(), root.clone());
+        tasks.spawn(async move {
+            let mut client = AccountingClient::new().with_api_root(&root);
+            let probe = match client.authenticate(&key).await {
+                Ok(_) => Probe::Accepted(client),
+                Err(e) if rejects_key(&e) => Probe::Rejected,
+                Err(e) => Probe::Failed(e),
+            };
+            (i, probe)
+        });
+    }
+    let mut probes: Vec<Option<Probe>> = candidates.iter().map(|_| None).collect();
+    while let Some(done) = tasks.join_next().await {
+        let (i, probe) = done.expect("region probe task");
+        probes[i] = Some(probe);
+    }
+    probes
+        .into_iter()
+        .map(|p| p.expect("every probe ran"))
+        .collect()
+}
+
+/// A root the user typed, without its trailing slash, if it is an http(s) URL.
+fn parse_base_url(text: &str) -> Option<String> {
+    let url = text.trim().trim_end_matches('/');
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split('/').next().unwrap_or_default();
+    (!host.is_empty() && !url.chars().any(char::is_whitespace)).then(|| url.to_string())
+}
+
+fn joined<T: Display>(labels: &[T], sep: &str) -> String {
+    labels
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// Find where `api_key` works by trying it on every candidate root at once.
+///
+/// A root that answers "Invalid access key" is not the key's region. Anything
+/// else going wrong on a root is reported, never skipped: the key might belong
+/// there. With exactly one region accepting the key, that is the answer, and
+/// `input` is not touched. With none or several, a person at a terminal
+/// (`interactive`) picks one of them, or `other` for a root of their own,
+/// which is verified with one Authenticate; there is no default. Without a
+/// terminal, none is the auth error and several a configuration error, each
+/// naming the flag that settles it.
+pub async fn detect<T, R>(
+    api_key: &str,
+    candidates: &[(T, String)],
+    input: &mut R,
+    interactive: bool,
+) -> Result<Detected<T>, YukiError>
+where
+    T: Copy + Eq + Display,
+    R: BufRead,
+{
+    eprint!("Detecting region...");
+    io::stderr().flush().ok();
+    let mut accepted = Vec::new();
+    let mut failed = Vec::new();
+    let probes = probe_all(api_key, candidates).await;
+    for ((label, root), probe) in candidates.iter().zip(probes) {
+        match probe {
+            Probe::Accepted(client) => accepted.push((*label, client)),
+            Probe::Rejected => {}
+            Probe::Failed(e) => failed.push((root.as_str(), e)),
+        }
+    }
+
+    if !failed.is_empty() {
+        eprintln!(" {}", sym_fail());
+        for (root, e) in &failed {
+            eprintln!("  could not check {root}: {e}");
+        }
+        for (label, _) in &accepted {
+            eprintln!("  region {label} accepts the key, but the check is incomplete.");
+        }
+        eprintln!(
+            "  {}",
+            dim("Pass --region (or --base-url) to skip region detection.")
+        );
+        // The first failure decides the exit code, e.g. 4 when rate limited.
+        return Err(failed.swap_remove(0).1);
+    }
+
+    if accepted.len() == 1 {
+        eprintln!(" {}", sym_ok());
+        let (label, client) = accepted.remove(0);
+        return Ok(Detected {
+            deployment: Deployment::Known(label),
+            client,
+        });
+    }
+
+    let tried: Vec<&str> = candidates.iter().map(|(_, root)| root.as_str()).collect();
+    let rejected = || {
+        YukiError::AuthFailed(format!(
+            "Invalid access key: rejected by {}. \
+             For a Yuki deployment outside these, pass --base-url <root>.",
+            tried.join(", ")
+        ))
+    };
+    let offered: Vec<T> = if accepted.is_empty() {
+        eprintln!(" {}", sym_fail());
+        eprintln!("No known Yuki region accepts this key.");
+        candidates.iter().map(|(label, _)| *label).collect()
+    } else {
+        let labels: Vec<T> = accepted.iter().map(|(label, _)| *label).collect();
+        eprintln!(" {}", sym_ok());
+        eprintln!(
+            "This key is accepted by more than one Yuki region: {}.",
+            joined(&labels, ", ")
+        );
+        labels
+    };
+    let codes = joined(&offered, "/");
+    let no_choice = |accepted_any: bool| {
+        if accepted_any {
+            YukiError::Config(format!(
+                "this key is accepted by more than one Yuki region ({}); \
+                 pass --region <{codes}> or --base-url <root>",
+                joined(&offered, ", ")
+            ))
+        } else {
+            rejected()
+        }
+    };
+    let accepted_any = !accepted.is_empty();
+    if !interactive {
+        return Err(no_choice(accepted_any));
+    }
+
+    loop {
+        eprint!("Yuki region [{codes}/other]: ");
+        io::stderr().flush().ok();
+        let Some(answer) = next_line(input) else {
+            eprintln!();
+            return Err(no_choice(accepted_any));
+        };
+        let answer = answer.to_ascii_lowercase();
+        if answer == "other" {
+            let url = loop {
+                eprint!("API root (e.g. https://api.yukiworks.example/ws): ");
+                io::stderr().flush().ok();
+                let Some(text) = next_line(input) else {
+                    eprintln!();
+                    return Err(no_choice(accepted_any));
+                };
+                match parse_base_url(&text) {
+                    Some(url) => break url,
+                    None => eprintln!("  not an http(s) URL: {text}"),
+                }
+            };
+            let client = authenticate(api_key, &url).await?;
+            return Ok(Detected {
+                deployment: Deployment::BaseUrl(url),
+                client,
+            });
+        }
+        match offered.iter().position(|label| label.to_string() == answer) {
+            // Every offered region already rejected the key.
+            Some(_) if !accepted_any => return Err(rejected()),
+            Some(i) => {
+                let (label, client) = accepted.swap_remove(i);
+                return Ok(Detected {
+                    deployment: Deployment::Known(label),
+                    client,
+                });
+            }
+            None => eprintln!("  answer {codes} or other"),
+        }
+    }
+}
+
+/// Say where the key was found, and return the endpoint to record for it:
+/// a region, or a root outside every known one. A typed root that is a known
+/// region's host counts as that region.
+fn announce(deployment: Deployment<Region>) -> (Option<Region>, Option<String>) {
+    let region = match &deployment {
+        Deployment::Known(region) => Some(*region),
+        Deployment::BaseUrl(url) => Region::from_api_root(url),
+    };
+    match (region, deployment) {
+        (Some(region), _) => {
+            eprintln!("Detected Yuki {} ({})", region.country(), region.host());
+            (Some(region), None)
+        }
+        (None, Deployment::BaseUrl(url)) => {
+            eprintln!("Using {url}");
+            (None, Some(url))
+        }
+        (None, Deployment::Known(_)) => unreachable!("a known deployment has a region"),
+    }
+}
+
+/// Authenticate with `api_key` at `api_root`.
+async fn authenticate(api_key: &str, api_root: &str) -> Result<AccountingClient, YukiError> {
     eprint!("Authenticating...");
     io::stderr().flush().ok();
     let mut client = AccountingClient::new().with_api_root(api_root);
     match client.authenticate(api_key).await {
-        Ok(_) => eprintln!(" {}", sym_ok()),
+        Ok(_) => {
+            eprintln!(" {}", sym_ok());
+            Ok(client)
+        }
         Err(e) => {
             eprintln!(" {}", sym_fail());
-            return Err(e);
+            Err(e)
         }
     }
+}
 
+/// List the administrations an authenticated `client` reaches.
+async fn discover(client: &AccountingClient) -> Result<Vec<Administration>, YukiError> {
     eprint!("Fetching administrations...");
     io::stderr().flush().ok();
     match client.administrations().await {
@@ -166,6 +450,9 @@ async fn discover(api_key: &str, api_root: &str) -> Result<Vec<Administration>, 
 /// line. Only the flag is persisted: an exported environment variable is a
 /// per-shell choice and must not silently rewrite the configuration. `base_url`
 /// (flag or env) is never persisted.
+///
+/// With neither, the region is detected from the key (see [`detect`]) and
+/// recorded, whichever it is.
 pub async fn run(
     api_key: Option<&str>,
     default_admin: Option<&str>,
@@ -175,7 +462,35 @@ pub async fn run(
     base_url: Option<&str>,
 ) -> Result<(), YukiError> {
     let stdin = io::stdin();
-    let path = Config::default_path();
+    let io = InitIo {
+        path: Config::default_path(),
+        interactive: stdin.is_terminal(),
+        input: stdin.lock(),
+        probes: probe_roots(std::env::var(PROBE_ROOTS_VAR).ok().as_deref())?,
+    };
+    run_with(
+        io,
+        api_key,
+        default_admin,
+        add,
+        region,
+        region_flag,
+        base_url,
+    )
+    .await
+}
+
+/// [`run`] over explicit input, configuration path and probe roots.
+pub async fn run_with<R: BufRead>(
+    mut io: InitIo<R>,
+    api_key: Option<&str>,
+    default_admin: Option<&str>,
+    add: bool,
+    region: Option<Region>,
+    region_flag: Option<Region>,
+    base_url: Option<&str>,
+) -> Result<(), YukiError> {
+    let path = io.path.clone();
 
     // Rotating the shared key touches nothing else, so it skips discovery entirely.
     if !add
@@ -188,9 +503,9 @@ pub async fn run(
         }
 
         if let Some(region) = region_flag {
-            config.region = stored_region(region);
+            config.region = Some(region);
         }
-        note_unstored_region(region, region_flag, config.region.unwrap_or_default());
+        note_unstored_region(region, region_flag, config.region);
         config.override_endpoint(region, base_url);
 
         eprintln!("Verifying new API key...");
@@ -209,7 +524,7 @@ pub async fn run(
             eprintln!("  {} Yuki Portal → Settings → API keys", dim("→"));
             eprint!("Yuki API key: ");
             io::stderr().flush().ok();
-            read_line(&stdin)
+            read_line(&mut io.input)
         }
     };
 
@@ -219,7 +534,7 @@ pub async fn run(
 
     if add {
         return add_key(
-            &path,
+            &mut io,
             &api_key,
             default_admin,
             region,
@@ -230,11 +545,7 @@ pub async fn run(
     }
 
     let existing = Config::load_from(&path).ok();
-    // A re-run keeps the stored region unless the flag says otherwise.
-    let stored = region_flag
-        .or(existing.as_ref().and_then(|c| c.region))
-        .unwrap_or_default();
-    note_unstored_region(region, region_flag, stored);
+    let saved_url = existing.as_ref().and_then(|c| c.base_url.clone());
     // Start from what will be saved, so discovery resolves the endpoint exactly
     // as later commands will. The run override is never saved.
     let mut config = Config {
@@ -246,13 +557,25 @@ pub async fn run(
             .as_ref()
             .map(|c| c.unmatched_ignore.clone())
             .unwrap_or_default(),
-        region: stored_region(stored),
-        base_url: existing.as_ref().and_then(|c| c.base_url.clone()),
+        region: None,
+        base_url: saved_url.clone(),
         endpoint_override: None,
     };
-    config.override_endpoint(region, base_url);
 
-    let admins = discover(&config.api_key, config.api_root(None)).await?;
+    // A saved base_url is an endpoint the user chose, like a flag: keep it.
+    let client = if region.is_some() || base_url.is_some() || saved_url.is_some() {
+        // A re-run keeps the stored region unless the flag says otherwise.
+        config.region = region_flag.or(existing.as_ref().and_then(|c| c.region));
+        note_unstored_region(region, region_flag, config.region);
+        config.override_endpoint(region, base_url);
+        authenticate(&config.api_key, config.api_root(None)).await?
+    } else {
+        let found = detect(&config.api_key, &io.probes, &mut io.input, io.interactive).await?;
+        (config.region, config.base_url) = announce(found.deployment);
+        found.client
+    };
+
+    let admins = discover(&client).await?;
     if admins.is_empty() {
         return Err(YukiError::NotFound(
             "no administrations found for this API key".to_string(),
@@ -284,7 +607,7 @@ pub async fn run(
         eprint!("Select default administration [1]: ");
         io::stderr().flush().ok();
 
-        let choice = read_line(&stdin);
+        let choice = read_line(&mut io.input);
         let idx: usize = if choice.is_empty() {
             1
         } else {
@@ -357,14 +680,15 @@ pub async fn run(
 /// A Yuki access key is scoped to the administration it was created in, so this is
 /// how a second set of books becomes reachable: the key is stored against the
 /// administrations it opens, and every command that targets one authenticates with it.
-async fn add_key(
-    path: &std::path::Path,
+async fn add_key<R: BufRead>(
+    io: &mut InitIo<R>,
     api_key: &str,
     default_admin: Option<&str>,
     region: Option<Region>,
     region_flag: Option<Region>,
     base_url: Option<&str>,
 ) -> Result<(), YukiError> {
+    let path: &Path = &io.path;
     // Distinguish "nothing to add to" from a config that exists but will not parse;
     // the second is a different problem and keeps its own error.
     if !path.exists() {
@@ -375,22 +699,26 @@ async fn add_key(
     }
     let mut config = Config::load_from(path)?;
 
-    // Administrations on another deployment than the configured default carry
-    // their own region, so a Dutch and a Belgian set of books can coexist.
+    // The key's administrations record the endpoint it was found on, so Dutch
+    // and Belgian books (or another deployment's) can coexist in one config.
     // Only the flag stamps a region: an exported YUKI_REGION is for this run.
-    let default_region = config.region.unwrap_or_default();
-    let stamp = region_flag.filter(|r| *r != default_region);
-    note_unstored_region(region, region_flag, default_region);
-
-    // Resolve the endpoint as for an administration carrying the stamp.
-    let probe = AdminEntry {
-        region: stamp,
-        ..AdminEntry::new("", "")
+    let (client, stamp, stamp_url) = if region.is_some() || base_url.is_some() {
+        note_unstored_region(region, region_flag, config.region);
+        // Resolve the endpoint as for an administration carrying the stamp.
+        let probe = AdminEntry {
+            region: region_flag,
+            ..AdminEntry::new("", "")
+        };
+        config.override_endpoint(region, base_url);
+        let api_root = config.api_root(Some(&probe)).to_string();
+        (authenticate(api_key, &api_root).await?, region_flag, None)
+    } else {
+        let found = detect(api_key, &io.probes, &mut io.input, io.interactive).await?;
+        let (stamp, stamp_url) = announce(found.deployment);
+        (found.client, stamp, stamp_url)
     };
-    config.override_endpoint(region, base_url);
-    let api_root = config.api_root(Some(&probe)).to_string();
 
-    let admins = discover(api_key, &api_root).await?;
+    let admins = discover(&client).await?;
     if admins.is_empty() {
         return Err(YukiError::NotFound(
             "no administrations found for this API key".to_string(),
@@ -398,10 +726,9 @@ async fn add_key(
     }
 
     let mut entries = to_entries(&admins);
-    if stamp.is_some() {
-        for entry in entries.values_mut() {
-            entry.region = stamp;
-        }
+    for entry in entries.values_mut() {
+        entry.region = stamp;
+        entry.base_url = stamp_url.clone();
     }
     let (added, updated) = config.merge_administrations(entries, api_key);
 
@@ -494,8 +821,67 @@ mod tests {
     }
 
     #[test]
-    fn only_a_non_default_region_is_stored() {
-        assert_eq!(stored_region(Region::Nl), None);
-        assert_eq!(stored_region(Region::Be), Some(Region::Be));
+    fn probe_roots_default_to_every_known_host() {
+        let roots = probe_roots(None).unwrap();
+        assert_eq!(roots.len(), Region::ALL.len());
+        for (region, root) in &roots {
+            assert_eq!(root, region.api_root());
+        }
+        assert_eq!(probe_roots(Some(" ")).unwrap(), roots);
+    }
+
+    #[test]
+    fn probe_roots_take_exactly_the_listed_regions() {
+        assert_eq!(
+            probe_roots(Some("be=http://127.0.0.1:1/be/ws")).unwrap(),
+            [(Region::Be, "http://127.0.0.1:1/be/ws".to_string())]
+        );
+        for bad in ["be", "de=http://x/ws"] {
+            assert!(probe_roots(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_typed_root_must_be_an_http_url() {
+        assert_eq!(
+            parse_base_url(" https://api.yukiworks.example/ws/ ").as_deref(),
+            Some("https://api.yukiworks.example/ws")
+        );
+        assert_eq!(
+            parse_base_url("http://127.0.0.1:8080/ws").as_deref(),
+            Some("http://127.0.0.1:8080/ws")
+        );
+        for bad in [
+            "",
+            "other",
+            "api.yukiworks.be/ws",
+            "https://",
+            "https:///ws",
+            "https://a b/ws",
+        ] {
+            assert_eq!(parse_base_url(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_typed_root_of_a_known_host_is_recorded_as_its_region() {
+        assert_eq!(
+            announce(Deployment::BaseUrl("https://api.yukiworks.be/ws".into())),
+            (Some(Region::Be), None)
+        );
+        assert_eq!(
+            announce(Deployment::BaseUrl("http://proxy/ws".into())),
+            (None, Some("http://proxy/ws".into()))
+        );
+    }
+
+    #[test]
+    fn only_invalid_access_key_means_another_region() {
+        assert!(rejects_key(&YukiError::AuthFailed(
+            "Invalid access key".into()
+        )));
+        // A WAF or proxy refusing the request says nothing about the key.
+        assert!(!rejects_key(&YukiError::AuthFailed("HTTP 403".into())));
+        assert!(!rejects_key(&YukiError::RateLimited));
     }
 }
