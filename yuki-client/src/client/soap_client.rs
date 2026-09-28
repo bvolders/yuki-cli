@@ -178,11 +178,6 @@ impl SoapClient {
                         inside_target = true;
                     }
                 }
-                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
-                    if inside_target =>
-                {
-                    content.push(event)?;
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
@@ -196,7 +191,7 @@ impl SoapClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(inside_target, event)?,
             }
             buf.clear();
         }
@@ -232,12 +227,6 @@ impl SoapClient {
                         _ => {}
                     }
                 }
-                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
-                    if in_faultcode || in_faultstring =>
-                {
-                    // Best effort: an unresolvable reference must not hide the fault.
-                    let _ = content.push(event);
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
@@ -271,7 +260,7 @@ impl SoapClient {
                     }
                 }
                 Ok(Event::Eof) | Err(_) => break,
-                _ => {}
+                Ok(ref event) => content.push_lossy_if(in_faultcode || in_faultstring, event),
             }
             buf.clear();
         }

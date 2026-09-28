@@ -287,7 +287,7 @@ impl ArchiveClient {
 
         let mut documents = Vec::new();
         let mut in_document = false;
-        let mut current_field = String::new();
+        let mut field: Option<String> = None;
         let mut doc = ArchiveDocument {
             id: String::new(),
             subject: String::new(),
@@ -328,15 +328,10 @@ impl ArchiveClient {
                         | "FileName" | "Reference"
                             if in_document =>
                         {
-                            current_field = local;
+                            field = Some(local);
                         }
                         _ => {}
                     }
-                }
-                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
-                    if in_document && !current_field.is_empty() =>
-                {
-                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
@@ -345,17 +340,18 @@ impl ArchiveClient {
                         "Subject" | "DocumentDate" | "Amount" | "Folder" | "ContactName"
                         | "FileName" | "Reference" => {
                             let text = content.take();
-                            match current_field.as_str() {
-                                "Subject" => doc.subject = text,
-                                "DocumentDate" => doc.document_date = text,
-                                "Amount" => doc.amount = text,
-                                "Folder" => doc.folder = text,
-                                "ContactName" => doc.contact_name = text,
-                                "FileName" => doc.file_name = text,
-                                "Reference" => doc.reference = text,
-                                _ => {}
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "Subject" => doc.subject = text,
+                                    "DocumentDate" => doc.document_date = text,
+                                    "Amount" => doc.amount = text,
+                                    "Folder" => doc.folder = text,
+                                    "ContactName" => doc.contact_name = text,
+                                    "FileName" => doc.file_name = text,
+                                    "Reference" => doc.reference = text,
+                                    _ => {}
+                                }
                             }
-                            current_field.clear();
                         }
                         "Document" => {
                             if !doc.id.is_empty() {
@@ -368,7 +364,7 @@ impl ArchiveClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(field.is_some(), event)?,
             }
             buf.clear();
         }
@@ -412,11 +408,6 @@ impl ArchiveClient {
                         _ => {}
                     }
                 }
-                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
-                    if in_description =>
-                {
-                    content.push(event)?;
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
@@ -439,7 +430,7 @@ impl ArchiveClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(in_description, event)?,
             }
             buf.clear();
         }
@@ -483,11 +474,6 @@ impl ArchiveClient {
                         _ => {}
                     }
                 }
-                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
-                    if in_description =>
-                {
-                    content.push(event)?;
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
@@ -510,7 +496,7 @@ impl ArchiveClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(in_description, event)?,
             }
             buf.clear();
         }
