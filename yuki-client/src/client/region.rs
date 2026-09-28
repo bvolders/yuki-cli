@@ -6,7 +6,14 @@ use std::str::FromStr;
 /// Yuki runs a separate API host per country. The services and their WSDLs are
 /// the same; only the host differs, and an access key is valid on its own
 /// country's host only.
+///
+/// With the `serde` feature it (de)serializes as its `as_str` form, `"nl"`/`"be"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "String", into = "&'static str")
+)]
 pub enum Region {
     /// The Netherlands: `api.yukiworks.nl`.
     #[default]
@@ -56,6 +63,20 @@ impl FromStr for Region {
             "be" => Ok(Self::Be),
             other => Err(format!("unknown region '{other}' (expected nl or be)")),
         }
+    }
+}
+
+impl TryFrom<String> for Region {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<Region> for &'static str {
+    fn from(region: Region) -> Self {
+        region.as_str()
     }
 }
 

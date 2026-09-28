@@ -1,5 +1,6 @@
-use std::process::{Command, Output};
+mod common;
 
+use common::{stdout_json, yuki};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -29,25 +30,6 @@ api_key = "holding-key"
 "#,
     )
     .expect("config file");
-}
-
-fn yuki(home: &TempDir, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_yuki"))
-        .args(args)
-        .env("HOME", home.path())
-        .env_remove("YUKI_REGION")
-        .env_remove("YUKI_BASE_URL")
-        .output()
-        .expect("yuki command")
-}
-
-fn stdout_json(output: Output) -> Value {
-    assert!(
-        output.status.success(),
-        "command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("JSON stdout")
 }
 
 #[test]

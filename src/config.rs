@@ -29,11 +29,7 @@ pub struct AdminEntry {
 
     /// Yuki deployment this administration lives on, when it differs from the
     /// top-level `region`. Set by `yuki init --add --region ...`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "region_serde"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<Region>,
 
     /// Bank GL accounts `check unmatched` scans when `--bank-account` is not
@@ -157,11 +153,7 @@ pub struct Config {
     pub unmatched_ignore: Vec<String>,
     /// Yuki deployment for administrations that do not name their own.
     /// Absent means the Netherlands, so existing configurations are unaffected.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "region_serde"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<Region>,
     /// Full API root (e.g. `https://api.yukiworks.be/ws`) that overrides every
     /// region. An escape hatch for new deployments and local mocks.
@@ -183,24 +175,11 @@ pub struct EndpointOverride {
     pub region: Option<Region>,
 }
 
-/// `Option<Region>` as a plain `"nl"`/`"be"` string.
-mod region_serde {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use crate::client::Region;
-
-    pub fn serialize<S: Serializer>(region: &Option<Region>, s: S) -> Result<S::Ok, S::Error> {
-        match region {
-            Some(r) => s.serialize_str(r.as_str()),
-            None => s.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Region>, D::Error> {
-        Option::<String>::deserialize(d)?
-            .map(|v| v.parse().map_err(serde::de::Error::custom))
-            .transpose()
-    }
+/// The resolved endpoint for one administration or key; see [`Config::endpoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Endpoint<'a> {
+    pub api_root: &'a str,
+    pub region: Region,
 }
 
 impl Config {
@@ -286,9 +265,10 @@ impl Config {
         };
     }
 
-    /// API root for `entry`, or for the shared key when `None`.
+    /// Where requests for `entry` (or the shared key, when `None`) go, and
+    /// which country's conventions (chart of accounts, bank formats) apply.
     ///
-    /// Precedence, highest first:
+    /// Layers, highest first:
     /// 1. the runtime override (`--base-url`/`--region` or their env vars), for
     ///    every administration and every key alike;
     /// 2. the administration's own `region`;
@@ -296,37 +276,40 @@ impl Config {
     /// 4. the top-level `region`;
     /// 5. the Netherlands.
     ///
+    /// The API root comes from the first layer present. The region comes from
+    /// the first layer that names one: a URL that is not a known deployment's
+    /// root (a proxy, a mock) says nothing about the country and is skipped.
     /// A saved `base_url` replaces the default endpoint only, so it cannot pull
     /// an administration that names its own region onto another deployment.
-    pub fn api_root(&self, entry: Option<&AdminEntry>) -> &str {
-        if let Some(o) = &self.endpoint_override {
-            return &o.api_root;
-        }
-        if let Some(region) = entry.and_then(|e| e.region) {
-            return region.api_root();
-        }
-        if let Some(url) = &self.base_url {
-            return url;
-        }
-        self.region.unwrap_or_default().api_root()
+    pub fn endpoint(&self, entry: Option<&AdminEntry>) -> Endpoint<'_> {
+        let region_layer = |r: Region| (r.api_root(), Some(r));
+        let layers = [
+            self.endpoint_override
+                .as_ref()
+                .map(|o| (o.api_root.as_str(), o.region)),
+            entry.and_then(|e| e.region).map(region_layer),
+            self.base_url
+                .as_deref()
+                .map(|url| (url, Region::from_api_root(url))),
+            self.region.map(region_layer),
+            Some(region_layer(Region::default())),
+        ];
+        let mut present = layers.into_iter().flatten();
+        let (api_root, region) = present.next().expect("the default layer is present");
+        let region = region
+            .or_else(|| present.find_map(|(_, region)| region))
+            .unwrap_or_default();
+        Endpoint { api_root, region }
     }
 
-    /// Region for `entry`: the country conventions (chart of accounts, bank
-    /// formats) of the deployment [`Config::api_root`] sends it to.
-    ///
-    /// Same precedence as `api_root`; a URL that is not a known deployment's root
-    /// (a proxy, a mock) is skipped, since it says nothing about the country.
+    /// API root for `entry`; see [`Config::endpoint`].
+    pub fn api_root(&self, entry: Option<&AdminEntry>) -> &str {
+        self.endpoint(entry).api_root
+    }
+
+    /// Region for `entry`; see [`Config::endpoint`].
     pub fn region(&self, entry: Option<&AdminEntry>) -> Region {
-        if let Some(o) = &self.endpoint_override
-            && let Some(region) = o.region
-        {
-            return region;
-        }
-        entry
-            .and_then(|e| e.region)
-            .or_else(|| self.base_url.as_deref().and_then(Region::from_api_root))
-            .or(self.region)
-            .unwrap_or_default()
+        self.endpoint(entry).region
     }
 
     /// Resolve the administration a command should run against.

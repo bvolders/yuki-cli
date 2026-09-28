@@ -11,8 +11,7 @@ pub mod upload;
 pub mod vat;
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
-use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::client::Region;
 use crate::client::accounting::AccountingClient;
@@ -59,53 +58,70 @@ pub struct Cli {
     pub yes: bool,
 
     /// Yuki deployment: nl (api.yukiworks.nl, default) or be (api.yukiworks.be).
-    /// Overrides the configured region for this run. `yuki init` stores it only
-    /// when given as a flag; an exported YUKI_REGION is never persisted.
+    /// Overrides the configured region for this run; `yuki init` stores it.
+    /// YUKI_REGION does the same when the flag is absent, but is never stored.
     #[arg(
         long,
         global = true,
-        env = "YUKI_REGION",
-        value_parser = PossibleValuesParser::new(["nl", "be"])
+        value_parser = PossibleValuesParser::new(REGIONS)
             .map(|s| s.parse::<Region>().expect("validated by PossibleValuesParser")),
     )]
     pub region: Option<Region>,
 
     /// Full API root, e.g. https://api.yukiworks.be/ws. Overrides --region.
-    #[arg(long, global = true, env = "YUKI_BASE_URL")]
+    /// YUKI_BASE_URL does the same when the flag is absent. Never stored.
+    #[arg(long, global = true)]
     pub base_url: Option<String>,
-
-    /// Whether `region` was typed on the command line rather than read from
-    /// `YUKI_REGION`. Clap merges both into one value, so this is recorded from
-    /// the argument's value source at parse time (see [`Cli::try_parse_tracked`]).
-    #[arg(skip)]
-    pub region_from_flag: bool,
 
     #[command(subcommand)]
     pub command: Commands,
 }
 
+/// Values `--region` and `YUKI_REGION` accept.
+const REGIONS: [&str; 2] = ["nl", "be"];
+
+/// The endpoint requested for this run, before the configuration is consulted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunEndpoint {
+    /// `--region`, else `YUKI_REGION`.
+    pub region: Option<Region>,
+    /// `--base-url`, else `YUKI_BASE_URL`; an empty value means unset.
+    pub base_url: Option<String>,
+}
+
 impl Cli {
-    /// Parse the process arguments, recording where `--region` came from.
-    pub fn try_parse_tracked() -> Result<Self, clap::Error> {
-        Self::try_parse_tracked_from(std::env::args_os())
+    /// The flags, each falling back to its environment variable.
+    pub fn run_endpoint(&self) -> Result<RunEndpoint, clap::Error> {
+        self.run_endpoint_with(|name| std::env::var(name).ok())
     }
 
-    /// [`Cli::try_parse_tracked`] over explicit arguments.
-    pub fn try_parse_tracked_from<I, T>(args: I) -> Result<Self, clap::Error>
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<std::ffi::OsString> + Clone,
-    {
-        let matches = Self::command().try_get_matches_from(args)?;
-        let mut cli = Self::from_arg_matches(&matches)?;
-        cli.region_from_flag = matches.value_source("region") == Some(ValueSource::CommandLine);
-        Ok(cli)
-    }
-
-    /// The region only when it was passed as `--region`, i.e. the one that
-    /// `yuki init` may persist.
-    pub fn region_flag(&self) -> Option<Region> {
-        self.region.filter(|_| self.region_from_flag)
+    /// [`Cli::run_endpoint`] over an explicit environment lookup.
+    ///
+    /// A set `YUKI_REGION` must be `nl` or `be`, exactly as the flag, and a bad
+    /// value is a usage error like a bad flag.
+    pub fn run_endpoint_with(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<RunEndpoint, clap::Error> {
+        let region = match (self.region, env("YUKI_REGION")) {
+            (Some(region), _) => Some(region),
+            (None, Some(value)) if REGIONS.contains(&value.as_str()) => {
+                Some(value.parse().expect("REGIONS holds only parseable regions"))
+            }
+            (None, Some(value)) => {
+                return Err(Self::command().error(
+                    clap::error::ErrorKind::InvalidValue,
+                    format!("invalid value '{value}' for YUKI_REGION [possible values: nl, be]"),
+                ));
+            }
+            (None, None) => None,
+        };
+        let base_url = self
+            .base_url
+            .clone()
+            .or_else(|| env("YUKI_BASE_URL"))
+            .filter(|u| !u.trim().is_empty());
+        Ok(RunEndpoint { region, base_url })
     }
 }
 
@@ -572,17 +588,49 @@ pub enum UploadCommands {
 mod tests {
     use super::*;
 
+    fn endpoint(args: &[&str], env: &[(&str, &str)]) -> Result<RunEndpoint, clap::Error> {
+        Cli::try_parse_from(args)
+            .expect("parses")
+            .run_endpoint_with(|name| {
+                env.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            })
+    }
+
     #[test]
-    fn region_flag_is_recorded_wherever_it_is_typed() {
-        for args in [
-            ["yuki", "init", "--region", "be"],
-            ["yuki", "--region", "be", "init"],
-        ] {
-            let cli = Cli::try_parse_tracked_from(args).expect("parses");
-            assert_eq!(cli.region, Some(Region::Be));
-            assert_eq!(cli.region_flag(), Some(Region::Be), "{args:?}");
+    fn flags_win_over_the_environment() {
+        let env = [("YUKI_REGION", "nl"), ("YUKI_BASE_URL", "http://env/ws")];
+        let got = endpoint(
+            &[
+                "yuki",
+                "--region",
+                "be",
+                "--base-url",
+                "http://flag/ws",
+                "init",
+            ],
+            &env,
+        );
+        assert_eq!(
+            got.unwrap(),
+            RunEndpoint {
+                region: Some(Region::Be),
+                base_url: Some("http://flag/ws".into())
+            }
+        );
+        let got = endpoint(&["yuki", "init"], &env).unwrap();
+        assert_eq!(got.region, Some(Region::Nl));
+        assert_eq!(got.base_url.as_deref(), Some("http://env/ws"));
+    }
+
+    #[test]
+    fn an_empty_base_url_is_unset_and_a_bad_region_is_a_usage_error() {
+        let got = endpoint(&["yuki", "init"], &[("YUKI_BASE_URL", " ")]).unwrap();
+        assert_eq!(got, RunEndpoint::default());
+        for bad in ["", "BE", "de"] {
+            let err = endpoint(&["yuki", "init"], &[("YUKI_REGION", bad)]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad:?}");
         }
-        let cli = Cli::try_parse_tracked_from(["yuki", "init"]).expect("parses");
-        assert_eq!(cli.region_flag(), None);
     }
 }

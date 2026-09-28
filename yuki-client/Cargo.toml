@@ -18,3 +18,8 @@ path = "src/lib.rs"
 quick-xml = "0.42"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+# Serialize/Deserialize for plain value types such as `Region`.
+serde = ["dep:serde"]

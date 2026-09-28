@@ -40,30 +40,47 @@ fn clients_default_to_the_dutch_host() {
 #[test]
 fn every_client_follows_the_api_root() {
     let be = Region::Be.api_root();
-    assert_eq!(
-        AccountingClient::new().with_api_root(be).base_url(),
-        "https://api.yukiworks.be/ws/Accounting.asmx"
-    );
-    assert_eq!(
-        AccountingInfoClient::new().with_api_root(be).base_url(),
-        "https://api.yukiworks.be/ws/AccountingInfo.asmx"
-    );
-    assert_eq!(
-        ArchiveClient::new().with_api_root(be).base_url(),
-        "https://api.yukiworks.be/ws/Archive.asmx"
-    );
-    assert_eq!(
-        ContactClient::new().with_api_root(be).base_url(),
-        "https://api.yukiworks.be/ws/Contact.asmx"
-    );
-    assert_eq!(
-        SalesClient::new().with_api_root(be).base_url(),
-        "https://api.yukiworks.be/ws/Sales.asmx"
-    );
-    assert_eq!(
-        VatClient::new().with_api_root(be).base_url(),
-        "https://api.yukiworks.be/ws/Vat.asmx"
-    );
+    let clients = [
+        (
+            "Accounting",
+            AccountingClient::new()
+                .with_api_root(be)
+                .base_url()
+                .to_string(),
+        ),
+        (
+            "AccountingInfo",
+            AccountingInfoClient::new()
+                .with_api_root(be)
+                .base_url()
+                .to_string(),
+        ),
+        (
+            "Archive",
+            ArchiveClient::new()
+                .with_api_root(be)
+                .base_url()
+                .to_string(),
+        ),
+        (
+            "Contact",
+            ContactClient::new()
+                .with_api_root(be)
+                .base_url()
+                .to_string(),
+        ),
+        (
+            "Sales",
+            SalesClient::new().with_api_root(be).base_url().to_string(),
+        ),
+        (
+            "Vat",
+            VatClient::new().with_api_root(be).base_url().to_string(),
+        ),
+    ];
+    for (service, url) in clients {
+        assert_eq!(url, format!("https://api.yukiworks.be/ws/{service}.asmx"));
+    }
 }
 
 #[test]

@@ -4,7 +4,7 @@ use reqwest::Client;
 
 use crate::error::YukiError;
 
-use super::{ElementText, local_name};
+use super::{ElementText, local_name, service_url};
 
 const YUKI_NS: &str = "http://www.theyukicompany.com/";
 const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -63,7 +63,7 @@ impl SoapEnvelope {
 /// HTTP transport client for the Yuki SOAP API.
 pub struct SoapClient {
     http: Client,
-    pub(super) base_url: String,
+    base_url: String,
     pub(super) session_id: Option<String>,
 }
 
@@ -92,6 +92,17 @@ impl SoapClient {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Point this transport at `service` (e.g. `Accounting.asmx`) under
+    /// `api_root`, such as `Region::Be.api_root()` or a local mock.
+    pub fn retarget(&mut self, api_root: &str, service: &str) {
+        self.base_url = service_url(api_root, service);
+    }
+
+    /// The endpoint this transport posts to.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Build the SOAPAction header value for a given operation.

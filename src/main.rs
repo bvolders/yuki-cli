@@ -1,15 +1,15 @@
 use std::fmt;
 use std::process;
 
-use clap::CommandFactory;
+use clap::{CommandFactory, Parser};
 use owo_colors::OwoColorize;
-use yuki_cli::cli::Cli;
 use yuki_cli::cli::Commands;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
     DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, UploadCommands,
     VatCommands,
 };
+use yuki_cli::cli::{Cli, RunEndpoint};
 use yuki_cli::config::Config;
 use yuki_cli::error::YukiError;
 use yuki_cli::output::{ListOptions, format_error_json, is_tty};
@@ -66,26 +66,29 @@ impl AppError {
     }
 }
 
+/// Print a usage error the way clap does, plus the structured envelope, and exit.
+fn exit_with_usage_error(e: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    // Help and version are informational exits, not errors.
+    // Print them normally and exit without an error envelope.
+    if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        let _ = e.print();
+        process::exit(0);
+    }
+    // Print clap's formatted error message to stderr, then the structured envelope.
+    eprintln!("{e}");
+    eprintln!("{}", format_error_json(&e.to_string(), "error"));
+    process::exit(e.exit_code());
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = match Cli::try_parse_tracked() {
-        Ok(cli) => cli,
-        Err(e) => {
-            use clap::error::ErrorKind;
-            // Help and version are informational exits, not errors.
-            // Print them normally and exit without an error envelope.
-            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
-                let _ = e.print();
-                process::exit(0);
-            }
-            // Print clap's formatted error message to stderr, then the structured envelope.
-            eprintln!("{e}");
-            eprintln!("{}", format_error_json(&e.to_string(), "error"));
-            process::exit(e.exit_code());
-        }
-    };
+    let cli = Cli::try_parse().unwrap_or_else(|e| exit_with_usage_error(e));
+    let endpoint = cli
+        .run_endpoint()
+        .unwrap_or_else(|e| exit_with_usage_error(e));
 
-    if let Err(err) = run(cli).await {
+    if let Err(err) = run(cli, endpoint).await {
         let code = err.exit_code();
         let kind = err.kind();
         // On TTY: print a human-friendly prefix first, then the structured error.
@@ -98,12 +101,11 @@ async fn main() {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), AppError> {
+async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
     let format = cli.output.as_deref();
-    // An empty YUKI_BASE_URL means unset, not a root of "".
-    let base_url = cli.base_url.clone().filter(|u| !u.trim().is_empty());
-    let region = cli.region;
-    let region_flag = cli.region_flag();
+    let RunEndpoint { region, base_url } = endpoint;
+    // Only a typed --region is ever persisted; YUKI_REGION is for this run.
+    let region_flag = cli.region;
     let load = || -> Result<Config, YukiError> {
         let mut config = Config::load()?;
         config.override_endpoint(region, base_url.as_deref());
