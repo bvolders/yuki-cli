@@ -79,23 +79,66 @@ fn is_gl_code(contact: &str) -> bool {
     !contact.is_empty() && contact.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Description patterns skipped by default for Belgian administrations: bank
-/// movements that never come with a purchase invoice.
-const BE_IGNORE_DESCRIPTIONS: &[&str] = &[
-    "Lening op korte termijn",
-    "Afloss. kapitaal",
-    "Vast voorschot kredieten",
-    "Kosten i.v.m. kredieten",
-    "Afrekening kredietkaarten",
-    "Betaling lonen",
-    "BTW ONTVANGSTEN",
-    "FOD FINANCI",
-];
+/// Region defaults for `check unmatched`, each used when the administration's
+/// config does not set its own.
+struct CheckDefaults {
+    /// Bank GL accounts to scan.
+    bank_accounts: &'static [&'static str],
+    /// Creditors control accounts that show who a payment went to.
+    creditor_accounts: &'static [&'static str],
+    /// Internal-transfer accounts.
+    transfer_accounts: &'static [&'static str],
+    /// Description patterns of bank movements that never come with a
+    /// purchase invoice.
+    ignore_descriptions: &'static [&'static str],
+    /// GL prefixes that never carry a document when a bank line is booked
+    /// straight to them.
+    no_document_accounts: &'static [&'static str],
+    /// Whether a payment to the administration's own name is an own transfer.
+    own_name_is_transfer: bool,
+}
 
-/// GL prefixes skipped by default for Belgian administrations when a bank line
-/// is booked straight to them: class 65, financial charges (interest, bank
-/// costs 657xxx, exchange differences), which never come with an invoice.
-const BE_NO_DOCUMENT_ACCOUNTS: &[&str] = &["65"];
+impl CheckDefaults {
+    fn for_region(region: Region) -> Self {
+        match region {
+            // The Dutch defaults keep the historic behaviour: one bank account
+            // and nothing else.
+            Region::Nl => Self {
+                bank_accounts: &["11001"],
+                creditor_accounts: &[],
+                transfer_accounts: &[],
+                ignore_descriptions: &[],
+                no_document_accounts: &[],
+                own_name_is_transfer: false,
+            },
+            // Belgium has a fixed chart (PCMN/MAR).
+            Region::Be => Self {
+                bank_accounts: &["550000"],
+                creditor_accounts: &["440000"],
+                transfer_accounts: &["580000"],
+                ignore_descriptions: &[
+                    "Lening op korte termijn",
+                    "Afloss. kapitaal",
+                    "Vast voorschot kredieten",
+                    "Kosten i.v.m. kredieten",
+                    "Afrekening kredietkaarten",
+                    "Betaling lonen",
+                    "BTW ONTVANGSTEN",
+                    "FOD FINANCI",
+                ],
+                // Class 65, financial charges (interest, bank costs 657xxx,
+                // exchange differences), which never come with an invoice.
+                no_document_accounts: &["65"],
+                own_name_is_transfer: true,
+            },
+        }
+    }
+}
+
+/// Owned copy of a default list.
+fn owned(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_string()).collect()
+}
 
 /// Matching rules for `check unmatched`, from region defaults and config.
 #[derive(Debug, Clone, Default)]
@@ -123,50 +166,47 @@ struct UnmatchedSetup {
 impl UnmatchedSetup {
     fn resolve(config: &Config, admin_name: &str, bank_flag: &[String]) -> Self {
         let entry = config.administrations.get(admin_name);
-        let be = config.region(entry) == Region::Be;
-        // Region default: Belgium has a fixed chart (PCMN/MAR); the Dutch
-        // default keeps the historic behaviour.
-        let region_default = |be_value: &[&str]| -> Vec<String> {
-            if be {
-                be_value.iter().map(|s| (*s).to_string()).collect()
-            } else {
-                Vec::new()
-            }
+        let defaults = CheckDefaults::for_region(config.region(entry));
+        // A list the administration configures wins, even when empty.
+        let configured = |list: Option<&Vec<String>>, default: &[&str]| {
+            list.cloned().unwrap_or_else(|| owned(default))
         };
 
         let bank_accounts = if !bank_flag.is_empty() {
             bank_flag.to_vec()
         } else if let Some(e) = entry.filter(|e| !e.bank_accounts.is_empty()) {
             e.bank_accounts.clone()
-        } else if be {
-            vec!["550000".to_string()]
         } else {
-            vec!["11001".to_string()]
+            owned(defaults.bank_accounts)
         };
 
         let own_names = entry
             .and_then(|e| e.name.as_deref())
             .map(normalize_name)
-            .filter(|n| be && !n.is_empty())
+            .filter(|n| defaults.own_name_is_transfer && !n.is_empty())
             .into_iter()
             .collect();
 
         Self {
             bank_accounts,
-            creditor_accounts: entry
-                .and_then(|e| e.creditor_accounts.clone())
-                .unwrap_or_else(|| region_default(&["440000"])),
-            transfer_accounts: entry
-                .and_then(|e| e.transfer_accounts.clone())
-                .unwrap_or_else(|| region_default(&["580000"])),
+            creditor_accounts: configured(
+                entry.and_then(|e| e.creditor_accounts.as_ref()),
+                defaults.creditor_accounts,
+            ),
+            transfer_accounts: configured(
+                entry.and_then(|e| e.transfer_accounts.as_ref()),
+                defaults.transfer_accounts,
+            ),
             rules: UnmatchedRules {
                 ignore_counterparties: config.unmatched_ignore.clone(),
-                ignore_descriptions: entry
-                    .and_then(|e| e.unmatched_ignore_descriptions.clone())
-                    .unwrap_or_else(|| region_default(BE_IGNORE_DESCRIPTIONS)),
-                no_document_accounts: entry
-                    .and_then(|e| e.no_document_accounts.clone())
-                    .unwrap_or_else(|| region_default(BE_NO_DOCUMENT_ACCOUNTS)),
+                ignore_descriptions: configured(
+                    entry.and_then(|e| e.unmatched_ignore_descriptions.as_ref()),
+                    defaults.ignore_descriptions,
+                ),
+                no_document_accounts: configured(
+                    entry.and_then(|e| e.no_document_accounts.as_ref()),
+                    defaults.no_document_accounts,
+                ),
                 own_names,
             },
         }
@@ -863,7 +903,7 @@ mod tests {
     fn be_rules() -> UnmatchedRules {
         UnmatchedRules {
             ignore_counterparties: Vec::new(),
-            ignore_descriptions: BE_IGNORE_DESCRIPTIONS.iter().map(|s| (*s).into()).collect(),
+            ignore_descriptions: owned(CheckDefaults::for_region(Region::Be).ignore_descriptions),
             no_document_accounts: vec!["65".into()],
             own_names: vec![normalize_name("Example Studio BV")],
         }
