@@ -1,75 +1,89 @@
 use crate::cli::setup_domain;
 use crate::client::accounting_info::AccountingInfoClient;
-use crate::client::sales::SalesClient;
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::output::{
     ListOptions, OutputFormat, apply_pagination, format_json, format_table, is_tty, select_fields,
 };
+use crate::period::parse_period;
+
+/// Which side of the ledger `invoices list` reports on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceSide {
+    /// Outstanding sales invoices (debtor items).
+    Debtor,
+    /// Outstanding purchase invoices (creditor items).
+    Creditor,
+}
+
+/// Map the `--invoice-type` flag to a ledger side. Sales is the default.
+fn invoice_side(invoice_type: Option<&str>) -> Result<InvoiceSide, YukiError> {
+    let Some(raw) = invoice_type.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(InvoiceSide::Debtor);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "sales" | "debtor" => Ok(InvoiceSide::Debtor),
+        "purchase" | "creditor" => Ok(InvoiceSide::Creditor),
+        _ => Err(YukiError::Config(format!(
+            "invalid invoice type: {raw}. Use sales (debtor) or purchase (creditor)."
+        ))),
+    }
+}
 
 pub async fn list(
     config: &Config,
     admin: Option<&str>,
-    _period: Option<&str>,
+    period: Option<&str>,
     invoice_type: Option<&str>,
     format: Option<&str>,
     opts: ListOptions<'_>,
 ) -> Result<(), YukiError> {
     let fmt = OutputFormat::from_flag(format, is_tty());
+    let side = invoice_side(invoice_type)?;
+    let range = period.map(parse_period).transpose()?;
 
-    match invoice_type {
-        Some("purchase") | Some("creditor") => {
-            let (client, target) = setup_domain(config, admin).await?;
-            let items = client.outstanding_creditor_items(target.admin_id).await?;
-
-            let mut headers = vec![
-                "Contact".into(),
-                "Description".into(),
-                "Date".into(),
-                "Amount".into(),
-                "Open".into(),
-            ];
-            let mut rows: Vec<Vec<String>> = items
-                .iter()
-                .map(|i| {
-                    vec![
-                        i.contact_name.clone(),
-                        i.description.clone(),
-                        i.date.clone(),
-                        i.amount.clone(),
-                        i.open_amount.clone(),
-                    ]
-                })
-                .collect();
-            apply_pagination(&mut rows, &opts);
-            select_fields(&mut headers, &mut rows, &opts)?;
-
-            match fmt {
-                OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
-                OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
-            }
+    let (client, target) = setup_domain(config, admin).await?;
+    let admin_id = target.admin_id;
+    let items = match (side, range) {
+        (InvoiceSide::Debtor, None) => client.outstanding_debtor_items(admin_id).await?,
+        (InvoiceSide::Debtor, Some((start, end))) => {
+            client
+                .outstanding_debtor_items_by_date(admin_id, &start, &end)
+                .await?
         }
-
-        // Default to sales invoices when type is "sales", "debtor", or unspecified
-        _ => {
-            let target = config.target(admin)?;
-            let mut client = SalesClient::new();
-            client.authenticate(target.api_key).await?;
-            let items = client.get_sales_items().await?;
-
-            let mut headers = vec!["ID".into(), "Description".into()];
-            let mut rows: Vec<Vec<String>> = items
-                .iter()
-                .map(|i| vec![i.id.clone(), i.description.clone()])
-                .collect();
-            apply_pagination(&mut rows, &opts);
-            select_fields(&mut headers, &mut rows, &opts)?;
-
-            match fmt {
-                OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
-                OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
-            }
+        (InvoiceSide::Creditor, None) => client.outstanding_creditor_items(admin_id).await?,
+        (InvoiceSide::Creditor, Some((start, end))) => {
+            client
+                .outstanding_creditor_items_by_date(admin_id, &start, &end)
+                .await?
         }
+    };
+
+    let mut headers = vec![
+        "Contact".into(),
+        "Description".into(),
+        "Date".into(),
+        "Amount".into(),
+        "Open".into(),
+    ];
+    let mut rows: Vec<Vec<String>> = items
+        .iter()
+        .map(|i| {
+            vec![
+                i.contact_name.clone(),
+                i.description.clone(),
+                i.date.clone(),
+                i.amount.clone(),
+                i.open_amount.clone(),
+            ]
+        })
+        .collect();
+    apply_pagination(&mut rows, &opts);
+    select_fields(&mut headers, &mut rows, &opts)?;
+
+    match fmt {
+        OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
+        OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
     }
 
     Ok(())
@@ -142,4 +156,34 @@ pub async fn show(
         OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sales_and_default_list_outstanding_debtor_items() {
+        assert_eq!(invoice_side(None).unwrap(), InvoiceSide::Debtor);
+        assert_eq!(invoice_side(Some("sales")).unwrap(), InvoiceSide::Debtor);
+        assert_eq!(invoice_side(Some("Debtor")).unwrap(), InvoiceSide::Debtor);
+    }
+
+    #[test]
+    fn purchase_lists_outstanding_creditor_items() {
+        assert_eq!(
+            invoice_side(Some("purchase")).unwrap(),
+            InvoiceSide::Creditor
+        );
+        assert_eq!(
+            invoice_side(Some("CREDITOR")).unwrap(),
+            InvoiceSide::Creditor
+        );
+    }
+
+    #[test]
+    fn unknown_invoice_type_is_rejected() {
+        let err = invoice_side(Some("items")).unwrap_err();
+        assert!(err.to_string().contains("items"), "{err}");
+    }
 }

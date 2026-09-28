@@ -7,6 +7,7 @@ pub mod documents;
 pub mod init;
 pub mod invoices;
 pub mod projects;
+pub mod sales;
 pub mod upload;
 pub mod vat;
 
@@ -109,7 +110,7 @@ pub enum Commands {
         command: AdminCommands,
     },
 
-    /// Work with sales invoices.
+    /// Work with outstanding sales and purchase invoices.
     Invoices {
         #[command(subcommand)]
         command: InvoiceCommands,
@@ -137,6 +138,12 @@ pub enum Commands {
     Vat {
         #[command(subcommand)]
         command: VatCommands,
+    },
+
+    /// Work with the sales catalogue.
+    Sales {
+        #[command(subcommand)]
+        command: SalesCommands,
     },
 
     /// Work with projects.
@@ -252,13 +259,13 @@ pub enum AdminCommands {
 
 #[derive(Subcommand)]
 pub enum InvoiceCommands {
-    /// List invoices, optionally filtered by period and type.
+    /// List outstanding (open) invoices, optionally filtered by period and type.
     List {
-        /// Accounting period (e.g. 2025-01).
+        /// Only items dated within this period (e.g. 2025, 2025-Q1, 2025-01).
         #[arg(long)]
         period: Option<String>,
 
-        /// Invoice type filter (e.g. sales, purchase).
+        /// Invoice type: sales (default, debtor items) or purchase (creditor items).
         #[arg(long)]
         invoice_type: Option<String>,
 
@@ -285,6 +292,24 @@ pub enum InvoiceCommands {
     Document {
         /// Transaction ID.
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SalesCommands {
+    /// List sales items (the products and services you invoice).
+    Items {
+        /// Maximum number of results to return.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Number of results to skip (for pagination).
+        #[arg(long)]
+        offset: Option<usize>,
+
+        /// Comma-separated list of fields to include in output.
+        #[arg(long)]
+        fields: Option<String>,
     },
 }
 

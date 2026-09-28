@@ -112,7 +112,10 @@ yuki vat returns                          # List all VAT return periods
 yuki vat returns 2025                     # Filter by year
 yuki vat codes                            # List active VAT codes
 
-yuki invoices list --invoice-type purchase # Outstanding purchase invoices
+yuki invoices list                        # Outstanding sales invoices (debtor items)
+yuki invoices list --invoice-type purchase # Outstanding purchase invoices (creditor items)
+yuki invoices list --period 2025-Q1       # Only items dated in the period
+yuki sales items                          # Sales item catalogue (products/services)
 yuki invoices show <transaction-id>       # Transaction details
 yuki invoices document <transaction-id>   # Document linked to a transaction
 

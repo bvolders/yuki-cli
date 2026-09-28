@@ -225,21 +225,35 @@ pub fn generate() -> Value {
             },
             {
                 "name": "invoices list",
-                "description": "List invoices, optionally filtered by period and type.",
+                "description": "List outstanding (open) invoices, optionally filtered by period and type.",
                 "mutating": false,
                 "args": [
-                    {"name": "--period", "type": "string", "required": false, "description": "Accounting period (e.g. 2025-01)."},
-                    {"name": "--invoice-type", "type": "string", "required": false, "description": "Invoice type filter (e.g. sales, purchase)."},
+                    {"name": "--period", "type": "string", "required": false, "description": "Only items dated within this period (e.g. 2025, 2025-Q1, 2025-01)."},
+                    {"name": "--invoice-type", "type": "string", "required": false, "enum": ["sales", "debtor", "purchase", "creditor"], "default": "sales", "description": "Invoice type: sales (default, debtor items) or purchase (creditor items)."},
+                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
+                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
+                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
+                ],
+                "output_fields": [
+                    {"name": "contact", "type": "string"},
+                    {"name": "description", "type": "string"},
+                    {"name": "date", "type": "string"},
+                    {"name": "amount", "type": "string"},
+                    {"name": "open", "type": "string"}
+                ]
+            },
+            {
+                "name": "sales items",
+                "description": "List sales items (the products and services you invoice).",
+                "mutating": false,
+                "args": [
                     {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
                     {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
                     {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
                 ],
                 "output_fields": [
                     {"name": "id", "type": "string"},
-                    {"name": "date", "type": "string"},
-                    {"name": "contact", "type": "string"},
-                    {"name": "amount", "type": "string"},
-                    {"name": "status", "type": "string"}
+                    {"name": "description", "type": "string"}
                 ]
             },
             {
