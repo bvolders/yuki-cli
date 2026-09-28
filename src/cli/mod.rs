@@ -594,6 +594,24 @@ pub enum CheckCommands {
         bank_account: Vec<String>,
     },
 
+    /// Suggest which payments already made settle the open purchase invoices.
+    ///
+    /// Read-only: Yuki's API cannot link a payment to an invoice, so confirm
+    /// each suggestion in the Yuki UI.
+    Matches {
+        /// Only open invoices dated in this period (e.g. 2026-Q2); payments
+        /// are still read up to today.
+        #[arg(long)]
+        period: Option<String>,
+        /// Bank GL account(s) to read payments from; repeat or comma-separate.
+        /// Defaults as for `check unmatched`.
+        #[arg(long, value_delimiter = ',')]
+        bank_account: Vec<String>,
+        /// Also list payments booked to a supplier that no open invoice takes.
+        #[arg(long)]
+        unallocated: bool,
+    },
+
     /// Check if a specific invoice reference is still outstanding.
     Outstanding {
         /// Invoice reference to check.

@@ -219,6 +219,7 @@ a shared key used by other profiles.
 ```sh
 yuki check btw 2025-Q4                    # VAT period check: outstanding items
 yuki check unmatched --period 2026-Q1     # Bank debits without matching invoices
+yuki check matches                        # Payments that may settle open purchase invoices
 yuki check outstanding <reference>        # Check if a reference is still outstanding
 ```
 
@@ -324,6 +325,38 @@ no_document_accounts = ["657", "650"]
 ```
 
 Dutch administrations keep the original behaviour unless these are set.
+
+### `check matches`: which open invoices are already paid
+
+`check matches` pairs open purchase invoices (the outstanding creditor items,
+as `invoices list --invoice-type purchase` shows them) with payments already
+made. It only suggests: Yuki's API cannot link a payment to an invoice, so each
+pair is confirmed in the Yuki UI. It reads the same accounts as `check
+unmatched` (bank, supplier ledger, transfers) from the oldest open invoice's
+date minus 90 days up to today; `--period` only narrows which invoices are
+considered. A payment is a candidate when no closed invoice explains it: a bank
+debit booked to the supplier but not linked to its invoice, a supplier-ledger
+payment from an account that is not scanned (e.g. a credit card), or a bank debit
+not booked to a supplier at all (a card payment or direct debit). Own
+transfers, ignored descriptions and no-document bookings are skipped as in
+`check unmatched`.
+
+| Confidence | When |
+|---|---|
+| `high` | same amount and supplier, at most 30 days apart; or one payment to a supplier adding up several of its invoices (within 7 days) |
+| `medium` | same amount and supplier, 31 to 90 days apart; several supplier payments adding up to one invoice; or one payment adding up invoices of several suppliers (the payment's supplier within 7 days, or any supplier dated that day, as with a marketplace order invoiced per seller) |
+| `low` | same amount, the payment names no supplier, at most 30 days apart |
+| `none` | no candidate payment: probably unpaid |
+
+Amounts must match to the cent; sums add up to four items. Each payment and each
+invoice is used once, strongest confidence first, then closest in date.
+`--unallocated` adds the supplier payments no open invoice took.
+
+```sh
+yuki check matches                     # every open purchase invoice
+yuki check matches --period 2026-Q2    # only invoices dated in Q2
+yuki check matches --unallocated -o json
+```
 
 Known limitation: individual credit-card purchases are not visible. The bank GL
 account only shows the monthly card settlement ("Afrekening kredietkaarten"),

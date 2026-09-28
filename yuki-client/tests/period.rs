@@ -111,3 +111,19 @@ fn today_is_an_iso_date() {
     assert_eq!(today.len(), 10);
     assert!(today.as_str() >= "2026-01-01");
 }
+
+#[test]
+fn epoch_days_parse_iso_dates_and_round_trip() {
+    use yuki_client::period::{date_from_epoch_days, epoch_days};
+    assert_eq!(epoch_days("1970-01-01"), Some(0));
+    assert_eq!(epoch_days("2026-09-28"), Some(20_724));
+    assert_eq!(epoch_days("2026-09-28T00:00:00"), Some(20_724));
+    assert_eq!(
+        epoch_days("2025-11-06")
+            .map(|d| d - 90)
+            .map(date_from_epoch_days),
+        Some("2025-08-08".into())
+    );
+    assert_eq!(epoch_days("not a date"), None);
+    assert_eq!(epoch_days("2026-13-01"), None);
+}

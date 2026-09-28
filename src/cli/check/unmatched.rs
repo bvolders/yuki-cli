@@ -1,5 +1,6 @@
 //! The matching engine behind `yuki check unmatched`: which bank debits have
-//! no purchase invoice, from ledgers, open items and the archive.
+//! no purchase invoice, from ledgers, open items and the archive. `check
+//! matches` reuses its fetches, amounts, ledger and filters (`pub(super)`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,15 +39,11 @@ const CODA_DETAIL_PREFIXES: &[&str] = &[
 ///
 /// Falls back to the first 50 characters of the description otherwise.
 fn parse_counterparty(description: &str) -> String {
-    if let Some(cntp_start) = description.find("/CNTP/") {
-        let after_cntp = &description[cntp_start + 6..];
-        let parts: Vec<&str> = after_cntp.splitn(4, '/').collect();
-        if parts.len() >= 3 {
-            return parts[2].trim().to_string();
-        }
-    }
-    if let Some(name) = parse_coda_counterparty(description) {
+    if let Some(name) = parse_counterparty_name(description) {
         return name;
+    }
+    if let Some(kind) = coda_kind(description) {
+        return kind;
     }
     description
         .chars()
@@ -56,7 +53,33 @@ fn parse_counterparty(description: &str) -> String {
         .to_string()
 }
 
-/// Counterparty from a Belgian CODA description, or `None` when it is not one.
+/// The counterparty *name* a bank description carries, or `None` when it has
+/// none (a CODA card payment or direct debit without a name, or free text).
+fn parse_counterparty_name(description: &str) -> Option<String> {
+    if let Some(cntp_start) = description.find("/CNTP/") {
+        let after_cntp = &description[cntp_start + 6..];
+        let parts: Vec<&str> = after_cntp.splitn(4, '/').collect();
+        if parts.len() >= 3 {
+            return Some(parts[2].trim().to_string()).filter(|n| !n.is_empty());
+        }
+    }
+    parse_coda_counterparty(description)
+}
+
+/// The CODA transaction type (first segment) of a Belgian description.
+fn coda_kind(description: &str) -> Option<String> {
+    if !description.contains("Netto bedrag:") {
+        return None;
+    }
+    let kind = description
+        .split('|')
+        .map(str::trim)
+        .find(|s| !s.is_empty())?;
+    Some(kind.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Counterparty name from a Belgian CODA description, or `None` when it is
+/// not one or names nobody.
 fn parse_coda_counterparty(description: &str) -> Option<String> {
     if !description.contains("Netto bedrag:") {
         return None;
@@ -66,21 +89,40 @@ fn parse_coda_counterparty(description: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    let (kind, rest) = segments.split_first()?;
+    let (_kind, rest) = segments.split_first()?;
     let name = rest.iter().skip(1).rev().find(|seg| {
         let lower = seg.to_lowercase();
         !CODA_DETAIL_PREFIXES.iter().any(|p| lower.starts_with(p))
-    });
-    let name = name.map_or(*kind, |n| n);
+    })?;
     // Squeeze the fixed-width padding CODA uses inside name/address fields.
     Some(name.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// The supplier the bank names for a line: the API contact when it is a name,
+/// else the counterparty in the description ([`parse_counterparty`]).
+pub(super) fn bank_counterparty(tx: &GlTransactionWithContact) -> String {
+    if !tx.contact_name.is_empty() && !is_gl_code(&tx.contact_name) {
+        tx.contact_name.clone()
+    } else {
+        parse_counterparty(&tx.description)
+    }
+}
+
+/// Like [`bank_counterparty`], but `None` when the line names nobody, so the
+/// CODA type or a description fragment is never mistaken for a name.
+pub(super) fn bank_counterparty_name(tx: &GlTransactionWithContact) -> Option<String> {
+    if !tx.contact_name.is_empty() && !is_gl_code(&tx.contact_name) {
+        Some(tx.contact_name.clone())
+    } else {
+        parse_counterparty_name(&tx.description)
+    }
 }
 
 /// Whether an API contact value is a GL account code rather than a name.
 ///
 /// Yuki fills `Contact` with the GL code when a bank line was booked straight to
 /// a ledger account (e.g. by a bank rule), so the value is no counterparty.
-fn is_gl_code(contact: &str) -> bool {
+pub(super) fn is_gl_code(contact: &str) -> bool {
     !contact.is_empty() && contact.chars().all(|c| c.is_ascii_digit())
 }
 
@@ -147,29 +189,58 @@ fn owned(list: &[&str]) -> Vec<String> {
 
 /// Matching rules for `check unmatched`, from region defaults and config.
 #[derive(Debug, Clone, Default)]
-struct UnmatchedRules {
+pub(super) struct UnmatchedRules {
     /// Counterparty substrings to skip (`unmatched_ignore`).
-    ignore_counterparties: Vec<String>,
+    pub(super) ignore_counterparties: Vec<String>,
     /// Full-description substrings to skip.
-    ignore_descriptions: Vec<String>,
+    pub(super) ignore_descriptions: Vec<String>,
     /// GL account prefixes that never carry a document. A bank line booked
     /// straight to one (its API contact is that GL code) is skipped; a line
     /// booked straight to any other account is still reported.
-    no_document_accounts: Vec<String>,
+    pub(super) no_document_accounts: Vec<String>,
     /// Names of the administration itself; a payment to one is an own transfer.
-    own_names: Vec<String>,
+    pub(super) own_names: Vec<String>,
+}
+
+impl UnmatchedRules {
+    /// Whether the full description matches an ignore pattern.
+    pub(super) fn skips_description(&self, description: &str) -> bool {
+        let lower = description.to_lowercase();
+        self.ignore_descriptions
+            .iter()
+            .any(|p| lower.contains(p.to_lowercase().as_str()))
+    }
+
+    /// Whether the line was booked straight to a GL account that never
+    /// carries a document (its API contact is that GL code).
+    pub(super) fn skips_gl_booking(&self, contact: &str) -> bool {
+        is_gl_code(contact)
+            && self
+                .no_document_accounts
+                .iter()
+                .any(|prefix| contact.starts_with(prefix.as_str()))
+    }
+
+    /// Whether the counterparty is ignored or is the administration itself.
+    pub(super) fn skips_counterparty(&self, counterparty: &str) -> bool {
+        let lower = counterparty.to_lowercase();
+        self.ignore_counterparties
+            .iter()
+            .any(|pat| lower.contains(&pat.to_lowercase()))
+            || self.own_names.contains(&normalize_name(counterparty))
+    }
 }
 
 /// Region defaults and per-administration overrides for `check unmatched`.
-struct UnmatchedSetup {
-    bank_accounts: Vec<String>,
-    creditor_accounts: Vec<String>,
-    transfer_accounts: Vec<String>,
-    rules: UnmatchedRules,
+pub(super) struct UnmatchedSetup {
+    pub(super) bank_accounts: Vec<String>,
+    pub(super) creditor_accounts: Vec<String>,
+    pub(super) transfer_accounts: Vec<String>,
+    pub(super) rules: UnmatchedRules,
 }
 
 impl UnmatchedSetup {
-    fn resolve(config: &Config, admin_name: &str, bank_flag: &[String]) -> Self {
+    pub(super) fn resolve(config: &Config, admin_name: &str, bank_flag: &[String]) -> Self {
         let entry = config.administrations.get(admin_name);
         let defaults = CheckDefaults::for_region(config.region(entry));
         // A list the administration configures wins, even when empty.
@@ -236,13 +307,13 @@ struct UnmatchedDebit {
 /// either cent through its `f64` form), where the code before `Cents` compared
 /// `{:.2}`-formatted strings; the two can differ only on such amounts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct Cents(i64);
+pub(super) struct Cents(pub(super) i64);
 
 impl Cents {
-    const ZERO: Self = Self(0);
+    pub(super) const ZERO: Self = Self(0);
 
     /// Parse an API amount such as `"-7.3"`, rounded to the cent.
-    fn parse(amount: &str) -> Option<Self> {
+    pub(super) fn parse(amount: &str) -> Option<Self> {
         let value = amount
             .trim()
             .parse::<f64>()
@@ -251,7 +322,7 @@ impl Cents {
         Some(Self((value * 100.0).round() as i64))
     }
 
-    fn abs(self) -> Self {
+    pub(super) fn abs(self) -> Self {
         Self(self.0.abs())
     }
 }
@@ -279,14 +350,14 @@ impl std::fmt::Display for Cents {
 }
 
 /// Date and amount, under which a bank debit and its ledger counter-entry meet.
-type EntryKey = (String, Cents);
+pub(super) type EntryKey = (String, Cents);
 
-fn entry_key(date: &str, amount: Cents) -> EntryKey {
+pub(super) fn entry_key(date: &str, amount: Cents) -> EntryKey {
     (date.to_string(), amount)
 }
 
 /// A multiset of keys that each match at most once.
-struct Pool<K>(HashMap<K, usize>);
+pub(super) struct Pool<K>(HashMap<K, usize>);
 
 impl<K> Default for Pool<K> {
     fn default() -> Self {
@@ -352,18 +423,20 @@ impl CreditorLine {
 
 /// A supplier payment on the creditors account.
 #[derive(Debug, Clone, PartialEq)]
-struct LedgerPayment {
-    contact: String,
+pub(super) struct LedgerPayment {
+    /// GL transaction id of the payment line on the creditors account.
+    pub(super) id: String,
+    pub(super) contact: String,
     /// Whether that supplier's invoices cover it.
-    covered: bool,
+    pub(super) covered: bool,
 }
 
 /// What the creditors control account says about bank payments.
 #[derive(Default)]
-struct CreditorLedger {
+pub(super) struct CreditorLedger {
     /// Supplier payments by date and amount ([`entry_key`]). Several payments
     /// can share a key, so every one is kept.
-    payments: HashMap<EntryKey, Vec<LedgerPayment>>,
+    pub(super) payments: HashMap<EntryKey, Vec<LedgerPayment>>,
 }
 
 impl CreditorLedger {
@@ -374,7 +447,7 @@ impl CreditorLedger {
     /// amount, so among equal candidates this prefers the supplier the bank
     /// names, then a covered payment (leaving the uncovered one for another
     /// bank line), then the first in supplier-name order.
-    fn claim(&mut self, key: &EntryKey, hint: &str) -> Option<LedgerPayment> {
+    pub(super) fn claim(&mut self, key: &EntryKey, hint: &str) -> Option<LedgerPayment> {
         let list = self.payments.get_mut(key)?;
         let hint = normalize_name(hint);
         let index = list
@@ -413,7 +486,7 @@ fn consume_fifo(invoices: &mut Vec<(&str, Cents)>, amount: Cents) {
 /// consume invoices the same way, so an invoice paid before the period cannot
 /// also cover a payment inside it. `entries` should reach back before the
 /// period so that invoices paid later are seen.
-fn match_creditor_ledger(
+pub(super) fn match_creditor_ledger(
     entries: &[GlTransactionWithContact],
     period_start: &str,
 ) -> CreditorLedger {
@@ -480,6 +553,7 @@ fn match_creditor_ledger(
             .entry(entry_key(&tx.date, amount))
             .or_default()
             .push(LedgerPayment {
+                id: tx.id.clone(),
                 contact: tx.contact_name.clone(),
                 covered,
             });
@@ -491,7 +565,61 @@ fn match_creditor_ledger(
 }
 
 /// Months before the period the creditors account is read from.
-const LOOKBACK_MONTHS: i32 = 3;
+pub(super) const LOOKBACK_MONTHS: i32 = 3;
+
+/// Debits that are own transfers: the opposite entry on the same date and
+/// amount sits on a transfer account or on another scanned bank account.
+/// Each opposite entry explains one debit only.
+pub(super) struct OwnTransfers<'a> {
+    transfers: Pool<EntryKey>,
+    bank_credits: Pool<(&'a str, EntryKey)>,
+    accounts: Vec<&'a str>,
+}
+
+impl<'a> OwnTransfers<'a> {
+    pub(super) fn new(
+        banks: &'a [(String, Vec<GlTransactionWithContact>)],
+        transfer_entries: &[GlTransactionWithContact],
+    ) -> Self {
+        let mut transfers = Pool::default();
+        for tx in transfer_entries {
+            if let Some(a) = Cents::parse(&tx.amount).filter(|a| *a >= Cents::ZERO) {
+                transfers.add(entry_key(&tx.date, a));
+            }
+        }
+        // Credits on the other scanned bank accounts are own transfers too.
+        let mut bank_credits = Pool::default();
+        for (account, txs) in banks {
+            for tx in txs {
+                if let Some(a) = Cents::parse(&tx.amount).filter(|a| *a > Cents::ZERO) {
+                    bank_credits.add((account.as_str(), entry_key(&tx.date, a)));
+                }
+            }
+        }
+        Self {
+            transfers,
+            bank_credits,
+            accounts: banks.iter().map(|(a, _)| a.as_str()).collect(),
+        }
+    }
+
+    /// Whether the debit on `account` with `key` (positive amount) is an own
+    /// transfer; consumes the opposite entry when it is.
+    pub(super) fn take(&mut self, account: &str, key: &EntryKey) -> bool {
+        if self.transfers.take(key) {
+            return true;
+        }
+        let others: Vec<&'a str> = self
+            .accounts
+            .iter()
+            .copied()
+            .filter(|other| *other != account)
+            .collect();
+        others
+            .into_iter()
+            .any(|other| self.bank_credits.take(&(other, key.clone())))
+    }
+}
 
 /// Cross-reference bank debits against ledgers, open items and the archive.
 ///
@@ -513,21 +641,7 @@ fn find_unmatched(
     archive_docs: &[ArchiveDocument],
     rules: &UnmatchedRules,
 ) -> Vec<UnmatchedDebit> {
-    let mut transfers = Pool::default();
-    for tx in transfer_entries {
-        if let Some(a) = Cents::parse(&tx.amount).filter(|a| *a >= Cents::ZERO) {
-            transfers.add(entry_key(&tx.date, a));
-        }
-    }
-    // Credits on the other scanned bank accounts are own transfers too.
-    let mut bank_credits = Pool::default();
-    for (account, txs) in banks {
-        for tx in txs {
-            if let Some(a) = Cents::parse(&tx.amount).filter(|a| *a > Cents::ZERO) {
-                bank_credits.add((account.as_str(), entry_key(&tx.date, a)));
-            }
-        }
-    }
+    let mut own_transfers = OwnTransfers::new(banks, transfer_entries);
     let mut creditor_pool = Pool::default();
     for item in creditor_items {
         if let Some(open) = Cents::parse(&item.open_amount) {
@@ -554,12 +668,6 @@ fn find_unmatched(
         .map(|d| normalize_name(&normalize_name(&d.contact_name)))
         .filter(|n| !n.is_empty())
         .collect();
-    let ignore_desc: Vec<String> = rules
-        .ignore_descriptions
-        .iter()
-        .map(|p| p.to_lowercase())
-        .collect();
-
     let mut unmatched = Vec::new();
     for (account, txs) in banks {
         for tx in txs {
@@ -572,32 +680,15 @@ fn find_unmatched(
 
             // The supplier the bank names: the API contact when it is a name,
             // else the description. Picks among equal ledger payments.
-            let bank_counterparty = if !tx.contact_name.is_empty() && !is_gl_code(&tx.contact_name)
-            {
-                tx.contact_name.clone()
-            } else {
-                parse_counterparty(&tx.description)
-            };
+            let bank_counterparty = bank_counterparty(tx);
             let ledger_payment = ledger.claim(&key, &bank_counterparty);
-            if ledger_payment.as_ref().is_some_and(|p| p.covered) || transfers.take(&key) {
-                continue;
-            }
-            let own_transfer = banks.iter().any(|(other, _)| {
-                other != account && bank_credits.take(&(other.as_str(), key.clone()))
-            });
-            if own_transfer {
+            if ledger_payment.as_ref().is_some_and(|p| p.covered)
+                || own_transfers.take(account, &key)
+            {
                 continue;
             }
 
-            let desc_lower = tx.description.to_lowercase();
-            if ignore_desc.iter().any(|p| desc_lower.contains(p.as_str())) {
-                continue;
-            }
-            if is_gl_code(&tx.contact_name)
-                && rules
-                    .no_document_accounts
-                    .iter()
-                    .any(|prefix| tx.contact_name.starts_with(prefix.as_str()))
+            if rules.skips_description(&tx.description) || rules.skips_gl_booking(&tx.contact_name)
             {
                 continue;
             }
@@ -610,19 +701,10 @@ fn find_unmatched(
             let ledger_contact = ledger_payment.map(|p| p.contact);
             let known_to_ledger = ledger_contact.is_some();
             let counterparty = ledger_contact.unwrap_or(bank_counterparty);
+            if rules.skips_counterparty(&counterparty) {
+                continue;
+            }
             let normalized = normalize_name(&counterparty);
-
-            let cp_lower = counterparty.to_lowercase();
-            if rules
-                .ignore_counterparties
-                .iter()
-                .any(|pat| cp_lower.contains(&pat.to_lowercase()))
-            {
-                continue;
-            }
-            if rules.own_names.contains(&normalized) {
-                continue;
-            }
             // The creditors account already compared this supplier's invoices.
             if !known_to_ledger
                 && archive_names
@@ -647,7 +729,7 @@ fn find_unmatched(
 
 /// Transactions with contact on each of `accounts` from `from` to `to`, one
 /// list per account in the same order; one API call per account, concurrently.
-async fn gl_entries(
+pub(super) async fn gl_entries(
     client: &AccountingClient,
     admin_id: &str,
     accounts: &[String],
@@ -806,7 +888,7 @@ const LEGAL_SUFFIXES: &[&str] = &[
 /// A name made only of a legal form (or punctuation) never normalizes to
 /// empty: it falls back to its dot-less form, then to the trimmed lowercase
 /// original, so it still matches itself.
-fn normalize_name(name: &str) -> String {
+pub(super) fn normalize_name(name: &str) -> String {
     let lower = name.trim().to_lowercase();
     // Remove "via ..." suffix (e.g. "Vimexx via Mollie" -> "vimexx")
     let base = lower.split(" via ").next().unwrap_or(&lower);
@@ -850,7 +932,7 @@ fn names_match(bank_name: &str, archive_name: &str) -> bool {
 }
 
 /// [`names_match`] over names already passed through [`normalize_name`].
-fn normalized_names_match(a: &str, b: &str) -> bool {
+pub(super) fn normalized_names_match(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && (a.contains(b) || b.contains(a))
 }
 

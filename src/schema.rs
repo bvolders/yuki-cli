@@ -362,6 +362,28 @@ pub fn generate() -> Value {
                 ]
             },
             {
+                "name": "check matches",
+                "description": "Suggest which payments already made settle the open purchase invoices (read-only; confirm in the Yuki UI).",
+                "mutating": false,
+                "args": [
+                    {"name": "--period", "type": "string", "required": false, "description": "Only open invoices dated in this period (e.g. 2026-Q2); payments are read up to today."},
+                    {"name": "--bank-account", "type": "string[]", "required": false, "description": "Bank GL account(s); repeat the flag or comma-separate values. Defaults as for check unmatched."},
+                    {"name": "--unallocated", "type": "boolean", "required": false, "description": "Also list payments booked to a supplier that no open invoice takes."}
+                ],
+                "output_fields": [
+                    {"name": "supplier", "type": "string"},
+                    {"name": "invoice_date", "type": "string"},
+                    {"name": "open", "type": "string"},
+                    {"name": "confidence", "type": "string", "description": "high, medium, low, none (no candidate: probably unpaid) or unallocated."},
+                    {"name": "payment_date", "type": "string"},
+                    {"name": "paid", "type": "string"},
+                    {"name": "bank", "type": "string"},
+                    {"name": "payment_id", "type": "string"},
+                    {"name": "counterparty", "type": "string"},
+                    {"name": "reason", "type": "string"}
+                ]
+            },
+            {
                 "name": "check outstanding",
                 "description": "Check if a specific invoice reference is still outstanding.",
                 "mutating": false,

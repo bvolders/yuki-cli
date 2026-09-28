@@ -491,6 +491,22 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?;
                 }
+                CheckCommands::Matches {
+                    period,
+                    bank_account,
+                    unallocated,
+                } => {
+                    yuki_cli::cli::check::matches(
+                        &config,
+                        admin,
+                        period.as_deref(),
+                        &bank_account,
+                        unallocated,
+                        format,
+                        cli.quiet,
+                    )
+                    .await?;
+                }
                 CheckCommands::Outstanding { reference } => {
                     yuki_cli::cli::check::outstanding(&config, admin, &reference, format).await?;
                 }

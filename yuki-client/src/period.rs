@@ -92,6 +92,30 @@ pub fn date_from_epoch_days(days: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// Days since 1970-01-01 of an ISO date (`YYYY-MM-DD`, anything after the
+/// tenth character such as a time is ignored); `None` when it is not a date.
+///
+/// The inverse of [`date_from_epoch_days`] (Howard Hinnant's `days_from_civil`).
+pub fn epoch_days(date: &str) -> Option<i64> {
+    let date = date.get(0..10)?;
+    let (y, rest) = date.split_once('-')?;
+    let (m, d) = rest.split_once('-')?;
+    let (year, month, day): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    if !(1..=12).contains(&month)
+        || day < 1
+        || day > i64::from(days_in_month(year as u32, month as u32))
+    {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
 /// Return the number of days in the given month of the given year.
 fn days_in_month(year: u32, month: u32) -> u32 {
     match month {
