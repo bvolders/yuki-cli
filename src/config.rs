@@ -29,11 +29,7 @@ pub struct AdminEntry {
 
     /// Yuki deployment this administration lives on, when it differs from the
     /// top-level `region`. Set by `yuki init --add --region ...`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "region_serde"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<Region>,
 
     /// Per-administration settings this build does not know about, kept
@@ -120,11 +116,7 @@ pub struct Config {
     pub unmatched_ignore: Vec<String>,
     /// Yuki deployment for administrations that do not name their own.
     /// Absent means the Netherlands, so existing configurations are unaffected.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "region_serde"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<Region>,
     /// Full API root (e.g. `https://api.yukiworks.be/ws`) that overrides every
     /// region. An escape hatch for new deployments and local mocks.
@@ -144,26 +136,6 @@ pub struct EndpointOverride {
     /// The region given explicitly, or implied by a URL that is a known
     /// deployment's root. `None` for a proxy or mock URL.
     pub region: Option<Region>,
-}
-
-/// `Option<Region>` as a plain `"nl"`/`"be"` string.
-mod region_serde {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use crate::client::Region;
-
-    pub fn serialize<S: Serializer>(region: &Option<Region>, s: S) -> Result<S::Ok, S::Error> {
-        match region {
-            Some(r) => s.serialize_str(r.as_str()),
-            None => s.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Region>, D::Error> {
-        Option::<String>::deserialize(d)?
-            .map(|v| v.parse().map_err(serde::de::Error::custom))
-            .transpose()
-    }
 }
 
 impl Config {
