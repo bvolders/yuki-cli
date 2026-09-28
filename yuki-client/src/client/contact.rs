@@ -153,11 +153,6 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
                     _ => {}
                 }
             }
-            Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
-                if in_contact && !current_field.is_empty() =>
-            {
-                content.push(event)?;
-            }
             Ok(Event::End(ref e)) => {
                 let name = e.name();
                 let local = local_name(name.as_ref());
@@ -185,7 +180,7 @@ pub fn parse_contacts(xml: &str) -> Result<Vec<Contact>, YukiError> {
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(YukiError::Xml(e.to_string())),
-            _ => {}
+            Ok(ref event) => content.push_if(in_contact && !current_field.is_empty(), event)?,
         }
         buf.clear();
     }

@@ -119,11 +119,6 @@ impl VatClient {
                         _ => {}
                     }
                 }
-                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
-                    if field.is_some() =>
-                {
-                    content.push(event)?;
-                }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
@@ -161,7 +156,7 @@ impl VatClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(field.is_some(), event)?,
             }
             buf.clear();
         }
@@ -201,11 +196,6 @@ impl VatClient {
                         _ => {}
                     }
                 }
-                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
-                    if field.is_some() =>
-                {
-                    content.push(event)?;
-                }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
@@ -228,7 +218,7 @@ impl VatClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(field.is_some(), event)?,
             }
             buf.clear();
         }
