@@ -55,6 +55,17 @@ pub fn parse_period(period: &str) -> Result<(String, String), YukiError> {
     Err(invalid())
 }
 
+/// First day of the month `months` before the month of `date` (`YYYY-MM-DD`),
+/// e.g. `month_start_before("2026-02-15", 3)` is `"2025-11-01"`.
+///
+/// An unparseable year or month falls back to 1970 and January.
+pub fn month_start_before(date: &str, months: i32) -> String {
+    let year: i32 = date.get(0..4).and_then(|y| y.parse().ok()).unwrap_or(1970);
+    let month: i32 = date.get(5..7).and_then(|m| m.parse().ok()).unwrap_or(1);
+    let total = year * 12 + (month - 1) - months;
+    format!("{:04}-{:02}-01", total / 12, total % 12 + 1)
+}
+
 /// Return the number of days in the given month of the given year.
 fn days_in_month(year: u32, month: u32) -> u32 {
     match month {

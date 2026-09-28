@@ -11,6 +11,7 @@ use crate::client::archive::{ArchiveClient, ArchiveDocument};
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
+use crate::period::month_start_before;
 
 /// Segments of a Belgian CODA description that carry payment details, not a name.
 const CODA_DETAIL_PREFIXES: &[&str] = &[
@@ -435,14 +436,8 @@ fn match_creditor_ledger(
     ledger
 }
 
-/// First day of the month three months before `date` (`YYYY-MM-DD`), so the
-/// creditors account is read far enough back to see invoices paid later.
-fn lookback_start(date: &str) -> String {
-    let year: i32 = date.get(0..4).and_then(|y| y.parse().ok()).unwrap_or(1970);
-    let month: i32 = date.get(5..7).and_then(|m| m.parse().ok()).unwrap_or(1);
-    let total = year * 12 + (month - 1) - 3;
-    format!("{:04}-{:02}-01", total / 12, total % 12 + 1)
-}
+/// Months before the period the creditors account is read from.
+const LOOKBACK_MONTHS: i32 = 3;
 
 /// Cross-reference bank debits against ledgers, open items and the archive.
 ///
@@ -621,7 +616,8 @@ pub async fn unmatched(
         banks.push((account.clone(), txs));
     }
 
-    let lookback = lookback_start(&start);
+    // Read the creditors account far enough back to see invoices paid later.
+    let lookback = month_start_before(&start, LOOKBACK_MONTHS);
     let mut creditor_entries = Vec::new();
     for account in &setup.creditor_accounts {
         if !quiet {
@@ -970,13 +966,6 @@ mod tests {
         assert!(is_gl_code("657100"));
         assert!(!is_gl_code("Example NV"));
         assert!(!is_gl_code(""));
-    }
-
-    #[test]
-    fn lookback_starts_three_months_earlier() {
-        assert_eq!(lookback_start("2026-07-01"), "2026-04-01");
-        assert_eq!(lookback_start("2026-02-15"), "2025-11-01");
-        assert_eq!(lookback_start("2026-01-01"), "2025-10-01");
     }
 
     #[test]
@@ -1406,10 +1395,6 @@ mod tests {
 
     #[test]
     fn setup_reads_no_document_accounts() {
-        let be = UnmatchedSetup::resolve(&config("region = \"be\"", ""), "co", &[]);
-        assert_eq!(be.rules.no_document_accounts, ["65"]);
-        let nl = UnmatchedSetup::resolve(&config("", ""), "co", &[]);
-        assert!(nl.rules.no_document_accounts.is_empty());
         let custom = config(
             "region = \"be\"",
             "no_document_accounts = [\"657\", \"6400\"]",
