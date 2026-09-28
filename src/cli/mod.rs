@@ -361,7 +361,7 @@ pub enum DocumentCommands {
         /// Invoice amount to search for.
         #[arg(long)]
         amount: f64,
-        /// Invoice date (YYYY-MM-DD). Matches within +/-7 days.
+        /// Invoice date: YYYY-MM-DD matches within +/-7 days; a period (2025, 2025-Q1, 2025-03) matches the whole period.
         #[arg(long)]
         date: String,
         /// Contact/supplier name to narrow the search.

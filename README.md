@@ -191,7 +191,7 @@ yuki upload payment-methods                             # List payment method ID
 | Flag | Description |
 |------|-------------|
 | `--profile <name>` / `--admin <name>` | Override default administration profile |
-| `--output text\|json` | Output format (auto-detects TTY) |
+| `--output auto\|text\|json` | Output format (default auto: table on a TTY, JSON when piped) |
 | `--quiet` | Suppress informational output |
 | `--yes` | Confirm destructive operations |
 

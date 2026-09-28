@@ -311,7 +311,7 @@ pub fn generate() -> Value {
                 "mutating": false,
                 "args": [
                     {"name": "--amount", "type": "number", "required": true, "description": "Invoice amount to search for."},
-                    {"name": "--date", "type": "string", "required": true, "description": "Invoice date (YYYY-MM-DD). Matches within +/-7 days."},
+                    {"name": "--date", "type": "string", "required": true, "description": "Invoice date: YYYY-MM-DD matches within +/-7 days; a period (2025, 2025-Q1, 2025-03) matches the whole period."},
                     {"name": "--contact", "type": "string", "required": false, "description": "Contact/supplier name to narrow the search."}
                 ],
                 "output_fields": [
