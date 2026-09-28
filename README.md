@@ -193,6 +193,11 @@ lookup by transaction ID, so the CLI fetches that account's lines for `--period`
 (default: the current year) in one API call and keeps the matching one. A
 narrower period means a smaller response.
 
+`accounts balance` reports the balance at the **end** of `--period` (today, in
+the local time zone, while the period is still running) and says which date in
+an `As Of` column. Releases up to 0.1.13 reported the balance at the period's start,
+without that column.
+
 ### Authentication and configuration
 
 ```sh

@@ -127,3 +127,25 @@ fn epoch_days_parse_iso_dates_and_round_trip() {
     assert_eq!(epoch_days("not a date"), None);
     assert_eq!(epoch_days("2026-13-01"), None);
 }
+
+#[test]
+fn local_date_follows_the_utc_offset_across_midnight() {
+    use yuki_client::period::date_at;
+    // 2026-09-27 22:30 UTC is already 2026-09-28 in Brussels (UTC+2).
+    let secs = 20_723 * 86_400 + 22 * 3_600 + 30 * 60;
+    assert_eq!(date_at(secs, 0), "2026-09-27");
+    assert_eq!(date_at(secs, 2 * 3_600), "2026-09-28");
+    // West of Greenwich the day starts later.
+    assert_eq!(date_at(20_724 * 86_400 + 3_600, -5 * 3_600), "2026-09-27");
+}
+
+#[cfg(unix)]
+#[test]
+fn today_is_the_local_calendar_date() {
+    let out = std::process::Command::new("date")
+        .arg("+%Y-%m-%d")
+        .output()
+        .unwrap();
+    let local = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(yuki_client::period::today(), local.trim());
+}

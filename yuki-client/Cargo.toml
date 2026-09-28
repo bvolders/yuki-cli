@@ -1,6 +1,6 @@
 [package]
 name = "yuki-client"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Typed async client for the Yuki bookkeeping SOAP API"
@@ -23,3 +23,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 [features]
 # Serialize/Deserialize for plain value types such as `Region`.
 serde = ["dep:serde"]
+
+# Local UTC offset for `period::today()`; already in the tree via tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
