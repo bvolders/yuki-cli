@@ -470,6 +470,30 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_reinit_keeps_the_settings_of_administrations_that_still_exist() {
+        let mut earlier = AdminEntry::new("domain-old", "admin-be").with_api_key("stale-key");
+        earlier.region = Some(Region::Be);
+        earlier.extra.insert(
+            "bank_accounts".into(),
+            toml::Value::Array(vec!["550002".into()]),
+        );
+        let previous = BTreeMap::from([("voorbeeld_bv".to_string(), earlier)]);
+        let discovered = to_entries(&[Administration {
+            name: "Voorbeeld BV".into(),
+            id: "admin-be".into(),
+            domain_id: "domain-be".into(),
+        }]);
+
+        let rebuilt = rebuild_administrations(Some(&previous), discovered);
+        let entry = &rebuilt["voorbeeld_bv"];
+        assert_eq!(entry.domain_id, "domain-be");
+        assert_eq!(entry.region, Some(Region::Be));
+        assert_eq!(entry.extra["bank_accounts"][0].as_str(), Some("550002"));
+        // The new key is the shared one now, so the stale per-admin key goes.
+        assert_eq!(entry.api_key, None);
+    }
+
+    #[test]
     fn only_a_non_default_region_is_stored() {
         assert_eq!(stored_region(Region::Nl), None);
         assert_eq!(stored_region(Region::Be), Some(Region::Be));
