@@ -55,14 +55,42 @@ pub fn parse_period(period: &str) -> Result<(String, String), YukiError> {
     Err(invalid())
 }
 
-/// Today's date (UTC) as `YYYY-MM-DD`.
+/// Today's date in the local time zone as `YYYY-MM-DD`.
+///
+/// Local, not UTC: in Belgium the UTC date lags the calendar by a day for the
+/// last one or two hours of every day, which would clamp a running period to
+/// yesterday.
 pub fn today() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    date_from_epoch_days((secs / 86_400) as i64)
+        .as_secs() as i64;
+    date_at(secs, local_utc_offset(secs))
+}
+
+/// Calendar date (`YYYY-MM-DD`) of a Unix timestamp seen at a UTC offset in seconds.
+pub fn date_at(epoch_secs: i64, utc_offset_secs: i64) -> String {
+    date_from_epoch_days((epoch_secs + utc_offset_secs).div_euclid(86_400))
+}
+
+/// The local time zone's UTC offset at `epoch_secs`, from the C library
+/// (honours `TZ` and DST); 0 when it cannot tell.
+#[cfg(unix)]
+fn local_utc_offset(epoch_secs: i64) -> i64 {
+    let t = epoch_secs as libc::time_t;
+    // SAFETY: `localtime_r` only writes into the `tm` we own and hand it, and
+    // reads `t`; a zeroed `tm` is a valid value of the plain C struct.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
+}
+
+#[cfg(not(unix))]
+fn local_utc_offset(_epoch_secs: i64) -> i64 {
+    0
 }
 
 /// Calendar date (`YYYY-MM-DD`) of a day count since 1970-01-01.

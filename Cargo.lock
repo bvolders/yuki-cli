@@ -2258,6 +2258,7 @@ dependencies = [
 name = "yuki-client"
 version = "0.2.1"
 dependencies = [
+ "libc",
  "quick-xml",
  "reqwest",
  "thiserror",

@@ -18,3 +18,7 @@ path = "src/lib.rs"
 quick-xml = "0.42"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 thiserror = "2"
+
+# Local UTC offset for `period::today()`; already in the tree via tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
