@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use super::resolve_period;
 use crate::cli::setup_domain;
 use crate::client::Region;
-use crate::client::accounting::{GlTransactionWithContact, OutstandingItem, TransactionType};
+use crate::client::accounting::{
+    AccountingClient, GlTransactionWithContact, OutstandingItem, TransactionType,
+};
 use crate::client::archive::{ArchiveClient, ArchiveDocument};
 use crate::config::Config;
 use crate::error::YukiError;
@@ -630,6 +632,26 @@ fn find_unmatched(
     unmatched
 }
 
+/// Transactions with contact on each of `accounts` from `from` to `to`, one
+/// list per account in the same order; one API call per account.
+async fn gl_entries(
+    client: &AccountingClient,
+    admin_id: &str,
+    accounts: &[String],
+    from: &str,
+    to: &str,
+) -> Result<Vec<Vec<GlTransactionWithContact>>, YukiError> {
+    let mut lists = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        lists.push(
+            client
+                .gl_account_transactions_and_contact(admin_id, account, from, to)
+                .await?,
+        );
+    }
+    Ok(lists)
+}
+
 /// Find bank transactions on the bank GL account(s) that have no matching invoice.
 ///
 /// See [`find_unmatched`] for the matching order. Bank, creditor and transfer
@@ -644,70 +666,63 @@ pub async fn unmatched(
     quiet: bool,
 ) -> Result<(), YukiError> {
     let (start, end) = resolve_period(period)?;
-    let (accounting_client, target) = setup_domain(config, admin).await?;
+    let (accounting, target) = setup_domain(config, admin).await?;
     let setup = UnmatchedSetup::resolve(config, target.config_name, bank_accounts);
-    let mut calls = 2;
-
-    let mut banks = Vec::new();
-    for account in &setup.bank_accounts {
-        if !quiet {
-            eprintln!("Fetching bank transactions (GL {account})...");
-        }
-        let txs = accounting_client
-            .gl_account_transactions_and_contact(target.admin_id, account, &start, &end)
-            .await?;
-        calls += 1;
-        banks.push((account.clone(), txs));
-    }
-
     // Read the creditors account far enough back to see invoices paid later.
     let lookback = month_start_before(&start, LOOKBACK_MONTHS);
-    let mut creditor_entries = Vec::new();
-    for account in &setup.creditor_accounts {
-        if !quiet {
+
+    if !quiet {
+        for account in &setup.bank_accounts {
+            eprintln!("Fetching bank transactions (GL {account})...");
+        }
+        for account in &setup.creditor_accounts {
             eprintln!("Fetching supplier ledger (GL {account}, from {lookback})...");
         }
-        creditor_entries.extend(
-            accounting_client
-                .gl_account_transactions_and_contact(target.admin_id, account, &lookback, &end)
-                .await?,
-        );
-        calls += 1;
-    }
-
-    let mut transfer_entries = Vec::new();
-    for account in &setup.transfer_accounts {
-        if !quiet {
+        for account in &setup.transfer_accounts {
             eprintln!("Fetching internal transfers (GL {account})...");
         }
-        transfer_entries.extend(
-            accounting_client
-                .gl_account_transactions_and_contact(target.admin_id, account, &start, &end)
-                .await?,
-        );
-        calls += 1;
-    }
-
-    if !quiet {
         eprintln!("Fetching outstanding creditor items...");
-    }
-    let creditor_items = accounting_client
-        .outstanding_creditor_items(target.admin_id)
-        .await?;
-    calls += 1;
-
-    if !quiet {
         eprintln!("Fetching booked invoices from archive...");
     }
-    let mut archive_client = ArchiveClient::new().with_api_root(target.api_root);
-    archive_client.authenticate(target.api_key).await?;
-    let archive_docs = archive_client.search_documents("", &start, &end).await?;
-    calls += 2;
+    let admin_id = target.admin_id;
+    let bank_entries =
+        gl_entries(&accounting, admin_id, &setup.bank_accounts, &start, &end).await?;
+    let creditor_entries = gl_entries(
+        &accounting,
+        admin_id,
+        &setup.creditor_accounts,
+        &lookback,
+        &end,
+    )
+    .await?;
+    let transfer_entries = gl_entries(
+        &accounting,
+        admin_id,
+        &setup.transfer_accounts,
+        &start,
+        &end,
+    )
+    .await?;
+    let creditor_items = accounting.outstanding_creditor_items(admin_id).await?;
+    let mut archive = ArchiveClient::new().with_api_root(target.api_root);
+    archive.authenticate(target.api_key).await?;
+    let archive_docs = archive.search_documents("", &start, &end).await?;
 
     if !quiet {
-        eprintln!("API calls made: {calls}");
+        // Authenticate + SetCurrentDomain, one call per GL account, the open
+        // items, and Authenticate + SearchDocuments on the archive.
+        let gl_calls = bank_entries.len() + creditor_entries.len() + transfer_entries.len();
+        eprintln!("API calls made: {}", 2 + gl_calls + 1 + 2);
     }
 
+    let banks: Vec<(String, Vec<GlTransactionWithContact>)> = setup
+        .bank_accounts
+        .iter()
+        .cloned()
+        .zip(bank_entries)
+        .collect();
+    let creditor_entries = creditor_entries.concat();
+    let transfer_entries = transfer_entries.concat();
     let found = find_unmatched(
         &banks,
         match_creditor_ledger(&creditor_entries, &start),
