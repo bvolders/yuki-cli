@@ -354,8 +354,12 @@ transfers, ignored descriptions and no-document bookings are skipped as in
 | `card` | no candidate, and either the invoice's payment method is a card (`Creditcard`), or the supplier ledger shows the supplier paid in the window from an account that is not scanned (in practice the credit card, whose purchases have no bank line of their own) |
 | `none` | no candidate, but the supplier was paid from a scanned bank account in the window, so its payment would show: probably unpaid |
 | `unseen` | no candidate, and no payment to the supplier at all in the window: a new supplier, or one paid by a card payment or direct debit whose bank line names nobody. Not evidence of either card or unpaid |
+| `credit` | an open credit note no payment settled together with the supplier's invoices: nothing to pay |
 
-Amounts must match to the cent; sums add up to four items. The exception is an
+Amounts must match to the cent; sums add up to four items. A payment to a
+supplier can settle its invoices net of its open credit notes (dated within
+90 days of the payment), as `medium`: 480.00 invoiced, 195.50 credited, 284.50
+paid. The exception is an
 invoice of a supplier outside the euro area (the open item carries the
 supplier's country, not the currency): Yuki books it at its own exchange rate
 and the card is charged at another, so a payment of that supplier within 3% or

@@ -180,36 +180,40 @@ fn an_invoice_without_any_payment_has_no_suggestion() {
 }
 
 #[test]
-fn credit_notes_are_not_open_invoices() {
-    assert!(OpenInvoice::from_item(&item("Supplier I", "2025-11-06", "-187.00")).is_none());
+fn credit_notes_are_kept_as_open_credits() {
+    let credit = OpenInvoice::from_item(&item("Supplier I", "2025-11-10", "-187.00")).unwrap();
+    assert!(credit.is_credit());
+    assert!(OpenInvoice::from_item(&item("Supplier I", "2025-11-10", "0.00")).is_none());
 }
 
 #[test]
 fn window_reaches_back_from_the_oldest_open_invoice() {
     let invoices = vec![
         invoice("Supplier A", "2026-08-03", "10.00"),
-        invoice("Supplier B", "2025-11-06", "20.00"),
+        invoice("Supplier B", "2025-11-10", "20.00"),
     ];
     let window = Window::for_invoices(&invoices, "2026-09-28").unwrap();
-    assert_eq!(window.payments_from, "2025-08-08");
+    assert_eq!(window.payments_from, "2025-08-12");
     assert_eq!(window.ledger_from, "2025-05-01");
     assert_eq!(window.to, "2026-09-28");
     assert!(Window::for_invoices(&[], "2026-09-28").is_none());
 }
 
 #[test]
-fn select_invoices_filters_by_period_and_drops_credit_notes() {
+fn select_invoices_filters_by_period_and_keeps_credit_notes() {
     let items = vec![
-        item("Supplier A", "2025-11-06", "20.00"),
+        item("Supplier A", "2025-11-10", "20.00"),
         item("Supplier B", "2026-07-15", "-5.00"),
         item("Supplier C", "2026-07-20", "7.00"),
+        item("Supplier D", "2026-07-21", "0.00"),
     ];
     let all = select_invoices(&items, None);
-    assert_eq!(all.len(), 2);
-    assert_eq!(all[0].date, "2025-11-06");
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].date, "2025-11-10");
     let q3 = select_invoices(&items, Some(("2026-07-01", "2026-09-30")));
-    assert_eq!(q3.len(), 1);
-    assert_eq!(q3[0].contact, "Supplier C");
+    assert_eq!(q3.len(), 2);
+    assert!(q3[0].is_credit());
+    assert_eq!(q3[1].contact, "Supplier C");
 }
 
 #[test]
@@ -631,4 +635,44 @@ fn a_busy_day_still_reaches_invoices_beyond_the_first_candidates() {
         .expect("p2 settles 12 and 13");
     assert_eq!(p2.payments, vec![1]);
     assert_eq!(p2.invoices, vec![12, 13]);
+}
+
+#[test]
+fn a_payment_can_settle_an_invoice_net_of_a_credit_note_of_the_supplier() {
+    // 480.00 invoiced, 195.50 credited earlier, 284.50 paid.
+    let invoices = vec![
+        invoice("Supplier K", "2026-05-12", "-195.50"),
+        invoice("Supplier K", "2026-06-01", "480.00"),
+        invoice("Supplier L", "2026-06-01", "-10.00"),
+    ];
+    let payments = vec![payment("p1", "2026-06-03", "284.50", Some("Supplier K"))];
+    let result = suggest(&invoices, &payments);
+    for i in [0, 1] {
+        let s = result.suggestions[i].as_ref().unwrap();
+        assert_eq!(s.confidence, Confidence::Medium, "item {i}");
+        assert_eq!(s.invoices, vec![0, 1]);
+        assert_eq!(s.payments, vec![0]);
+    }
+    let (headers, rows) = rows_for(&invoices, &payments, &result, &PaidVia::default());
+    let conf = headers.iter().position(|h| h == "Confidence").unwrap();
+    let reason = headers.iter().position(|h| h == "Reason").unwrap();
+    assert!(
+        rows[1][reason]
+            .starts_with("one payment settles 1 invoice net of 1 credit note of the supplier"),
+        "{}",
+        rows[1][reason]
+    );
+    // Another supplier's credit note is not netted, and stays a credit.
+    assert_eq!(rows[2][conf], "credit");
+    assert_eq!(rows[2][reason], "open credit note: nothing to pay");
+}
+
+#[test]
+fn a_credit_note_is_never_paid_on_its_own() {
+    // A tiny foreign credit note is not "within the FX tolerance" of a payment.
+    let mut credit = item("Hosting Inc", "2026-06-07", "-0.40");
+    credit.country = "US".into();
+    let invoices = vec![OpenInvoice::from_item(&credit).unwrap()];
+    let payments = vec![payment("p1", "2026-06-07", "0.50", Some("Hosting Inc"))];
+    assert_eq!(confidence_of(&suggest(&invoices, &payments), 0), None);
 }

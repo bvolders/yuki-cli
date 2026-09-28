@@ -70,7 +70,7 @@ impl Confidence {
     }
 }
 
-/// An open purchase invoice (an outstanding creditor item).
+/// An open purchase invoice or credit note (an outstanding creditor item).
 #[derive(Debug, Clone)]
 pub(super) struct OpenInvoice {
     pub(super) contact: String,
@@ -84,10 +84,16 @@ pub(super) struct OpenInvoice {
 }
 
 impl OpenInvoice {
-    /// The invoice behind an outstanding item; `None` for a credit note (a
-    /// negative open amount), which no payment settles.
+    /// A credit note: no payment settles it on its own, but a payment can
+    /// settle the supplier's invoices net of it.
+    pub(super) fn is_credit(&self) -> bool {
+        self.open < Cents::ZERO
+    }
+
+    /// The invoice or credit note (a negative open amount) behind an
+    /// outstanding item; `None` when nothing is open.
     pub(super) fn from_item(item: &OutstandingItem) -> Option<Self> {
-        let open = Cents::parse(&item.open_amount).filter(|o| *o > Cents::ZERO)?;
+        let open = Cents::parse(&item.open_amount).filter(|o| *o != Cents::ZERO)?;
         Some(Self {
             contact: item.contact_name.clone(),
             date: day(&item.date).to_string(),
@@ -186,8 +192,8 @@ impl Window {
     }
 }
 
-/// Open invoices (credit notes dropped), optionally dated within `range`,
-/// oldest first.
+/// Open invoices and credit notes, optionally dated within `range`, oldest
+/// first.
 pub(super) fn select_invoices(
     items: &[OutstandingItem],
     range: Option<(&str, &str)>,
@@ -396,12 +402,13 @@ struct Candidate {
 }
 
 /// Subsets of 2..=[`MAX_GROUP`] of `pool` whose amounts sum to `target`
-/// exactly, each in `pool` order.
+/// exactly, each in `pool` order. Amounts may be negative (credit notes).
 fn subsets(pool: &[usize], amount: &dyn Fn(usize) -> i64, target: i64) -> Vec<Vec<usize>> {
     fn walk(
         pool: &[usize],
         amount: &dyn Fn(usize) -> i64,
         left: i64,
+        signed: bool,
         chosen: &mut Vec<usize>,
         out: &mut Vec<Vec<usize>>,
     ) {
@@ -409,17 +416,26 @@ fn subsets(pool: &[usize], amount: &dyn Fn(usize) -> i64, target: i64) -> Vec<Ve
             out.push(chosen.clone());
             return;
         }
-        if left <= 0 || chosen.len() == MAX_GROUP {
+        // Overshooting is final only when nothing negative can bring it back.
+        if (left <= 0 && !signed) || chosen.len() == MAX_GROUP {
             return;
         }
         for (k, &item) in pool.iter().enumerate() {
             chosen.push(item);
-            walk(&pool[k + 1..], amount, left - amount(item), chosen, out);
+            walk(
+                &pool[k + 1..],
+                amount,
+                left - amount(item),
+                signed,
+                chosen,
+                out,
+            );
             chosen.pop();
         }
     }
+    let signed = pool.iter().any(|&i| amount(i) < 0);
     let mut out = Vec::new();
-    walk(pool, amount, target, &mut Vec::new(), &mut out);
+    walk(pool, amount, target, signed, &mut Vec::new(), &mut out);
     out
 }
 
@@ -475,7 +491,7 @@ fn candidates(
             .filter(|(p, _)| free_payment[*p])
     };
 
-    for (i, invoice) in free_invoices() {
+    for (i, invoice) in free_invoices().filter(|(_, i)| !i.is_credit()) {
         let mut split_pool = Vec::new();
         for (p, payment) in free_payments() {
             let d = days(i, p);
@@ -529,12 +545,19 @@ fn candidates(
         let pool = closest(
             free_invoices()
                 .filter(|(i, invoice)| {
-                    invoice.open < payment.amount
-                        && match name_relation(payment, &names[*i]) {
-                            Name::Same => days(*i, p) <= GROUP_DAYS,
-                            // Another seller's part of a same-day order.
-                            Name::Other | Name::Unknown => invoice.date == payment.date,
+                    let relation = name_relation(payment, &names[*i]);
+                    if invoice.is_credit() {
+                        // The supplier's own credit note, netted off its invoices.
+                        return relation == Name::Same && days(*i, p) <= FAR_DAYS;
+                    }
+                    match relation {
+                        // Even one larger than the payment, net of a credit note.
+                        Name::Same => days(*i, p) <= GROUP_DAYS,
+                        // Another seller's part of a same-day order.
+                        Name::Other | Name::Unknown => {
+                            invoice.open < payment.amount && invoice.date == payment.date
                         }
+                    }
                 })
                 .map(|(i, _)| (days(i, p), i))
                 .collect(),
@@ -544,12 +567,15 @@ fn candidates(
                 .iter()
                 .filter(|&&i| name_relation(payment, &names[i]) == Name::Same)
                 .count();
+            let netted = set.iter().any(|&i| invoices[i].is_credit());
             let confidence = match (&payment.supplier, same) {
                 // A nameless payment may be anyone's.
                 (None, _) => Confidence::Low,
                 // It names someone else: it pays none of them.
                 (Some(_), 0) => continue,
-                (Some(_), n) if n == set.len() => Confidence::High,
+                // Netting a credit note is a guess about how the supplier
+                // settled, however well the names agree.
+                (Some(_), n) if n == set.len() && !netted => Confidence::High,
                 (Some(_), _) => Confidence::Medium,
             };
             found.push(Candidate {
@@ -625,7 +651,7 @@ pub(super) fn suggest(invoices: &[OpenInvoice], payments: &[Payment]) -> Matches
 }
 
 /// Why a suggestion was made, in words.
-fn reason(s: &Suggestion, payments: &[Payment]) -> String {
+fn reason(s: &Suggestion, invoices: &[OpenInvoice], payments: &[Payment]) -> String {
     let apart = match s.days {
         0 => "same day".to_string(),
         1 => "1 day apart".to_string(),
@@ -642,6 +668,19 @@ fn reason(s: &Suggestion, payments: &[Payment]) -> String {
     } else {
         format!("within {} days", s.days)
     };
+    let credits = s
+        .invoices
+        .iter()
+        .filter(|&&i| invoices[i].is_credit())
+        .count();
+    if credits > 0 {
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+        return format!(
+            "one payment settles {} net of {} of the supplier, {within}{booked}",
+            plural(s.invoices.len() - credits, "invoice"),
+            plural(credits, "credit note"),
+        );
+    }
     if s.invoices.len() > 1 {
         let (payment, suppliers) = match s.confidence {
             Confidence::High => ("payment", "of the supplier"),
@@ -724,13 +763,15 @@ pub(super) fn rows_for(
                         join(s, &|p| p.bank.clone()),
                         join(s, &|p| p.id.clone()),
                         names.join("; "),
-                        reason(s, payments),
+                        reason(s, invoices, payments),
                     ]);
                 }
                 None => {
                     let name = normalize_name(&invoice.contact);
                     let among = |names: &[String]| names.iter().any(|n| normalized_names_match(n, &name));
-                    let (status, why) = if !invoice.card_method.is_empty() {
+                    let (status, why) = if invoice.is_credit() {
+                        ("credit", "open credit note: nothing to pay".to_string())
+                    } else if !invoice.card_method.is_empty() {
                         (
                             "card",
                             format!(
@@ -904,7 +945,7 @@ pub async fn matches(
             format!(" (payments {} to {})", w.payments_from, w.to)
         });
         eprintln!(
-            "{} open invoices{window}: {} high, {} medium, {} low; no candidate: {} paid by card before, {} probably unpaid, {} supplier never seen paid",
+            "{} open items{window}: {} high, {} medium, {} low; no candidate: {} card, {} probably unpaid, {} supplier never seen paid, {} credit notes",
             invoices.len(),
             count("high"),
             count("medium"),
@@ -912,6 +953,7 @@ pub async fn matches(
             count("card"),
             count("none"),
             count("unseen"),
+            count("credit"),
         );
     }
     if unallocated {
