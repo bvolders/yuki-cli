@@ -172,7 +172,8 @@ fn days_apart(a: &str, b: &str) -> i64 {
 /// Date ranges to read.
 #[derive(Debug)]
 pub(super) struct Window {
-    /// Payments from here: the oldest open invoice minus [`FAR_DAYS`].
+    /// Payments from here: the oldest open invoice (not credit note) minus
+    /// [`FAR_DAYS`].
     pub(super) payments_from: String,
     /// The creditors account from here, [`LOOKBACK_MONTHS`] earlier still, so
     /// that closed invoices paid inside the window are seen.
@@ -182,7 +183,13 @@ pub(super) struct Window {
 
 impl Window {
     pub(super) fn for_invoices(invoices: &[OpenInvoice], today: &str) -> Option<Self> {
-        let oldest = invoices.iter().filter_map(|i| epoch_days(&i.date)).min()?;
+        // Credit notes do not widen it: reading further back changes what the
+        // creditors account covers, and a credit is only netted near a payment.
+        let oldest = invoices
+            .iter()
+            .filter(|i| !i.is_credit())
+            .filter_map(|i| epoch_days(&i.date))
+            .min()?;
         let payments_from = date_from_epoch_days(oldest - FAR_DAYS);
         Some(Self {
             ledger_from: month_start_before(&payments_from, LOOKBACK_MONTHS),

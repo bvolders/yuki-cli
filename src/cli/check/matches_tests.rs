@@ -200,6 +200,20 @@ fn window_reaches_back_from_the_oldest_open_invoice() {
 }
 
 #[test]
+fn an_old_credit_note_does_not_widen_the_window() {
+    // Reading further back changes what the creditors account covers, so an
+    // old credit note must not move the window of the invoices.
+    let invoices = vec![
+        invoice("Supplier A", "2025-01-15", "-5.00"),
+        invoice("Supplier B", "2025-11-10", "20.00"),
+    ];
+    let window = Window::for_invoices(&invoices, "2026-09-28").unwrap();
+    assert_eq!(window.payments_from, "2025-08-12");
+    let only_credit = vec![invoice("Supplier A", "2025-01-15", "-5.00")];
+    assert!(Window::for_invoices(&only_credit, "2026-09-28").is_none());
+}
+
+#[test]
 fn select_invoices_filters_by_period_and_keeps_credit_notes() {
     let items = vec![
         item("Supplier A", "2025-11-10", "20.00"),
