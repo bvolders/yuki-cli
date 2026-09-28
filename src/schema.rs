@@ -77,11 +77,7 @@ pub fn generate() -> Value {
                 "name": "vat codes",
                 "description": "List active VAT codes.",
                 "mutating": false,
-                "args": [
-                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
-                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
-                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
-                ],
+                "args": [],
                 "output_fields": [
                     {"name": "code", "type": "string"},
                     {"name": "description", "type": "string"},
@@ -154,11 +150,7 @@ pub fn generate() -> Value {
                 "name": "accounts scheme",
                 "description": "Show the chart of accounts (GL account scheme).",
                 "mutating": false,
-                "args": [
-                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
-                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
-                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
-                ],
+                "args": [],
                 "output_fields": [
                     {"name": "code", "type": "string"},
                     {"name": "description", "type": "string"},
@@ -182,10 +174,7 @@ pub fn generate() -> Value {
                 "description": "Show opening balances per GL account for a book year.",
                 "mutating": false,
                 "args": [
-                    {"name": "--year", "type": "string", "required": false, "description": "Book year (e.g. 2025)."},
-                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
-                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
-                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
+                    {"name": "--year", "type": "string", "required": false, "description": "Book year (e.g. 2025)."}
                 ],
                 "output_fields": [
                     {"name": "account", "type": "string"},
@@ -197,11 +186,7 @@ pub fn generate() -> Value {
                 "name": "projects list",
                 "description": "List all projects.",
                 "mutating": false,
-                "args": [
-                    {"name": "--limit", "type": "integer", "required": false, "description": "Maximum number of results to return."},
-                    {"name": "--offset", "type": "integer", "required": false, "description": "Number of results to skip (for pagination)."},
-                    {"name": "--fields", "type": "string", "required": false, "description": "Comma-separated list of fields to include in output."}
-                ],
+                "args": [],
                 "output_fields": [
                     {"name": "code", "type": "string"},
                     {"name": "name", "type": "string"},
@@ -768,6 +753,77 @@ mod tests {
         assert!(names.contains(&"profile list"), "missing 'profile list'");
         assert!(names.contains(&"config path"), "missing 'config path'");
         assert!(names.contains(&"doctor"), "missing 'doctor'");
+    }
+
+    /// Leaf commands and their arguments as clap defines them, keyed "group sub".
+    fn clap_leaves() -> Vec<(String, Vec<String>)> {
+        use clap::CommandFactory;
+        fn walk(cmd: &clap::Command, prefix: &str, out: &mut Vec<(String, Vec<String>)>) {
+            for sub in cmd.get_subcommands() {
+                let name = if prefix.is_empty() {
+                    sub.get_name().to_string()
+                } else {
+                    format!("{prefix} {}", sub.get_name())
+                };
+                if sub.has_subcommands() {
+                    walk(sub, &name, out);
+                } else {
+                    let mut args: Vec<String> = sub
+                        .get_arguments()
+                        .filter(|a| !a.is_global_set() && a.get_id() != "help")
+                        .map(|a| match a.get_long() {
+                            Some(long) => format!("--{long}"),
+                            None => a.get_id().to_string(),
+                        })
+                        .collect();
+                    args.sort();
+                    out.push((name, args));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&crate::cli::Cli::command(), "", &mut out);
+        out
+    }
+
+    #[test]
+    fn schema_commands_and_args_match_clap() {
+        let schema = generate();
+        let documented: std::collections::BTreeMap<String, Vec<String>> = schema["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let mut args: Vec<String> = c["args"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|arg| arg["name"].as_str().unwrap().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                args.sort();
+                (c["name"].as_str().unwrap().to_string(), args)
+            })
+            .collect();
+        let mut problems = Vec::new();
+        for (name, args) in clap_leaves() {
+            if matches!(name.as_str(), "completions" | "schema" | "capabilities") {
+                continue;
+            }
+            match documented.get(&name) {
+                None => problems.push(format!("{name}: missing from schema")),
+                Some(doc_args) if doc_args != &args => {
+                    problems.push(format!("{name}: schema {doc_args:?} != clap {args:?}"))
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "schema drift:\n{}",
+            problems.join("\n")
+        );
     }
 
     #[test]
