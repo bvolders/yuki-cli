@@ -80,6 +80,11 @@ pub fn today() -> String {
     date_at(secs, local_utc_offset(secs))
 }
 
+/// The current year in the local time zone, from [`today`].
+pub fn current_year() -> u32 {
+    today()[..4].parse().unwrap_or(1970)
+}
+
 /// Calendar date (`YYYY-MM-DD`) of a Unix timestamp seen at a UTC offset in seconds.
 pub fn date_at(epoch_secs: i64, utc_offset_secs: i64) -> String {
     date_from_epoch_days((epoch_secs + utc_offset_secs).div_euclid(86_400))

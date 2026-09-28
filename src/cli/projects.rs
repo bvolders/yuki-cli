@@ -2,7 +2,7 @@ use crate::client::accounting_info::AccountingInfoClient;
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
-use crate::period::parse_period;
+use crate::period::{current_year, parse_period};
 
 pub async fn list(
     config: &Config,
@@ -67,13 +67,4 @@ fn resolve_period(period: Option<&str>) -> Result<(String, String), YukiError> {
             Ok((format!("{year}-01-01"), format!("{year}-12-31")))
         }
     }
-}
-
-fn current_year() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    1970 + (secs / 31_557_600) as u32
 }

@@ -6,7 +6,7 @@ use crate::error::YukiError;
 use crate::output::{
     ListOptions, OutputFormat, apply_pagination, format_json, format_table, is_tty, select_fields,
 };
-use crate::period::{parse_period, today};
+use crate::period::{current_year, parse_period, today};
 
 pub async fn balance(
     config: &Config,
@@ -199,16 +199,6 @@ pub(crate) fn resolve_period(period: Option<&str>) -> Result<(String, String), Y
             Ok((format!("{year}-01-01"), format!("{year}-12-31")))
         }
     }
-}
-
-fn current_year() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Approximate: seconds since epoch divided by seconds per year
-    1970 + (secs / 31_557_600) as u32
 }
 
 #[cfg(test)]

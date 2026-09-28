@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::error::YukiError;
 use crate::folders;
 use crate::output::{ListOptions, OutputFormat, format_json, format_table, is_tty, select_fields};
+use crate::period::current_year;
 
 /// Parse a document type, which Yuki identifies by a numeric ID.
 fn doc_type_id(value: &str) -> Result<i32, YukiError> {
@@ -208,15 +209,6 @@ pub async fn exists(
     }
 
     Ok(())
-}
-
-fn current_year() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    1970 + (secs / 31_557_600) as u32
 }
 
 /// Build a search window and date filter from a date string.

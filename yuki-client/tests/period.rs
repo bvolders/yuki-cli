@@ -149,3 +149,9 @@ fn today_is_the_local_calendar_date() {
     let local = String::from_utf8(out.stdout).unwrap();
     assert_eq!(yuki_client::period::today(), local.trim());
 }
+
+#[test]
+fn current_year_is_the_year_of_today() {
+    use yuki_client::period::{current_year, today};
+    assert_eq!(current_year().to_string(), today()[..4]);
+}
