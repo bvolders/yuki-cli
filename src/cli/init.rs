@@ -447,11 +447,16 @@ async fn discover(client: &AccountingClient) -> Result<Vec<Administration>, Yuki
 ///
 /// `region` is the deployment for this run, from `--region` or `YUKI_REGION`;
 /// `region_flag` is the same value only when `--region` was typed on the command
-/// line. Only the flag is persisted: an exported environment variable is a
-/// per-shell choice and must not silently rewrite the configuration. `base_url`
-/// (flag or env) is never persisted.
+/// line. `base_url` (flag or env) is resolved the same way.
 ///
-/// With neither, the region is detected from the key (see [`detect`]) and
+/// A fresh init — no configuration exists yet — has nothing to protect from the
+/// environment, so it persists whichever endpoint `region`/`base_url` actually
+/// resolved to, exactly as a typed `--region`/`--base-url` would be. Re-running
+/// `init` on an existing configuration (or rotating the key, or `--add`) only
+/// ever persists the flag: an exported environment variable is a per-shell
+/// choice there and must not silently rewrite the configuration.
+///
+/// With neither given, the region is detected from the key (see [`detect`]) and
 /// recorded, whichever it is.
 pub async fn run(
     api_key: Option<&str>,
@@ -564,10 +569,30 @@ pub async fn run_with<R: BufRead>(
 
     // A saved base_url is an endpoint the user chose, like a flag: keep it.
     let client = if region.is_some() || base_url.is_some() || saved_url.is_some() {
-        // A re-run keeps the stored region unless the flag says otherwise.
-        config.region = region_flag.or(existing.as_ref().and_then(|c| c.region));
-        note_unstored_region(region, region_flag, config.region);
-        config.override_endpoint(region, base_url);
+        if existing.is_none() {
+            // A fresh init has nothing to overwrite, so the endpoint this run
+            // actually used — from a flag or its environment variable alike —
+            // is the one to record, exactly as a typed --region/--base-url
+            // would be. Otherwise the next run without the environment variable
+            // would silently fall back to the legacy `nl` default.
+            config.override_endpoint(region, base_url);
+            let resolved = config
+                .endpoint_override
+                .clone()
+                .expect("region or base_url was given");
+            config.region = resolved.region;
+            // A URL matching no known region is recorded as `base_url`, like
+            // `detect`'s "other" answer; one that does names its region, so the
+            // runtime URL (possibly a test mock, not the region's real host) is
+            // dropped rather than baked into the config.
+            config.base_url = resolved.region.is_none().then_some(resolved.api_root);
+        } else {
+            // A re-run keeps the stored region unless the flag says otherwise:
+            // an exported variable must not silently rewrite an existing config.
+            config.region = region_flag.or(existing.as_ref().and_then(|c| c.region));
+            note_unstored_region(region, region_flag, config.region);
+            config.override_endpoint(region, base_url);
+        }
         authenticate(&config.api_key, config.api_root(None)).await?
     } else {
         let found = detect(&config.api_key, &io.probes, &mut io.input, io.interactive).await?;
