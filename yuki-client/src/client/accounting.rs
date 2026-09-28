@@ -4,7 +4,7 @@ use quick_xml::events::Event;
 use crate::error::YukiError;
 
 use super::soap_client::{SoapClient, SoapEnvelope};
-use super::{Region, local_name, service_url, unescape_text};
+use super::{ElementText, Region, local_name, service_url};
 
 const SERVICE: &str = "Accounting.asmx";
 
@@ -304,7 +304,6 @@ impl AccountingClient {
             return Err(err);
         }
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut balances = Vec::new();
         let mut in_account = false;
@@ -315,6 +314,7 @@ impl AccountingClient {
             balance_type: String::new(),
             amount: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -348,23 +348,24 @@ impl AccountingClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if let Some(ref f) = field {
-                        let text = unescape_text(e)
-                            .map_err(|e| YukiError::Xml(e.to_string()))?
-                            .trim()
-                            .to_string();
-                        match f.as_str() {
-                            "Description" => current.description = text,
-                            "Amount" => current.amount = text,
-                            _ => {}
-                        }
-                    }
+                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                    if field.is_some() =>
+                {
+                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
-                        "Description" | "Amount" => field = None,
+                        "Description" | "Amount" => {
+                            let text = content.take();
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "Description" => current.description = text,
+                                    "Amount" => current.amount = text,
+                                    _ => {}
+                                }
+                            }
+                        }
                         "GLAccount" if in_account => {
                             balances.push(current.clone());
                             in_account = false;
@@ -388,7 +389,6 @@ impl AccountingClient {
     /// `Date`, `Description`, `Amount`, and `GLAccountCode`.
     pub fn parse_gl_transactions(xml: &str) -> Result<Vec<GlTransaction>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut transactions = Vec::new();
         let mut in_transaction = false;
@@ -400,6 +400,7 @@ impl AccountingClient {
             gl_account: String::new(),
             amount: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -428,26 +429,25 @@ impl AccountingClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if let Some(ref f) = field {
-                        let text = unescape_text(e)
-                            .map_err(|e| YukiError::Xml(e.to_string()))?
-                            .trim()
-                            .to_string();
-                        match f.as_str() {
-                            "Date" => current.date = text,
-                            "Description" => current.description = text,
-                            "Amount" => current.amount = text,
-                            "GLAccountCode" => current.gl_account = text,
-                            _ => {}
-                        }
-                    }
+                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                    if field.is_some() =>
+                {
+                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "Date" | "Description" | "Amount" | "GLAccountCode" => {
-                            field = None;
+                            let text = content.take();
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "Date" => current.date = text,
+                                    "Description" => current.description = text,
+                                    "Amount" => current.amount = text,
+                                    "GLAccountCode" => current.gl_account = text,
+                                    _ => {}
+                                }
+                            }
                         }
                         "GLAccountTransaction" if in_transaction => {
                             transactions.push(current.clone());
@@ -473,7 +473,6 @@ impl AccountingClient {
         xml: &str,
     ) -> Result<Vec<GlTransactionWithContact>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut transactions = Vec::new();
         let mut in_transaction = false;
@@ -486,6 +485,7 @@ impl AccountingClient {
             amount: String::new(),
             contact_name: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -518,28 +518,27 @@ impl AccountingClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if let Some(ref f) = field {
-                        let text = unescape_text(e)
-                            .map_err(|e| YukiError::Xml(e.to_string()))?
-                            .trim()
-                            .to_string();
-                        match f.as_str() {
-                            "Date" => current.date = text,
-                            "Description" => current.description = text,
-                            "Amount" => current.amount = text,
-                            "GLAccountCode" => current.gl_account = text,
-                            "Contact" | "ContactName" => current.contact_name = text,
-                            _ => {}
-                        }
-                    }
+                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                    if field.is_some() =>
+                {
+                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "Date" | "Description" | "Amount" | "GLAccountCode" | "Contact"
                         | "ContactName" => {
-                            field = None;
+                            let text = content.take();
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "Date" => current.date = text,
+                                    "Description" => current.description = text,
+                                    "Amount" => current.amount = text,
+                                    "GLAccountCode" => current.gl_account = text,
+                                    "Contact" | "ContactName" => current.contact_name = text,
+                                    _ => {}
+                                }
+                            }
                         }
                         "GLAccountTransaction" if in_transaction => {
                             transactions.push(current.clone());
@@ -565,7 +564,6 @@ impl AccountingClient {
     /// `<Administration ID="uuid"><Name>Company</Name>...</Administration>`
     pub fn parse_administrations(xml: &str) -> Result<Vec<Administration>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut administrations = Vec::new();
         let mut current_id = String::new();
@@ -574,6 +572,7 @@ impl AccountingClient {
         let mut in_administration = false;
         let mut in_name = false;
         let mut in_domain_id = false;
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -598,22 +597,22 @@ impl AccountingClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    let text = unescape_text(e)
-                        .map_err(|e| YukiError::Xml(e.to_string()))?
-                        .trim()
-                        .to_string();
-                    if in_name {
-                        current_name = text;
-                    } else if in_domain_id {
-                        current_domain_id = text;
-                    }
+                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                    if in_name || in_domain_id =>
+                {
+                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
-                        "Name" => in_name = false,
-                        "DomainID" => in_domain_id = false,
+                        "Name" if in_name => {
+                            in_name = false;
+                            current_name = content.take();
+                        }
+                        "DomainID" if in_domain_id => {
+                            in_domain_id = false;
+                            current_domain_id = content.take();
+                        }
                         "Administration" => {
                             if !current_id.is_empty() {
                                 administrations.push(Administration {
@@ -646,7 +645,6 @@ impl AccountingClient {
         result_tag: &str,
     ) -> Result<Vec<OutstandingItem>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut items = Vec::new();
         let mut in_result = false;
@@ -659,6 +657,7 @@ impl AccountingClient {
             amount: String::new(),
             open_amount: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -686,28 +685,27 @@ impl AccountingClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if let Some(ref f) = field {
-                        let text = unescape_text(e)
-                            .map_err(|e| YukiError::Xml(e.to_string()))?
-                            .trim()
-                            .to_string();
-                        match f.as_str() {
-                            "Contact" | "ContactName" => current.contact_name = text,
-                            "Description" => current.description = text,
-                            "Date" => current.date = text,
-                            "Amount" | "OriginalAmount" => current.amount = text,
-                            "OpenAmount" => current.open_amount = text,
-                            _ => {}
-                        }
-                    }
+                Ok(ref event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)))
+                    if field.is_some() =>
+                {
+                    content.push(event)?;
                 }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "Contact" | "ContactName" | "Description" | "Date" | "Amount"
                         | "OriginalAmount" | "OpenAmount" => {
-                            field = None;
+                            let text = content.take();
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "Contact" | "ContactName" => current.contact_name = text,
+                                    "Description" => current.description = text,
+                                    "Date" => current.date = text,
+                                    "Amount" | "OriginalAmount" => current.amount = text,
+                                    "OpenAmount" => current.open_amount = text,
+                                    _ => {}
+                                }
+                            }
                         }
                         "Item" if in_item => {
                             items.push(current.clone());
