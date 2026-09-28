@@ -71,6 +71,16 @@ impl ArchiveClient {
         self.soap.base_url()
     }
 
+    /// Reuse a session opened by another service client instead of calling
+    /// [`authenticate`](Self::authenticate) again. A Yuki session is not tied
+    /// to the service it was opened on: one from `Accounting.asmx` is accepted
+    /// by `Archive.asmx` (verified on Yuki Belgium).
+    #[must_use]
+    pub fn with_session(mut self, session_id: &str) -> Self {
+        self.soap = self.soap.with_session(session_id);
+        self
+    }
+
     fn require_session(&self) -> Result<&str, YukiError> {
         self.soap.session_id().ok_or_else(|| {
             YukiError::AuthFailed("not authenticated — call authenticate() first".to_string())

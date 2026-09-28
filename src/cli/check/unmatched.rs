@@ -684,6 +684,13 @@ pub async fn unmatched(
         eprintln!("Fetching booked invoices from archive...");
     }
     let admin_id = target.admin_id;
+    // The Accounting session works on the archive too, saving an Authenticate.
+    let session = accounting
+        .session_id()
+        .ok_or_else(|| YukiError::AuthFailed("no session after authenticating".into()))?;
+    let archive = ArchiveClient::new()
+        .with_api_root(target.api_root)
+        .with_session(session);
     // The requests are independent, so they run concurrently; results keep
     // their order, so the output does not depend on timing.
     let (bank_entries, creditor_entries, transfer_entries, creditor_items, archive_docs) = tokio::try_join!(
@@ -703,18 +710,14 @@ pub async fn unmatched(
             &end
         ),
         accounting.outstanding_creditor_items(admin_id),
-        async {
-            let mut archive = ArchiveClient::new().with_api_root(target.api_root);
-            archive.authenticate(target.api_key).await?;
-            archive.search_documents("", &start, &end).await
-        },
+        archive.search_documents("", &start, &end),
     )?;
 
     if !quiet {
         // Authenticate + SetCurrentDomain, one call per GL account, the open
-        // items, and Authenticate + SearchDocuments on the archive.
+        // items, and SearchDocuments on the archive.
         let gl_calls = bank_entries.len() + creditor_entries.len() + transfer_entries.len();
-        eprintln!("API calls made: {}", 2 + gl_calls + 1 + 2);
+        eprintln!("API calls made: {}", 2 + gl_calls + 1 + 1);
     }
 
     let banks: Vec<(String, Vec<GlTransactionWithContact>)> = setup

@@ -133,6 +133,11 @@ impl AccountingClient {
         self.soap.base_url()
     }
 
+    /// The session ID from [`authenticate`](Self::authenticate), if any.
+    pub fn session_id(&self) -> Option<&str> {
+        self.soap.session_id()
+    }
+
     fn require_session(&self) -> Result<&str, YukiError> {
         self.soap.session_id().ok_or_else(|| {
             YukiError::AuthFailed("not authenticated — call authenticate() first".to_string())
