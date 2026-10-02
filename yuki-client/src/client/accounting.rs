@@ -29,6 +29,27 @@ pub struct OutstandingItem {
     /// The payment method booked on the item (e.g. `Creditcard`); empty when
     /// not set.
     pub payment_method: String,
+    /// The item's `ID` attribute; empty when the response has none.
+    pub id: String,
+    /// The `Type` text, e.g. `Aankoopfactuur` or `Creditcardbetaling`.
+    pub type_name: String,
+    /// The `Type` element's `ID` attribute: `2` for a purchase invoice or
+    /// credit note, empty for a bank or card transaction.
+    pub type_id: String,
+    /// The invoice reference (`Reference`); empty for a payment.
+    pub reference: String,
+    /// The archive document the item was booked from (`DocumentID`): the
+    /// invoice, or the bank statement for a payment.
+    pub document_id: String,
+}
+
+impl OutstandingItem {
+    /// Whether the item is a bank or card transaction rather than an invoice
+    /// or credit note: Yuki sends such an item a `Type` without an `ID`. Only
+    /// [`AccountingClient::outstanding_creditor_items_with_payments`] returns them.
+    pub fn is_payment(&self) -> bool {
+        self.type_id.is_empty()
+    }
 }
 
 /// A general ledger transaction.
@@ -283,6 +304,45 @@ impl AccountingClient {
             .call("OutstandingCreditorItemsByDate", envelope)
             .await?;
         Self::parse_outstanding_items(&body, "OutstandingCreditorItemsByDateResult")
+    }
+
+    /// Retrieve the creditor items open on `date_outstanding` (`YYYY-MM-DD`),
+    /// unsettled bank and card payments included.
+    ///
+    /// `OutstandingCreditorItems` lists invoices and credit notes only. This
+    /// `OutstandingCreditorItemsByDateOutstanding` call with
+    /// `includeBankTransactions` also returns every payment booked to a
+    /// supplier that no invoice settles yet ([`OutstandingItem::is_payment`]):
+    /// what Yuki's "Betalingen waarvan factuur nog ontbreekt" lists.
+    pub async fn outstanding_creditor_items_with_payments(
+        &self,
+        administration_id: &str,
+        date_outstanding: &str,
+    ) -> Result<Vec<OutstandingItem>, YukiError> {
+        let session = self.require_session()?;
+        let envelope =
+            Self::outstanding_with_payments_envelope(session, administration_id, date_outstanding);
+        let body = self
+            .soap
+            .call("OutstandingCreditorItemsByDateOutstanding", envelope)
+            .await?;
+        Self::parse_outstanding_items(&body, "OutstandingCreditorItemsByDateOutstandingResult")
+    }
+
+    /// Build the `OutstandingCreditorItemsByDateOutstanding` request envelope:
+    /// bank transactions included, sorted by contact.
+    pub fn outstanding_with_payments_envelope(
+        session_id: &str,
+        administration_id: &str,
+        date_outstanding: &str,
+    ) -> String {
+        SoapEnvelope::new("OutstandingCreditorItemsByDateOutstanding")
+            .session(session_id)
+            .param("administrationID", administration_id)
+            .param("includeBankTransactions", "true")
+            .param("sortOrder", "ContactAsc")
+            .param("dateOutstanding", date_outstanding)
+            .build()
     }
 
     /// Retrieve transactions for a GL account with contact info over a date range.
@@ -680,9 +740,23 @@ impl AccountingClient {
                         "Item" if in_result => {
                             in_item = true;
                             current = OutstandingItem::default();
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() == "ID" {
+                                    current.id = attr.value.into_owned();
+                                }
+                            }
+                        }
+                        "Type" if in_item => {
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() == "ID" {
+                                    current.type_id = attr.value.into_owned();
+                                }
+                            }
+                            field = Some(local);
                         }
                         "Contact" | "ContactName" | "Description" | "Date" | "Amount"
                         | "OriginalAmount" | "OpenAmount" | "Country" | "PaymentMethod"
+                        | "Reference" | "DocumentID"
                             if in_item =>
                         {
                             field = Some(local);
@@ -694,10 +768,14 @@ impl AccountingClient {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
                         "Contact" | "ContactName" | "Description" | "Date" | "Amount"
-                        | "OriginalAmount" | "OpenAmount" | "Country" | "PaymentMethod" => {
+                        | "OriginalAmount" | "OpenAmount" | "Country" | "PaymentMethod"
+                        | "Reference" | "DocumentID" | "Type" => {
                             let text = content.take();
                             if let Some(f) = field.take() {
                                 match f.as_str() {
+                                    "Type" => current.type_name = text,
+                                    "Reference" => current.reference = text,
+                                    "DocumentID" => current.document_id = text,
                                     "Contact" | "ContactName" => current.contact_name = text,
                                     "Description" => current.description = text,
                                     "Date" => current.date = text,

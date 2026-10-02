@@ -524,6 +524,59 @@ fn parses_the_supplier_country_of_outstanding_items() {
 }
 
 #[test]
+fn parses_unsettled_payments_among_outstanding_creditor_items() {
+    // Real shape of OutstandingCreditorItemsByDateOutstanding with
+    // includeBankTransactions: a card payment's Type has an empty ID.
+    let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <OutstandingCreditorItemsByDateOutstandingResponse xmlns="http://www.theyukicompany.com/">
+      <OutstandingCreditorItemsByDateOutstandingResult>
+        <OutstandingCreditorItems xmlns="">
+          <Item ID="pay-1"><Date>2026-08-07</Date><Description>VERCEL INC. COVINA C</Description>
+            <Contact>Vercel Inc</Contact><ContactID>c-1</ContactID><OpenAmount>-17.65</OpenAmount>
+            <OriginalAmount>-17.65</OriginalAmount><Type ID="">Creditcardbetaling</Type>
+            <Reference /><DueDate /><DocumentID>stmt-1</DocumentID><PaymentMethod /></Item>
+          <Item ID="inv-1"><Date>2026-09-07</Date><Description>Factuur van Vercel Inc</Description>
+            <Contact>Vercel Inc</Contact><OpenAmount>17.22</OpenAmount>
+            <OriginalAmount>17.22</OriginalAmount><Type ID="2">Aankoopfactuur</Type>
+            <Reference>2E81616A-0008</Reference><DocumentID>doc-1</DocumentID>
+            <PaymentMethod>Bancontact</PaymentMethod></Item>
+        </OutstandingCreditorItems>
+      </OutstandingCreditorItemsByDateOutstandingResult>
+    </OutstandingCreditorItemsByDateOutstandingResponse>
+  </soap:Body>
+</soap:Envelope>"#;
+    let items = AccountingClient::parse_outstanding_items(
+        xml,
+        "OutstandingCreditorItemsByDateOutstandingResult",
+    )
+    .unwrap();
+    assert_eq!(items.len(), 2);
+    let (pay, inv) = (&items[0], &items[1]);
+    assert_eq!(pay.id, "pay-1");
+    assert!(pay.is_payment());
+    assert_eq!(pay.type_name, "Creditcardbetaling");
+    assert_eq!(pay.open_amount, "-17.65");
+    assert_eq!(pay.reference, "");
+    assert_eq!(pay.document_id, "stmt-1");
+    assert!(!inv.is_payment());
+    assert_eq!(inv.type_id, "2");
+    assert_eq!(inv.reference, "2E81616A-0008");
+    assert_eq!(inv.document_id, "doc-1");
+    assert_eq!(inv.payment_method, "Bancontact");
+}
+
+#[test]
+fn outstanding_with_payments_envelope_includes_bank_transactions() {
+    let xml = AccountingClient::outstanding_with_payments_envelope("sid", "admin-1", "2026-10-02");
+    assert!(xml.contains("<yuki:includeBankTransactions>true</yuki:includeBankTransactions>"));
+    assert!(xml.contains("<yuki:sortOrder>ContactAsc</yuki:sortOrder>"));
+    assert!(xml.contains("<yuki:dateOutstanding>2026-10-02</yuki:dateOutstanding>"));
+    assert!(xml.contains("<yuki:administrationID>admin-1</yuki:administrationID>"));
+}
+
+#[test]
 fn parses_gl_account_balances() {
     // Real GLAccountBalance shape: the operation returns every account, each a
     // <GLAccount> with Code/BalanceType attributes and Description/Amount children.
