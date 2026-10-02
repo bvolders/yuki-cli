@@ -3,18 +3,20 @@
 //!
 //! The sales archive shows a number only once Yuki has filed the invoice's
 //! PDF, which can lag. The ledger closes that gap. `prepare --out` records a
-//! number as `reserved`, with the hash of the prepared invoice it was given
-//! to; `create --prepared` turns that reservation, and only for that exact
-//! content, into `pending` ([`InvoiceLedger::send_reserved`]) just before
-//! `ProcessSalesInvoices` is called. Then
-//! [`commit`](InvoiceLedger::commit) or [`reject`](InvoiceLedger::reject)
-//! settles it by Yuki's answer. A pending number whose outcome is unknown
-//! stays taken until `sales invoice numbers --resolve` settles it; a
-//! reservation stays until it is sent or released. Only a rejected number
+//! number as `reserved` ([`InvoiceLedger::reserve`]), with the hash of the
+//! prepared invoice it was given to; `create --prepared` turns that
+//! reservation, and only for that exact content, into `pending`
+//! ([`InvoiceLedger::send_reserved`]) just before `ProcessSalesInvoices` is
+//! called. Yuki's answer then settles it: `booked`, `rejected` (free again),
+//! back to `reserved` when nothing reached Yuki, or still `pending` when the
+//! outcome is unknown, until `sales invoice numbers --resolve` settles it.
+//! A reservation stays until it is sent or released. Only a rejected number
 //! may be given out again.
 //!
-//! Numbers belong to an administration (its `admin_id`): each administration
-//! numbers its invoices on its own. Numbers compare as [`same_number`]: `2026-01` is `2026-1`.
+//! Numbers belong to an administration (its `admin_id`), and an
+//! [`InvoiceLedger`] is opened for one: each administration numbers its
+//! invoices on its own. Numbers compare as [`same_number`]: `2026-01` is
+//! `2026-1`.
 //!
 //! The file is a [`Ledger`]: written atomically, and locked by an OS lock on
 //! `.invoice-numbers.json.lock` only for each short read-and-write, never
@@ -96,25 +98,41 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// Whether the entry counts for administration `admin`.
-    fn of(&self, admin: &str) -> bool {
-        self.admin == admin
+    /// Whether the entry still holds its number: anything not rejected.
+    fn holds(&self) -> bool {
+        self.status != Status::Rejected
     }
+}
+
+/// The refusal for a number an entry still holds, saying what to do: shared
+/// by reserving and by `--number` (see `invoice_number::choose`).
+pub fn given_out(entry: &Entry) -> InvoiceError {
+    let status = match entry.status {
+        Status::Pending => {
+            "pending (outcome unknown: check Yuki, then `yuki sales invoice numbers --resolve`)"
+        }
+        Status::Reserved => {
+            "reserved by `prepare --out` (free it with `yuki sales invoice numbers --resolve <number> --as rejected`)"
+        }
+        other => other.label(),
+    };
+    InvoiceError::InvalidInput(format!(
+        "invoice number {} was already given out: {status}",
+        entry.number
+    ))
 }
 
 /// How long a reservation may wait before `prepare`, `create` and `numbers`
 /// warn about it.
 pub const STALE_DAYS: i64 = 7;
 
-/// A number about to be given out, and what it is for.
-#[derive(Debug, Clone, Copy)]
-pub struct Claim<'a> {
-    /// The administration's `admin_id`.
-    pub admin: &'a str,
-    pub number: &'a str,
-    pub date: &'a str,
-    pub customer: &'a str,
-    pub gross: &'a str,
+/// A number about to be given out, and the invoice it is for.
+#[derive(Debug, Clone)]
+pub struct Claim {
+    pub number: String,
+    pub date: String,
+    pub customer: String,
+    pub gross: String,
 }
 
 /// The ledger's entries, in memory.
@@ -134,11 +152,63 @@ impl LedgerFormat for Numbers {
         " (its numbers would be given out again until the sales archive shows them)";
 }
 
-impl Numbers {
-    /// Reservations of `admin` older than [`STALE_DAYS`] on `today` (epoch
-    /// days), as warning lines.
-    pub fn warnings(&self, admin: &str, today: i64) -> Vec<String> {
-        self.entries_of(admin)
+/// The ledger file, seen by one administration: locked for a short
+/// read-and-write ([`open`](Self::open)), or only read ([`peek`](Self::peek)).
+pub struct InvoiceLedger {
+    file: Ledger<Numbers>,
+    admin: String,
+}
+
+impl InvoiceLedger {
+    /// Lock and load the ledger, for administration `admin` (its
+    /// `admin_id`), waiting while another run holds the lock.
+    pub fn open(admin: &str) -> Result<Self, YukiError> {
+        Self::open_at(&ledger_path(), admin)
+    }
+
+    /// [`open`](Self::open) the ledger at `path`; a missing file is empty.
+    pub fn open_at(path: &Path, admin: &str) -> Result<Self, YukiError> {
+        Ok(Self {
+            file: Ledger::open_wait(path)?,
+            admin: admin.to_string(),
+        })
+    }
+
+    /// Load the ledger for `admin` without the lock, to read only.
+    pub fn peek(admin: &str) -> Result<Self, YukiError> {
+        Ok(Self {
+            file: Ledger::peek(&ledger_path())?,
+            admin: admin.to_string(),
+        })
+    }
+
+    /// This administration's entries, oldest first.
+    pub fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.file
+            .state()
+            .entries
+            .iter()
+            .filter(move |e| e.admin == self.admin)
+    }
+
+    /// The entry still holding `number`, if any.
+    pub fn holder(&self, number: &str) -> Option<&Entry> {
+        self.entries()
+            .filter(|e| e.holds() && same_number(&e.number, number))
+            .last()
+    }
+
+    /// The numbers still held: every entry not rejected.
+    pub fn taken_numbers(&self) -> impl Iterator<Item = &str> {
+        self.entries()
+            .filter(|e| e.holds())
+            .map(|e| e.number.as_str())
+    }
+
+    /// Reservations older than [`STALE_DAYS`] on `today` (epoch days), as
+    /// warning lines.
+    pub fn warnings(&self, today: i64) -> Vec<String> {
+        self.entries()
             .filter(|e| e.status == Status::Reserved)
             .filter(|e| epoch_days(&e.recorded_at).is_some_and(|d| today - d > STALE_DAYS))
             .map(|e| {
@@ -152,85 +222,32 @@ impl Numbers {
             .collect()
     }
 
-    /// The entry of `admin` still holding `number` (not rejected), if any.
-    pub fn holder(&self, admin: &str, number: &str) -> Option<&Entry> {
-        self.entries
-            .iter()
-            .rev()
-            .find(|e| e.of(admin) && e.status != Status::Rejected && same_number(&e.number, number))
-    }
-
-    /// The numbers `admin` still holds: every entry not rejected.
-    pub fn taken_numbers<'a>(&'a self, admin: &'a str) -> impl Iterator<Item = &'a str> {
-        self.entries
-            .iter()
-            .filter(move |e| e.of(admin) && e.status != Status::Rejected)
-            .map(|e| e.number.as_str())
-    }
-
-    /// The entries of `admin`, oldest first.
-    pub fn entries_of<'a>(&'a self, admin: &'a str) -> impl Iterator<Item = &'a Entry> {
-        self.entries.iter().filter(move |e| e.of(admin))
-    }
-
-    /// Record the claim as reserved for the prepared invoice whose content
-    /// hash is `hash`; refused while an entry holds the number.
-    pub fn reserve_prepared(&mut self, claim: &Claim<'_>, hash: &str) -> Result<(), InvoiceError> {
-        self.claim(claim, Status::Reserved, Some(hash))
-    }
-
-    fn claim(
-        &mut self,
-        claim: &Claim<'_>,
-        status: Status,
-        hash: Option<&str>,
-    ) -> Result<(), InvoiceError> {
-        if let Some(held) = self.holder(claim.admin, claim.number) {
-            return Err(InvoiceError::InvalidInput(format!(
-                "invoice number {} was already given out: {}",
-                claim.number,
-                held.status.label()
-            )));
+    /// Print [`warnings`](Self::warnings) for today to stderr.
+    pub fn warn(&self) {
+        let today = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
+            .div_euclid(86_400);
+        for warning in self.warnings(today) {
+            eprintln!("warning: {warning}");
         }
-        self.entries.push(Entry {
-            number: claim.number.to_string(),
-            admin: claim.admin.to_string(),
-            date: claim.date.to_string(),
-            customer: claim.customer.to_string(),
-            gross: claim.gross.to_string(),
-            status,
-            recorded_at: now_utc(),
-            booked_at: None,
-            hash: hash.map(str::to_string),
-            note: None,
-            extra: BTreeMap::new(),
-        });
-        Ok(())
     }
 
-    /// The latest entry of `admin` for `number` in one of `states`.
-    fn latest(&mut self, admin: &str, number: &str, states: &[Status]) -> Option<&mut Entry> {
-        self.entries
-            .iter_mut()
-            .rev()
-            .find(|e| e.of(admin) && states.contains(&e.status) && same_number(&e.number, number))
-    }
-
-    /// The reservation of `admin` for `number`, checked against the content
-    /// hash of the prepared invoice about to be sent.
-    pub fn check_reserved(
-        &self,
-        admin: &str,
-        number: &str,
-        hash: &str,
-    ) -> Result<(), InvoiceError> {
-        let held = self.holder(admin, number).ok_or_else(|| {
-            InvoiceError::InvalidInput(format!(
-                "invoice number {number} is not reserved in this administration: prepare it again with `sales invoice prepare --out`"
-            ))
-        })?;
+    /// The position of the reservation of `number`, checked against the
+    /// content hash of the prepared invoice about to be sent.
+    fn find_reserved(&self, number: &str, hash: &str) -> Result<usize, InvoiceError> {
+        let entries = &self.file.state().entries;
+        let at = entries
+            .iter()
+            .rposition(|e| e.admin == self.admin && e.holds() && same_number(&e.number, number))
+            .ok_or_else(|| {
+                InvoiceError::InvalidInput(format!(
+                    "invoice number {number} is not reserved in this administration: prepare it again with `sales invoice prepare --out`"
+                ))
+            })?;
+        let held = &entries[at];
         match held.status {
-            Status::Reserved if held.hash.as_deref() == Some(hash) => Ok(()),
+            Status::Reserved if held.hash.as_deref() == Some(hash) => Ok(at),
             Status::Reserved => Err(InvoiceError::InvalidInput(format!(
                 "the prepared invoice {number} is not the one prepare reserved the number for: it changed since, so its PDF may not match; prepare it again"
             ))),
@@ -241,143 +258,108 @@ impl Numbers {
         }
     }
 
-    /// Move the latest entry of `admin` for `number` from `from` to `to`;
+    /// Whether `number` is reserved for the prepared invoice with content
+    /// hash `hash`.
+    pub fn check_reserved(&self, number: &str, hash: &str) -> Result<(), InvoiceError> {
+        self.find_reserved(number, hash).map(|_| ())
+    }
+
+    /// Reserve the claimed number for the prepared invoice with content
+    /// hash `hash` (`prepare --out`); refused while an entry holds it.
+    pub fn reserve(&mut self, claim: &Claim, hash: &str) -> Result<(), InvoiceError> {
+        if let Some(held) = self.holder(&claim.number) {
+            return Err(given_out(held));
+        }
+        self.file.state_mut().entries.push(Entry {
+            number: claim.number.clone(),
+            admin: self.admin.clone(),
+            date: claim.date.clone(),
+            customer: claim.customer.clone(),
+            gross: claim.gross.clone(),
+            status: Status::Reserved,
+            recorded_at: now_utc(),
+            booked_at: None,
+            hash: Some(hash.to_string()),
+            note: None,
+            extra: BTreeMap::new(),
+        });
+        Ok(self.file.save()?)
+    }
+
+    /// Write-ahead for a prepared invoice: the reservation
+    /// [`check_reserved`](Self::check_reserved) finds becomes pending before
+    /// the invoice is sent.
+    pub fn send_reserved(&mut self, number: &str, hash: &str) -> Result<(), InvoiceError> {
+        let at = self.find_reserved(number, hash)?;
+        self.file.state_mut().entries[at].status = Status::Pending;
+        Ok(self.file.save()?)
+    }
+
+    /// Move the latest entry for `number` from `from` to `to` and save;
     /// refused when there is none in `from`.
-    pub(crate) fn transition(
-        &mut self,
-        admin: &str,
-        number: &str,
-        from: Status,
-        to: Status,
-    ) -> Result<(), InvoiceError> {
-        let entry = self.latest(admin, number, &[from]).ok_or_else(|| {
-            YukiError::NotFound(format!("no {} invoice number {number}", from.label()))
-        })?;
+    fn transition(&mut self, number: &str, from: Status, to: Status) -> Result<(), InvoiceError> {
+        let admin = &self.admin;
+        let entry = self
+            .file
+            .state_mut()
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| e.admin == *admin && e.status == from && same_number(&e.number, number))
+            .ok_or_else(|| {
+                YukiError::NotFound(format!("no {} invoice number {number}", from.label()))
+            })?;
         entry.status = to;
         if to == Status::Booked {
             entry.booked_at = Some(now_utc());
         }
-        Ok(())
-    }
-}
-
-/// The ledger file, locked while open so two runs cannot reserve at once.
-pub struct InvoiceLedger(Ledger<Numbers>);
-
-impl InvoiceLedger {
-    /// Lock and load the ledger at its default path.
-    pub fn open() -> Result<Self, YukiError> {
-        Self::open_at(&ledger_path())
+        Ok(self.file.save()?)
     }
 
-    /// Lock and load the ledger at `path`, waiting while another run holds
-    /// the lock; a missing file is an empty ledger.
-    pub fn open_at(path: &Path) -> Result<Self, YukiError> {
-        Ledger::open_wait(path).map(Self)
-    }
-
-    /// The numbers in the ledger at its default path, read without the lock.
-    pub fn peek() -> Result<Numbers, YukiError> {
-        Ok(Ledger::<Numbers>::peek(&ledger_path())?.state().clone())
-    }
-
-    pub fn list(&self) -> &Numbers {
-        self.0.state()
-    }
-
-    /// Reserve the claimed number for the prepared invoice with content
-    /// hash `hash` (`prepare --out`).
-    pub fn reserve_prepared(&mut self, claim: &Claim<'_>, hash: &str) -> Result<(), InvoiceError> {
-        self.0.state_mut().reserve_prepared(claim, hash)?;
-        Ok(self.0.save()?)
-    }
-
-    /// Write-ahead for a prepared invoice: its reservation, checked against
-    /// `hash`, becomes pending before it is sent.
-    pub fn send_reserved(
-        &mut self,
-        admin: &str,
-        number: &str,
-        hash: &str,
-    ) -> Result<(), InvoiceError> {
-        let numbers = self.0.state_mut();
-        numbers.check_reserved(admin, number, hash)?;
-        if let Some(entry) = numbers.latest(admin, number, &[Status::Reserved]) {
-            entry.status = Status::Pending;
-        }
-        Ok(self.0.save()?)
-    }
-
-    /// Undo [`send_reserved`](Self::send_reserved) when nothing reached Yuki:
-    /// the number is reserved again for the same content, to retry.
-    pub fn unsend(&mut self, admin: &str, number: &str) -> Result<(), InvoiceError> {
-        self.0
-            .state_mut()
-            .transition(admin, number, Status::Pending, Status::Reserved)?;
-        Ok(self.0.save()?)
+    /// Nothing reached Yuki: the number is reserved again for the same
+    /// content, to retry.
+    pub fn unsend(&mut self, number: &str) -> Result<(), InvoiceError> {
+        self.transition(number, Status::Pending, Status::Reserved)
     }
 
     /// Release a reservation that will not be sent: the number is free again.
-    pub fn release(&mut self, admin: &str, number: &str) -> Result<(), InvoiceError> {
-        self.0
-            .state_mut()
-            .transition(admin, number, Status::Reserved, Status::Rejected)?;
-        Ok(self.0.save()?)
+    pub fn release(&mut self, number: &str) -> Result<(), InvoiceError> {
+        self.transition(number, Status::Reserved, Status::Rejected)
     }
 
     /// Yuki booked `number`.
-    pub fn commit(&mut self, admin: &str, number: &str) -> Result<(), InvoiceError> {
-        self.0
-            .state_mut()
-            .transition(admin, number, Status::Pending, Status::Booked)?;
-        Ok(self.0.save()?)
+    pub fn commit(&mut self, number: &str) -> Result<(), InvoiceError> {
+        self.transition(number, Status::Pending, Status::Booked)
     }
 
     /// Yuki did not create `number`: free it again.
-    pub fn reject(&mut self, admin: &str, number: &str) -> Result<(), InvoiceError> {
-        self.0
-            .state_mut()
-            .transition(admin, number, Status::Pending, Status::Rejected)?;
-        Ok(self.0.save()?)
+    pub fn reject(&mut self, number: &str) -> Result<(), InvoiceError> {
+        self.transition(number, Status::Pending, Status::Rejected)
     }
 
     /// Settle `number` by hand, after checking Yuki: a pending number as
     /// booked or rejected; a reservation, never sent, only as rejected.
-    pub fn resolve(
-        &mut self,
-        admin: &str,
-        number: &str,
-        resolution: Resolution,
-    ) -> Result<(), InvoiceError> {
-        let reserved =
-            self.list().holder(admin, number).map(|e| e.status) == Some(Status::Reserved);
+    pub fn resolve(&mut self, number: &str, resolution: Resolution) -> Result<(), InvoiceError> {
+        let reserved = self.holder(number).map(|e| e.status) == Some(Status::Reserved);
         match (resolution, reserved) {
-            (Resolution::Rejected, true) => self.release(admin, number),
-            (Resolution::Rejected, false) => self.reject(admin, number),
+            (Resolution::Rejected, true) => self.release(number),
+            (Resolution::Rejected, false) => self.reject(number),
             (Resolution::Booked, true) => Err(InvoiceError::InvalidInput(format!(
                 "invoice number {number} is reserved, never sent: it can only be released (--as rejected)"
             ))),
-            (Resolution::Booked, false) => self.commit(admin, number),
+            (Resolution::Booked, false) => self.commit(number),
         }
     }
 
-    /// Note on the latest pending entry of `admin` for `number`.
-    pub fn note(&mut self, admin: &str, number: &str, note: &str) -> Result<(), InvoiceError> {
-        if let Some(entry) = self.0.state_mut().latest(admin, number, &[Status::Pending]) {
+    /// Note on the latest pending entry for `number`.
+    pub fn note(&mut self, number: &str, note: &str) -> Result<(), InvoiceError> {
+        let admin = &self.admin;
+        if let Some(entry) = self.file.state_mut().entries.iter_mut().rev().find(|e| {
+            e.admin == *admin && e.status == Status::Pending && same_number(&e.number, number)
+        }) {
             entry.note = Some(note.to_string());
         }
-        Ok(self.0.save()?)
-    }
-}
-
-/// Print [`Numbers::warnings`] for `admin` to stderr.
-pub fn warn(numbers: &Numbers, admin: &str) {
-    let today = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-        .div_euclid(86_400);
-    for warning in numbers.warnings(admin, today) {
-        eprintln!("warning: {warning}");
+        Ok(self.file.save()?)
     }
 }
 
@@ -404,7 +386,7 @@ fn now_utc() -> String {
     )
 }
 
-/// `sales invoice numbers`: list the numbers of administration `admin`,
+/// `sales invoice numbers`: list the selected administration's numbers,
 /// after settling one by hand when `resolve` is given.
 pub fn numbers(
     config: &Config,
@@ -413,22 +395,22 @@ pub fn numbers(
     format: Option<&str>,
 ) -> Result<(), InvoiceError> {
     let admin = config.target(admin)?.admin_id;
-    let numbers = match resolve {
+    let ledger = match resolve {
         Some((number, resolution)) => {
-            let mut ledger = InvoiceLedger::open()?;
-            ledger.resolve(admin, number, resolution)?;
-            ledger.list().clone()
+            let mut ledger = InvoiceLedger::open(admin)?;
+            ledger.resolve(number, resolution)?;
+            ledger
         }
-        None => InvoiceLedger::peek()?,
+        None => InvoiceLedger::peek(admin)?,
     };
-    warn(&numbers, admin);
+    ledger.warn();
     let headers: Vec<String> = [
         "Number", "Date", "Customer", "Gross", "Status", "Recorded", "Booked", "Note",
     ]
     .map(String::from)
     .to_vec();
-    let rows: Vec<Vec<String>> = numbers
-        .entries_of(admin)
+    let rows: Vec<Vec<String>> = ledger
+        .entries()
         .map(|e| {
             vec![
                 e.number.clone(),
@@ -453,161 +435,150 @@ pub fn numbers(
 mod tests {
     use super::*;
 
-    fn claim<'a>(admin: &'a str, number: &'a str) -> Claim<'a> {
+    fn claim(number: &str) -> Claim {
         Claim {
-            admin,
-            number,
-            date: "2026-10-31",
-            customer: "Example BV",
-            gross: "121.00",
+            number: number.into(),
+            date: "2026-10-31".into(),
+            customer: "Example BV".into(),
+            gross: "121.00".into(),
         }
     }
 
-    /// Reserve `number` for `admin` and send it: pending.
-    fn pend(ledger: &mut InvoiceLedger, admin: &str, number: &str) -> Result<(), InvoiceError> {
-        ledger.reserve_prepared(&claim(admin, number), "h")?;
-        ledger.send_reserved(admin, number, "h")
+    struct Dir(tempfile::TempDir);
+
+    impl Dir {
+        fn new() -> Self {
+            Self(tempfile::TempDir::new().unwrap())
+        }
+
+        fn open(&self, admin: &str) -> InvoiceLedger {
+            InvoiceLedger::open_at(&self.0.path().join("invoice-numbers.json"), admin).unwrap()
+        }
+    }
+
+    /// Reserve `number` and send it: pending.
+    fn pend(ledger: &mut InvoiceLedger, number: &str) -> Result<(), InvoiceError> {
+        ledger.reserve(&claim(number), "h")?;
+        ledger.send_reserved(number, "h")
     }
 
     #[test]
     fn a_number_stays_taken_until_rejected_and_survives_a_reopen() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("invoice-numbers.json");
-        pend(&mut InvoiceLedger::open_at(&path).unwrap(), "a1", "2026-20").unwrap();
-        let mut ledger = InvoiceLedger::open_at(&path).unwrap();
-        assert_eq!(
-            ledger.list().holder("a1", "2026-20").unwrap().status,
-            Status::Pending
-        );
-        let err = pend(&mut ledger, "a1", "2026-20").unwrap_err();
+        let dir = Dir::new();
+        pend(&mut dir.open("a1"), "2026-20").unwrap();
+        let mut ledger = dir.open("a1");
+        assert_eq!(ledger.holder("2026-20").unwrap().status, Status::Pending);
+        let err = pend(&mut ledger, "2026-20").unwrap_err();
         assert!(err.to_string().contains("already given out: pending"));
-        ledger.reject("a1", "2026-20").unwrap();
-        assert!(ledger.list().holder("a1", "2026-20").is_none());
+        ledger.reject("2026-20").unwrap();
+        assert!(ledger.holder("2026-20").is_none());
         // A rejected number can be given out again, and booked.
-        pend(&mut ledger, "a1", "2026-20").unwrap();
-        ledger.commit("a1", "2026-20").unwrap();
-        let booked = ledger.list().holder("a1", "2026-20").unwrap();
+        pend(&mut ledger, "2026-20").unwrap();
+        ledger.commit("2026-20").unwrap();
+        let booked = ledger.holder("2026-20").unwrap();
         assert_eq!(booked.status, Status::Booked);
         assert!(booked.booked_at.is_some());
         assert!(
-            ledger
-                .resolve("a1", "2026-20", Resolution::Rejected)
-                .is_err(),
+            ledger.resolve("2026-20", Resolution::Rejected).is_err(),
             "nothing pending"
         );
-        assert_eq!(
-            ledger.list().taken_numbers("a1").collect::<Vec<_>>(),
-            ["2026-20"]
-        );
-        drop(ledger);
-        // Only the ledger and its lock file are left, the lock released.
-        let mut names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            [".invoice-numbers.json.lock", "invoice-numbers.json"]
-        );
+        assert_eq!(ledger.taken_numbers().collect::<Vec<_>>(), ["2026-20"]);
     }
 
     #[test]
     fn numbers_belong_to_an_administration_and_compare_by_value() {
-        let mut numbers = Numbers::default();
-        numbers
-            .reserve_prepared(&claim("a1", "2026-01"), "h")
-            .unwrap();
+        let dir = Dir::new();
+        let mut a1 = dir.open("a1");
+        a1.reserve(&claim("2026-01"), "h").unwrap();
         // 2026-1 is 2026-01, in the same administration only.
-        let err = numbers
-            .reserve_prepared(&claim("a1", "2026-1"), "h")
-            .unwrap_err();
+        let err = a1.reserve(&claim("2026-1"), "h").unwrap_err();
         assert!(err.to_string().contains("already given out"), "{err}");
-        assert!(numbers.holder("a1", "2026-001").is_some());
-        numbers
-            .reserve_prepared(&claim("a2", "2026-1"), "h")
-            .unwrap();
-        assert_eq!(numbers.taken_numbers("a2").collect::<Vec<_>>(), ["2026-1"]);
-        assert!(numbers.holder("a3", "2026-1").is_none());
+        assert!(a1.holder("2026-001").is_some());
+        drop(a1);
+        let mut a2 = dir.open("a2");
+        a2.reserve(&claim("2026-1"), "h").unwrap();
+        assert_eq!(a2.taken_numbers().collect::<Vec<_>>(), ["2026-1"]);
+        drop(a2);
+        assert!(dir.open("a3").holder("2026-1").is_none());
     }
 
     #[test]
     fn a_second_opener_waits_for_the_lock() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("invoice-numbers.json");
-        let held = InvoiceLedger::open_at(&path).unwrap();
+        let dir = Dir::new();
+        let held = dir.open("a1");
         let start = std::time::Instant::now();
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(200));
             drop(held);
         });
-        InvoiceLedger::open_at(&path).unwrap();
+        dir.open("a1");
         assert!(start.elapsed() >= std::time::Duration::from_millis(150));
         release.join().unwrap();
     }
 
     #[test]
     fn a_reservation_is_sent_only_for_its_content_and_can_be_released() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("invoice-numbers.json");
-        let mut ledger = InvoiceLedger::open_at(&path).unwrap();
-        ledger
-            .reserve_prepared(&claim("a1", "2026-20"), "hash-a")
-            .unwrap();
+        let dir = Dir::new();
+        let mut ledger = dir.open("a1");
+        ledger.reserve(&claim("2026-20"), "hash-a").unwrap();
         // Reserved numbers are taken, like pending ones.
+        assert!(ledger.reserve(&claim("2026-20"), "x").is_err());
+        let err = ledger.send_reserved("2026-20", "hash-b").unwrap_err();
+        assert!(err.to_string().contains("changed since"), "{err}");
         assert!(
-            ledger
-                .reserve_prepared(&claim("a1", "2026-20"), "x")
+            dir.open_other("a2")
+                .send_reserved("2026-20", "hash-a")
                 .is_err()
         );
-        let err = ledger.send_reserved("a1", "2026-20", "hash-b").unwrap_err();
-        assert!(err.to_string().contains("changed since"), "{err}");
-        assert!(ledger.send_reserved("a2", "2026-20", "hash-a").is_err());
-        ledger.send_reserved("a1", "2026-20", "hash-a").unwrap();
-        assert_eq!(
-            ledger.list().holder("a1", "2026-20").unwrap().status,
-            Status::Pending
-        );
-        let err = ledger.send_reserved("a1", "2026-20", "hash-a").unwrap_err();
+        ledger.send_reserved("2026-20", "hash-a").unwrap();
+        assert_eq!(ledger.holder("2026-20").unwrap().status, Status::Pending);
+        let err = ledger.send_reserved("2026-20", "hash-a").unwrap_err();
         assert!(err.to_string().contains("pending already"), "{err}");
-        assert!(
-            ledger.release("a1", "2026-20").is_err(),
-            "pending, not reserved"
-        );
-        ledger.commit("a1", "2026-20").unwrap();
+        assert!(ledger.release("2026-20").is_err(), "pending, not reserved");
+        // Nothing reached Yuki: reserved again, for the same content.
+        ledger.unsend("2026-20").unwrap();
+        ledger.send_reserved("2026-20", "hash-a").unwrap();
+        ledger.commit("2026-20").unwrap();
 
-        // Released (or resolved as rejected), a reservation frees its number.
-        ledger
-            .reserve_prepared(&claim("a1", "2026-21"), "h")
-            .unwrap();
-        ledger
-            .reserve_prepared(&claim("a1", "2026-22"), "h")
-            .unwrap();
-        ledger
-            .resolve("a1", "2026-21", Resolution::Rejected)
-            .unwrap();
+        // Resolved as rejected, a reservation frees its number; it can
+        // never be booked.
+        ledger.reserve(&claim("2026-21"), "h").unwrap();
         assert!(
-            ledger.resolve("a1", "2026-22", Resolution::Booked).is_err(),
+            ledger.resolve("2026-21", Resolution::Booked).is_err(),
             "never sent"
         );
-        ledger
-            .resolve("a1", "2026-22", Resolution::Rejected)
-            .unwrap();
-        assert!(ledger.list().holder("a1", "2026-21").is_none());
-        assert!(ledger.list().holder("a1", "2026-22").is_none());
+        ledger.resolve("2026-21", Resolution::Rejected).unwrap();
+        assert!(ledger.holder("2026-21").is_none());
+    }
+
+    impl Dir {
+        /// A second administration's view, without waiting for the lock
+        /// the test holds.
+        fn open_other(&self, admin: &str) -> InvoiceLedger {
+            InvoiceLedger {
+                file: Ledger::peek(&self.0.path().join("invoice-numbers.json")).unwrap(),
+                admin: admin.into(),
+            }
+        }
     }
 
     #[test]
     fn old_reservations_are_warned_about() {
-        let mut numbers = Numbers::default();
-        numbers
-            .reserve_prepared(&claim("a1", "2026-20"), "h")
+        let dir = Dir::new();
+        let mut ledger = dir.open("a1");
+        ledger
+            .reserve(
+                &Claim {
+                    customer: "Buuurt".into(),
+                    ..claim("2026-20")
+                },
+                "h",
+            )
             .unwrap();
-        numbers.entries[0].recorded_at = "2026-10-01T09:00:00Z".into();
-        numbers.entries[0].customer = "Buuurt".into();
+        ledger.file.state_mut().entries[0].recorded_at = "2026-10-01T09:00:00Z".into();
         let day = epoch_days("2026-10-01").unwrap();
-        assert!(numbers.warnings("a1", day + STALE_DAYS).is_empty());
-        let warnings = numbers.warnings("a1", day + STALE_DAYS + 1);
+        assert!(ledger.warnings(day + STALE_DAYS).is_empty());
+        let warnings = ledger.warnings(day + STALE_DAYS + 1);
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].starts_with(
@@ -615,7 +586,7 @@ mod tests {
             ),
             "{warnings:?}"
         );
-        assert!(numbers.warnings("a2", day + 30).is_empty());
+        assert!(dir.open_other("a2").warnings(day + 30).is_empty());
     }
 
     #[test]

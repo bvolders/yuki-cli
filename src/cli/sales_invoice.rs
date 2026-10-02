@@ -496,6 +496,16 @@ impl Invoice {
         serde_json::to_value(file).expect("serialize prepared invoice")
     }
 
+    /// The ledger claim for giving this invoice `number`.
+    pub fn claim(&self, number: &str) -> Claim {
+        Claim {
+            number: number.to_string(),
+            date: self.date.clone(),
+            customer: self.contact.label(),
+            gross: self.gross().to_string(),
+        }
+    }
+
     /// What booking it as `send` needs, checked in one place for every way
     /// an invoice is booked: a due date, and the customer's email when it is
     /// emailed to a contact without a code.
@@ -1544,23 +1554,14 @@ pub fn write_prepared(
     }
     let json = invoice.prepared(Some(seller), Some(admin_id));
     let hash = content_hash(&json);
-    InvoiceLedger::open()?.reserve_prepared(
-        &Claim {
-            admin: admin_id,
-            number,
-            date: &invoice.date,
-            customer: &invoice.contact.label(),
-            gross: &invoice.gross().to_string(),
-        },
-        &hash,
-    )?;
+    InvoiceLedger::open(admin_id)?.reserve(&invoice.claim(number), &hash)?;
     let mut text = serde_json::to_string_pretty(&json).expect("serialize prepared invoice");
     text.push('\n');
     if let Err(e) = crate::ledger::atomic_write(out, text.as_bytes()) {
         // Nothing to send without the file: free the number again.
-        let _ = InvoiceLedger::open()
+        let _ = InvoiceLedger::open(admin_id)
             .map_err(InvoiceError::from)
-            .and_then(|mut l| l.release(admin_id, number));
+            .and_then(|mut l| l.release(number));
         return Err(InvoiceError::Yuki(YukiError::Config(format!(
             "{}: {e}",
             out.display()
@@ -1675,30 +1676,30 @@ pub async fn submit_numbered(
     };
     let admin_id = config.target(admin)?.admin_id;
     // The lock is held only for the write, never while Yuki is called.
-    InvoiceLedger::open()?.send_reserved(admin_id, number, hash)?;
+    InvoiceLedger::open(admin_id)?.send_reserved(number, hash)?;
     let result = submit(config, admin, invoice, format, quiet)
         .await
         .map(|import| verdict(&import, invoice));
-    let outcome = InvoiceLedger::open()
+    let outcome = InvoiceLedger::open(admin_id)
         .map_err(InvoiceError::from)
         .and_then(|mut ledger| match &result {
-        Ok(Verdict::Done) => ledger.commit(admin_id, number).map(|()| true),
+        Ok(Verdict::Done) => ledger.commit(number).map(|()| true),
         // Booked under this number, only not sent as asked.
         Ok(Verdict::SendIncomplete(message)) => ledger
-            .note(admin_id, number, message)
-            .and_then(|()| ledger.commit(admin_id, number))
+            .note(number, message)
+            .and_then(|()| ledger.commit(number))
             .map(|()| true),
         // Nothing reached Yuki: the prepared invoice keeps its number, to retry.
         Err(InvoiceError::Yuki(_)) => {
-            ledger.unsend(admin_id, number)?;
+            ledger.unsend(number)?;
             eprintln!(
                 "invoice number {number} is reserved again for this prepared invoice: nothing reached Yuki, so run the same create --prepared again"
             );
             Ok(true)
         }
-        Ok(Verdict::Rejected { freed: true, .. }) => ledger.reject(admin_id, number).map(|()| true),
+        Ok(Verdict::Rejected { freed: true, .. }) => ledger.reject(number).map(|()| true),
         Ok(Verdict::ReferenceMismatch(message)) => {
-            ledger.note(admin_id, number, message).map(|()| false)
+            ledger.note(number, message).map(|()| false)
         }
         Ok(Verdict::Rejected { freed: false, .. }) | Err(_) => Ok(false),
     });
@@ -1957,7 +1958,7 @@ pub async fn create(
                 )));
             }
             let number = invoice.number.as_deref().unwrap_or_default();
-            InvoiceLedger::peek()?.check_reserved(&admin_id, number, &hash)?;
+            InvoiceLedger::peek(&admin_id)?.check_reserved(number, &hash)?;
             binding = Some(hash);
             invoice
         }
@@ -1980,7 +1981,7 @@ pub async fn create(
     }
     let config = load_config()?;
     let target = config.target(admin)?;
-    crate::cli::invoice_ledger::warn(&InvoiceLedger::peek()?, target.admin_id);
+    InvoiceLedger::peek(target.admin_id)?.warn();
     // A booking without a prompt names the number it books.
     if invoice.send.is_some() {
         check_confirm(invoice.number.as_deref(), args.confirm, yes)?;
@@ -2033,7 +2034,7 @@ pub async fn prepare(
     if let Some(config) = &config
         && let Ok(target) = config.target(admin)
     {
-        crate::cli::invoice_ledger::warn(&InvoiceLedger::peek()?, target.admin_id);
+        InvoiceLedger::peek(target.admin_id)?.warn();
     }
     if let (Some(request), Some(config)) = (number, &config) {
         config.target(admin)?;

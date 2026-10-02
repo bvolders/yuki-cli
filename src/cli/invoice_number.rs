@@ -8,7 +8,7 @@
 //! existing numbers are. Yuki's own counter does not learn about numbers
 //! given this way, so once invoices are numbered here, number them all here.
 
-use crate::cli::invoice_ledger::{InvoiceLedger, Numbers};
+use crate::cli::invoice_ledger::{InvoiceLedger, given_out};
 use crate::cli::sales_invoice::InvoiceError;
 use crate::cli::setup_domain;
 use crate::client::archive::ArchiveClient;
@@ -177,7 +177,7 @@ pub async fn resolve(
     }
     let admin_id = config.target(admin)?.admin_id;
     let archive = archive_numbers(config, admin, &years).await?;
-    choose(request, year, &archive, &InvoiceLedger::peek()?, admin_id)
+    choose(request, year, &archive, &InvoiceLedger::peek(admin_id)?)
 }
 
 /// [`resolve`] once the archive's numbers are known.
@@ -185,10 +185,9 @@ pub fn choose(
     request: &NumberRequest,
     year: u32,
     archive: &[String],
-    ledger: &Numbers,
-    admin: &str,
+    ledger: &InvoiceLedger,
 ) -> Result<String, InvoiceError> {
-    let held: Vec<String> = ledger.taken_numbers(admin).map(str::to_string).collect();
+    let held: Vec<String> = ledger.taken_numbers().map(str::to_string).collect();
     let number = match request {
         NumberRequest::Auto => next_free(archive, &held, year),
         NumberRequest::Given(number) => number.clone(),
@@ -198,19 +197,8 @@ pub fn choose(
             "invoice number {number} is already in the sales archive"
         )));
     }
-    if taken(&held, &number) {
-        let status = ledger.holder(admin, &number).map_or("taken", |e| match e.status {
-            crate::cli::invoice_ledger::Status::Pending => {
-                "pending (outcome unknown: check Yuki, then `yuki sales invoice numbers --resolve`)"
-            }
-            crate::cli::invoice_ledger::Status::Reserved => {
-                "reserved by `prepare --out` (free it with `yuki sales invoice numbers --resolve <number> --as rejected`)"
-            }
-            _ => "booked",
-        });
-        return Err(InvoiceError::InvalidInput(format!(
-            "invoice number {number} was already given out: {status}"
-        )));
+    if let Some(held) = ledger.holder(&number) {
+        return Err(given_out(held));
     }
     Ok(number)
 }
@@ -347,77 +335,38 @@ mod tests {
 
     #[test]
     fn the_ledger_holds_numbers_the_archive_does_not_show_yet() {
+        use crate::cli::invoice_ledger::{Claim, Resolution};
         let archive = numbers_in_file_names(&archive());
-        let mut ledger = Numbers::default();
-        ledger
-            .reserve_prepared(
-                &crate::cli::invoice_ledger::Claim {
-                    admin: "a1",
-                    number: "2026-20",
-                    date: "2026-10-31",
-                    customer: "Example BV",
-                    gross: "121.00",
-                },
-                "h",
-            )
-            .unwrap();
-        // auto skips the pending number; giving it is refused.
-        assert_eq!(
-            choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a1").unwrap(),
-            "2026-21"
-        );
-        let err = choose(
-            &NumberRequest::Given("2026-20".into()),
-            2026,
-            &archive,
-            &ledger,
-            "a1",
-        )
-        .unwrap_err()
-        .to_string();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("invoice-numbers.json");
+        let claim = |customer: &str| Claim {
+            number: "2026-20".into(),
+            date: "2026-10-31".into(),
+            customer: customer.into(),
+            gross: "121.00".into(),
+        };
+        let mut a1 = InvoiceLedger::open_at(&path, "a1").unwrap();
+        a1.reserve(&claim("Example BV"), "h").unwrap();
+        // auto skips the reserved number; giving it is refused.
+        let choose_in = |ledger: &InvoiceLedger, request: NumberRequest| {
+            choose(&request, 2026, &archive, ledger).map_err(|e| e.to_string())
+        };
+        assert_eq!(choose_in(&a1, NumberRequest::Auto).unwrap(), "2026-21");
+        let err = choose_in(&a1, NumberRequest::Given("2026-20".into())).unwrap_err();
         assert!(err.contains("already given out: reserved"), "{err}");
-        let err = choose(
-            &NumberRequest::Given("2026-19".into()),
-            2026,
-            &archive,
-            &ledger,
-            "a1",
-        )
-        .unwrap_err()
-        .to_string();
+        let err = choose_in(&a1, NumberRequest::Given("2026-19".into())).unwrap_err();
         assert!(err.contains("already in the sales archive"), "{err}");
         // A rejected number is free again.
-        {
-            use crate::cli::invoice_ledger::Status;
-            ledger
-                .transition("a1", "2026-20", Status::Reserved, Status::Rejected)
-                .unwrap();
-        }
-        assert_eq!(
-            choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a1").unwrap(),
-            "2026-20"
-        );
+        a1.resolve("2026-20", Resolution::Rejected).unwrap();
+        assert_eq!(choose_in(&a1, NumberRequest::Auto).unwrap(), "2026-20");
+        drop(a1);
         // Another administration's numbers do not count.
-        ledger
-            .reserve_prepared(
-                &crate::cli::invoice_ledger::Claim {
-                    admin: "a2",
-                    number: "2026-20",
-                    date: "2026-10-31",
-                    customer: "Other BV",
-                    gross: "1.00",
-                },
-                "h",
-            )
-            .unwrap();
-        assert_eq!(
-            choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a1").unwrap(),
-            "2026-20"
-        );
-        assert_eq!(
-            choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a2").unwrap(),
-            "2026-21"
-        );
+        let mut a2 = InvoiceLedger::open_at(&path, "a2").unwrap();
+        a2.reserve(&claim("Other BV"), "h").unwrap();
+        assert_eq!(choose_in(&a2, NumberRequest::Auto).unwrap(), "2026-21");
+        drop(a2);
+        let a1 = InvoiceLedger::open_at(&path, "a1").unwrap();
+        assert_eq!(choose_in(&a1, NumberRequest::Auto).unwrap(), "2026-20");
     }
 
     #[test]
