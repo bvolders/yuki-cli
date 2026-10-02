@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -298,16 +298,6 @@ impl Invoice {
         self.net() + self.vat()
     }
 
-    /// The currency shown in the preview: Yuki's default is EUR.
-    fn currency_label(&self) -> &str {
-        self.currency.as_deref().unwrap_or("EUR")
-    }
-
-    /// Whether the invoice names its currency, rather than taking Yuki's default.
-    fn currency_given(&self) -> bool {
-        self.currency.is_some()
-    }
-
     /// The yes/no question the confirmation prompt asks.
     pub fn question(&self) -> String {
         match self.send {
@@ -408,14 +398,12 @@ impl Invoice {
             .collect();
         let _ = writeln!(out, "{}", format_table(&headers, &rows));
 
-        let currency = self.currency_label();
-        let _ = writeln!(
-            out,
-            "  {:<15}{:>12} {currency}",
-            "Net",
-            self.net().to_string()
-        );
-        for rate in self.vat_rates() {
+        let currency = self.currency.as_deref().unwrap_or("EUR");
+        let net = self.net();
+        let rates = self.vat_rates();
+        let gross = net + rates.iter().map(|r| r.vat).sum();
+        let _ = writeln!(out, "  {:<15}{:>12} {currency}", "Net", net.to_string());
+        for rate in &rates {
             let _ = writeln!(
                 out,
                 "  {:<15}{:>12} {currency}  ({}% on {})",
@@ -429,9 +417,9 @@ impl Invoice {
             out,
             "  {:<15}{:>12} {currency}",
             "Gross total",
-            self.gross().to_string()
+            gross.to_string()
         );
-        let default = if self.currency_given() {
+        let default = if self.currency.is_some() {
             ""
         } else {
             "; no currency given, so Yuki's default (EUR)"
@@ -1105,7 +1093,7 @@ pub fn templates(format: Option<&str>) -> Result<(), YukiError> {
     ]
     .map(String::from)
     .to_vec();
-    let rows: Vec<Vec<String>> = names.iter().map(|name| template_row(name, &dir)).collect();
+    let rows: Vec<Vec<String>> = names.iter().map(|name| template_row(name)).collect();
     let format = OutputFormat::from_flag(format, is_tty());
     if rows.is_empty() && matches!(format, OutputFormat::Table) {
         eprintln!("No invoice templates in {}", dir.display());
@@ -1117,8 +1105,10 @@ pub fn templates(format: Option<&str>) -> Result<(), YukiError> {
     Ok(())
 }
 
-fn template_row(name: &str, dir: &Path) -> Vec<String> {
-    let path = dir.join(format!("{name}.toml")).display().to_string();
+fn template_row(name: &str) -> Vec<String> {
+    let path = template_path(name)
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     match load(
         &Source::Template(name.to_string()),
         &Overrides::default(),
