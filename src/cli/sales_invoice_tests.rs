@@ -55,6 +55,11 @@ vat_percentage = 21
 vat_type = 1
 "#;
 
+/// [`MINIMAL`] with the due date a booking needs.
+fn bookable() -> String {
+    format!("due_days = 30\n{MINIMAL}")
+}
+
 fn invoice(text: &str, send: Option<SendMode>) -> Invoice {
     parse(text, "test.toml", &Overrides::default(), send).expect("valid invoice")
 }
@@ -179,14 +184,14 @@ fn elements_follow_the_xsd_sequence_order() {
 
 #[test]
 fn the_invoice_carries_no_reference_so_yuki_numbers_it() {
-    let xml = invoice(MINIMAL, Some(SendMode::Email)).to_xml();
+    let xml = invoice(&bookable(), Some(SendMode::Email)).to_xml();
     assert!(!xml.contains("<Reference>"), "{xml}");
 }
 
 #[test]
 fn draft_and_send_modes_set_process_and_the_send_flags() {
     let flags = |send| {
-        let xml = invoice(MINIMAL, send).to_xml();
+        let xml = invoice(&bookable(), send).to_xml();
         ["Process", "EmailToCustomer", "SentToPeppol"]
             .map(|tag| xml.contains(&format!("<{tag}>true</{tag}>")))
     };
@@ -427,16 +432,21 @@ fn the_preview_states_customer_lines_totals_and_mode() {
             "missing {expected:?} in:\n{draft}"
         );
     }
-    let sent = invoice(MINIMAL, Some(SendMode::Peppol)).preview(None);
+    let sent = invoice(&bookable(), Some(SendMode::Peppol)).preview(None);
     assert!(
         sent.contains(
             "BOOK AND SEND OVER PEPPOL (Process=true, EmailToCustomer=false, SentToPeppol=true)"
         ),
         "{sent}"
     );
-    assert!(sent.contains("due Yuki's default term"), "{sent}");
+    assert!(sent.contains("2026-10-01, due 2026-10-31"), "{sent}");
+    assert!(
+        invoice(MINIMAL, None)
+            .preview(None)
+            .contains("due Yuki's default term")
+    );
     assert_eq!(
-        invoice(MINIMAL, Some(SendMode::Email)).question(),
+        invoice(&bookable(), Some(SendMode::Email)).question(),
         "Book this invoice in Yuki and send it by email?"
     );
 }
@@ -681,7 +691,7 @@ fn book_books_without_sending_and_the_number_is_the_reference() {
         number: Some(&number),
         ..Default::default()
     };
-    let inv = parse(MINIMAL, "t", &overrides, Some(SendMode::Book)).unwrap();
+    let inv = parse(&bookable(), "t", &overrides, Some(SendMode::Book)).unwrap();
     let xml = inv.to_xml();
     for fragment in [
         "<Process>true</Process>",
@@ -858,7 +868,7 @@ fn a_booking_announces_itself_in_one_line() {
         number: Some(&number),
         ..Default::default()
     };
-    let inv = parse(MINIMAL, "t", &overrides, Some(SendMode::Book)).unwrap();
+    let inv = parse(&bookable(), "t", &overrides, Some(SendMode::Book)).unwrap();
     assert_eq!(
         inv.booking_line().unwrap(),
         "BOOKS IMMEDIATELY: 2026-20 code C0042 1512.50 EUR"
@@ -943,4 +953,66 @@ fn unknown_or_misplaced_placeholders_are_errors() {
         err.contains("subject: {pct_of_net:…} only works in a line"),
         "{err}"
     );
+}
+
+#[test]
+fn a_booking_needs_a_due_date() {
+    for send in [SendMode::Book, SendMode::Email, SendMode::Peppol] {
+        let err = parse(MINIMAL, "t", &Overrides::default(), Some(send))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a booked invoice needs a due date: give due_days or due_date"),
+            "{err}"
+        );
+    }
+    // A draft may leave it to Yuki; due_date works as well as due_days.
+    assert!(parse(MINIMAL, "t", &Overrides::default(), None).is_ok());
+    let dated = format!("due_date = 2026-11-01\n{MINIMAL}");
+    assert!(parse(&dated, "t", &Overrides::default(), Some(SendMode::Book)).is_ok());
+}
+
+#[test]
+fn a_vat_mention_is_passed_through_and_missed_at_zero_percent() {
+    let zero = MINIMAL.replace("vat_percentage = 21", "vat_percentage = 0");
+    let inv = invoice(&zero, None);
+    assert!(inv.lacks_vat_mention());
+    assert!(
+        inv.preview(None)
+            .contains("0% VAT and there is no vat_mention")
+    );
+    let mentioned = format!("vat_mention = \"Btw verlegd\"\n{zero}");
+    let inv = invoice(&mentioned, None);
+    assert!(!inv.lacks_vat_mention());
+    assert!(!inv.preview(None).contains("no vat_mention"));
+    assert_eq!(inv.prepared()["vat_mention"], "Btw verlegd");
+    // Not part of what Yuki receives.
+    assert!(!inv.to_xml().contains("verlegd"));
+    assert!(!invoice(MINIMAL, None).lacks_vat_mention());
+}
+
+#[test]
+fn the_seller_is_the_prepared_firm() {
+    let seller: crate::config::Seller = toml::from_str(
+        r#"
+name = "Studio Maak"
+address = "Meidoornlaan 13"
+zipcode = "2920"
+city = "Kalmthout"
+country = "BE"
+phone = "0491370721"
+enterprise_number = "0748.926.706"
+vat_number = "BE0748.926.706"
+iban = "BE35733070723437"
+"#,
+    )
+    .unwrap();
+    let json = invoice(MINIMAL, None).prepared_for(Some(&seller));
+    assert_eq!(json["firm"]["name"], "Studio Maak");
+    assert_eq!(json["firm"]["enterprise_number"], "0748.926.706");
+    assert_eq!(json["firm"]["iban"], "BE35733070723437");
+    for unset in ["bic", "legal_form", "rpr"] {
+        assert!(json["firm"][unset].is_null(), "{unset}");
+    }
+    assert!(invoice(MINIMAL, None).prepared_for(None)["firm"].is_null());
 }

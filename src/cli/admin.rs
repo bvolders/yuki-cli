@@ -260,6 +260,7 @@ mod tests {
             region: None,
             base_url: None,
             endpoint_override: None,
+            seller: None,
         }
     }
 

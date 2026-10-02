@@ -398,7 +398,8 @@ else today) and `--subject` its subject. An invoice file has the same format:
 ```toml
 # ~/.config/yuki/invoices/acme-hosting.toml
 subject = "Managed hosting"
-due_days = 30                     # or: due_date = 2026-11-01
+due_days = 30                     # or: due_date = 2026-11-01; required to book
+# vat_mention = "Btw verlegd"     # printed on a rendered invoice; the preview warns at 0% without one
 # date = 2026-10-01               # default: today
 # payment_method = "ElectronicTransfer"
 # layout = "Standard"             # a layout name from Yuki; default layout if unknown
@@ -439,6 +440,26 @@ shows the final text): `{month}` (the Dutch month name, `oktober`), `{year}`
 (`2026`), `{month_num}` (`10`) and, in a line, `{pct_of_net:25}`: 25% of that
 line's net, rounded to the cent, in Belgian notation (`4.312,50`). Any other
 text between braces is an error.
+
+A rendered invoice also prints the firm that issues it. `prepare` gives it as
+`firm`, from a `[seller]` table in `~/.config/yuki/config.toml` (`bic`,
+`legal_form` and `rpr` are optional and come out as `null` when unset):
+
+```toml
+[seller]
+name = "Your Firm"
+address = "Street 1"
+zipcode = "1000"
+city = "Brussel"
+country = "BE"
+phone = "0400000000"
+enterprise_number = "0123.456.789"
+vat_number = "BE0123.456.789"
+iban = "BE00000000000000"
+# bic = "GEBABEBB"
+# legal_form = "BV"
+# rpr = "RPR Brussel"
+```
 
 Real Yuki contacts often have an empty `Code`, so match on name, address and VAT
 number. `yuki contacts search <name>` shows each contact's HID, city and VAT

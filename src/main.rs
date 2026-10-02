@@ -539,18 +539,23 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         };
                         let mut invoice = sales_invoice::load(&inputs.source(), &overrides, None)
                             .map_err(invalid_input)?;
-                        if let Some(request) = &inputs.number {
-                            let config = load()?;
+                        // The config, when there is one, gives the issuing firm.
+                        let config = match &inputs.number {
+                            Some(_) => Some(load()?),
+                            None => load().ok(),
+                        };
+                        if let (Some(request), Some(config)) = (&inputs.number, &config) {
                             config.target(admin)?;
                             invoice.number = Some(
-                                invoice_number::resolve(&config, admin, request, &invoice.date)
+                                invoice_number::resolve(config, admin, request, &invoice.date)
                                     .await
                                     .map_err(invalid_input)?,
                             );
                         }
+                        let seller = config.as_ref().and_then(|c| c.seller.as_ref());
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&invoice.prepared())
+                            serde_json::to_string_pretty(&invoice.prepared_for(seller))
                                 .expect("serialize invoice")
                         );
                     }

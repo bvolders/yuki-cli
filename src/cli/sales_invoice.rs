@@ -20,7 +20,7 @@ use crate::cli::invoice_ledger::{Claim, InvoiceLedger};
 use crate::cli::invoice_number::{NumberRequest, dutch_date, structured_reference};
 use crate::client::escape_text;
 use crate::client::sales::{SalesClient, SalesInvoicesImport};
-use crate::config::Config;
+use crate::config::{Config, Seller};
 use crate::error::{Delivery, YukiError};
 use crate::money::{Cents, div_round, format_scaled, parse_scaled};
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
@@ -159,6 +159,7 @@ struct InvoiceSpec {
     payment_method: Option<String>,
     remarks: Option<String>,
     notes: Option<String>,
+    vat_mention: Option<String>,
     pdf: Option<String>,
     contact: Option<ContactSpec>,
     #[serde(default)]
@@ -329,6 +330,9 @@ pub struct Invoice {
     pub payment_method: Option<String>,
     pub remarks: Option<String>,
     pub notes: Option<String>,
+    /// The legal VAT mention a rendered invoice prints, e.g. for 0% VAT
+    /// ("Btw verlegd", "Vrijgesteld van btw, art. 44 WBTW"); not sent to Yuki.
+    pub vat_mention: Option<String>,
     /// Stored in Yuki instead of the invoice Yuki would generate.
     pub pdf: Option<Pdf>,
     /// `Reference`: the invoice number, when the CLI gives it.
@@ -413,6 +417,7 @@ impl Invoice {
             "currency": self.currency.as_deref().unwrap_or("EUR"),
             "payment_method": self.payment_method,
             "notes": self.notes,
+            "vat_mention": self.vat_mention,
             "customer": {
                 "code": c.code,
                 "name": c.name,
@@ -450,6 +455,19 @@ impl Invoice {
             },
             "payment_reference": self.number.as_deref().and_then(|n| structured_reference(n).ok()),
         })
+    }
+
+    /// [`prepared`](Self::prepared) with the issuing firm as `firm`
+    /// (`null` without a `[seller]` in the config).
+    pub fn prepared_for(&self, seller: Option<&Seller>) -> serde_json::Value {
+        let mut json = self.prepared();
+        json["firm"] = seller.map_or(serde_json::Value::Null, Seller::firm);
+        json
+    }
+
+    /// Whether a line is at 0% VAT without a `vat_mention` to explain why.
+    pub fn lacks_vat_mention(&self) -> bool {
+        self.vat_mention.is_none() && self.lines.iter().any(|l| l.vat_percentage == 0)
     }
 
     /// What will happen, for humans: customer, lines, totals and send mode.
@@ -518,6 +536,7 @@ impl Invoice {
             ("Layout", &self.layout),
             ("Notes", &self.notes),
             ("Remarks", &self.remarks),
+            ("VAT mention", &self.vat_mention),
         ] {
             if let Some(value) = value {
                 row(label, value);
@@ -605,6 +624,12 @@ impl Invoice {
             if let Some(remarks) = &line.remarks {
                 let _ = write!(out, "\n  line {} remarks: {remarks}", i + 1);
             }
+        }
+        if self.lacks_vat_mention() {
+            let _ = write!(
+                out,
+                "\n  !! a line is at 0% VAT and there is no vat_mention: the invoice must say why (e.g. \"Btw verlegd\")"
+            );
         }
         out
     }
@@ -994,6 +1019,10 @@ fn validate(
     }
     let remarks = p.text("remarks", spec.remarks);
     let notes = p.text("notes", spec.notes);
+    let vat_mention = p.text("vat_mention", spec.vat_mention);
+    if send.is_some() && due_date.is_none() && !p.0.iter().any(|e| e.contains("due_")) {
+        p.push("a booked invoice needs a due date: give due_days or due_date");
+    }
     if notes
         .as_ref()
         .is_some_and(|n| n.chars().count() > NOTES_MAX)
@@ -1115,6 +1144,7 @@ fn validate(
         payment_method,
         remarks,
         notes,
+        vat_mention,
         pdf,
         number,
         contact,

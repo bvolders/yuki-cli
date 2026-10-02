@@ -28,6 +28,7 @@ gl_account = "700000"
 const AD_HOC: &str = r#"
 subject = "Workshop & follow-up"
 date = 2026-10-01
+due_days = 14
 
 [contact]
 name = "New Customer BV"

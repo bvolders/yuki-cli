@@ -565,6 +565,8 @@ pub async fn run_with<R: BufRead>(
         region: None,
         base_url: saved_url.clone(),
         endpoint_override: None,
+        // The firm issuing invoices is not something init discovers.
+        seller: existing.as_ref().and_then(|c| c.seller.clone()),
     };
 
     // A saved base_url is an endpoint the user chose, like a flag: keep it.

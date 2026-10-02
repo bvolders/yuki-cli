@@ -174,6 +174,71 @@ pub struct Config {
     /// Wins over everything in the file and is never written back to it.
     #[serde(skip)]
     pub endpoint_override: Option<EndpointOverride>,
+    /// `[seller]`: the firm issuing sales invoices, as a rendered invoice
+    /// prints it. Needed by `sales invoice prepare --out`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller: Option<Seller>,
+}
+
+/// The firm issuing sales invoices (`[seller]` in the config).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Seller {
+    pub name: String,
+    pub address: String,
+    pub zipcode: String,
+    pub city: String,
+    /// ISO 3166-1 alpha-2, e.g. `BE`.
+    pub country: String,
+    pub phone: String,
+    /// Ondernemingsnummer, e.g. `0748.926.706`.
+    pub enterprise_number: String,
+    pub vat_number: String,
+    pub iban: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legal_form: Option<String>,
+    /// RPR/RPM and its court, e.g. `RPR Antwerpen, afdeling Antwerpen`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpr: Option<String>,
+}
+
+impl Seller {
+    /// The `[seller]` table to add to the config, for an error message.
+    pub const SNIPPET: &'static str = r#"[seller]
+name = "Your Firm"
+address = "Street 1"
+zipcode = "1000"
+city = "Brussel"
+country = "BE"
+phone = "0400000000"
+enterprise_number = "0123.456.789"
+vat_number = "BE0123.456.789"
+iban = "BE00000000000000"
+# bic = "GEBABEBB"
+# legal_form = "BV"
+# rpr = "RPR Brussel"
+"#;
+
+    /// The seller as the prepared invoice's `firm`: every field, the
+    /// optional ones as `null` when unset.
+    pub fn firm(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "address": self.address,
+            "zipcode": self.zipcode,
+            "city": self.city,
+            "country": self.country,
+            "phone": self.phone,
+            "enterprise_number": self.enterprise_number,
+            "vat_number": self.vat_number,
+            "iban": self.iban,
+            "bic": self.bic,
+            "legal_form": self.legal_form,
+            "rpr": self.rpr,
+        })
+    }
 }
 
 /// A run-scoped endpoint: where to send requests and, when known, which

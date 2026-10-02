@@ -18,6 +18,7 @@ fn config_with(
         region: None,
         base_url: None,
         endpoint_override: None,
+        seller: None,
     }
 }
 
