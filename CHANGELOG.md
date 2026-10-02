@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- **yuki-client**: `SoapEnvelope::param` now XML-escapes its value, so a file name, search query or description containing `&`, `<` or `>` no longer produces a malformed request. SOAP requests now give up connecting after 15 seconds and time out after 300 seconds in total instead of waiting forever; a timeout error says "timed out".
+- **yuki-client**: `SoapEnvelope::param` now XML-escapes its value, so a file name, search query or description containing `&`, `<` or `>` no longer produces a malformed request. SOAP requests now give up connecting after 15 seconds and time out after 60 seconds (uploads: 60 plus 30 per MB, at most 600) instead of waiting forever; a timeout error says "timed out".
 
 ### Breaking Changes
 

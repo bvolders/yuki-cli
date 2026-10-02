@@ -76,8 +76,8 @@ pub fn escape_text(value: &str) -> String {
 /// How long establishing a connection may take.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// How long one SOAP request may take in total, upload included.
-pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long one SOAP request may take in total, unless the call says otherwise.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// HTTP transport client for the Yuki SOAP API.
 pub struct SoapClient {
@@ -138,15 +138,27 @@ impl SoapClient {
 
     /// POST a SOAP envelope and return the raw response body.
     pub async fn call(&self, operation: &str, envelope: String) -> Result<String, YukiError> {
+        self.call_with_timeout(operation, envelope, None).await
+    }
+
+    /// [`call`](Self::call) with its own total timeout, e.g. for a large upload.
+    pub async fn call_with_timeout(
+        &self,
+        operation: &str,
+        envelope: String,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<String, YukiError> {
         let action = Self::soap_action("", operation);
-        let response = self
+        let mut request = self
             .http
             .post(&self.base_url)
             .header("Content-Type", "text/xml; charset=utf-8")
             .header("SOAPAction", format!("\"{action}\""))
-            .body(envelope)
-            .send()
-            .await?;
+            .body(envelope);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await?;
 
         let status = response.status();
         let body = response.text().await?;
