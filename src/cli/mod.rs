@@ -878,6 +878,29 @@ pub enum CheckCommands {
         unallocated: bool,
     },
 
+    /// List the payments Yuki has no invoice for, per supplier, with that
+    /// supplier's open invoices.
+    ///
+    /// Yuki's "Betalingen waarvan factuur nog ontbreekt" with "Toon
+    /// openstaande facturen": bank and card payments booked to a supplier
+    /// that no invoice settles yet, open as of today. Read-only, and it pairs
+    /// nothing; `check matches` suggests pairings.
+    Missing {
+        /// Only payments dated in this period (e.g. 2026-Q3); the supplier's
+        /// open invoices are listed whatever their date.
+        #[arg(long)]
+        period: Option<String>,
+        /// Receipts folder to look each payment up in (read only): vendor
+        /// from the file's folder name, amount from its receipts-log.csv
+        /// (EUR, or the foreign amount the card line states), date within
+        /// 5 days; .yuki-sync.json marks files already uploaded.
+        #[arg(long, value_name = "DIR")]
+        receipts: Option<std::path::PathBuf>,
+        /// Only suppliers whose name contains this (case-insensitive).
+        #[arg(long, value_name = "NAME")]
+        contact: Option<String>,
+    },
+
     /// Check if a specific invoice reference is still outstanding.
     Outstanding {
         /// Invoice reference to check.

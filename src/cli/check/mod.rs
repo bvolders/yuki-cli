@@ -1,9 +1,12 @@
 //! `yuki check`: VAT, outstanding-item and unmatched-payment checks.
 
 mod matches;
+mod missing;
+mod receipts;
 mod unmatched;
 
 pub use matches::matches;
+pub use missing::missing;
 pub use unmatched::unmatched;
 
 use crate::cli::setup_domain;

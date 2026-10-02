@@ -596,6 +596,22 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?;
                 }
+                CheckCommands::Missing {
+                    period,
+                    receipts,
+                    contact,
+                } => {
+                    yuki_cli::cli::check::missing(
+                        &config,
+                        admin,
+                        period.as_deref(),
+                        receipts.as_deref(),
+                        contact.as_deref(),
+                        format,
+                        cli.quiet,
+                    )
+                    .await?;
+                }
                 CheckCommands::Outstanding { reference } => {
                     yuki_cli::cli::check::outstanding(&config, admin, &reference, format).await?;
                 }

@@ -486,6 +486,27 @@ pub fn generate() -> Value {
                 ]
             },
             {
+                "name": "check missing",
+                "description": "List, per supplier, the bank and card payments no invoice settles yet (Yuki's \"Betalingen waarvan factuur nog ontbreekt\") and that supplier's open invoices, optionally with the local receipt for each payment.",
+                "mutating": false,
+                "args": [
+                    {"name": "--period", "type": "string", "required": false, "description": "Only payments dated in this period (e.g. 2026-Q3); open invoices are listed whatever their date."},
+                    {"name": "--receipts", "type": "path", "required": false, "description": "Receipts folder, read only: vendor from each file's folder name, amount from receipts-log.csv (EUR or the card line's foreign amount), date within 5 days; .yuki-sync.json marks uploaded files. Adds the Local receipt column."},
+                    {"name": "--contact", "type": "string", "required": false, "description": "Only suppliers whose name contains this (case-insensitive)."}
+                ],
+                "output_fields": [
+                    {"name": "supplier", "type": "string"},
+                    {"name": "kind", "type": "string", "description": "payment, open invoice or open credit note."},
+                    {"name": "date", "type": "string"},
+                    {"name": "description", "type": "string"},
+                    {"name": "reference", "type": "string"},
+                    {"name": "amount", "type": "string"},
+                    {"name": "open", "type": "string"},
+                    {"name": "fx", "type": "string", "description": "Foreign amount of a card payment, e.g. 20.00 USD; ~ when worked out from the exchange rate."},
+                    {"name": "local_receipt", "type": "string", "description": "With --receipts: the matching file, and its upload state."}
+                ]
+            },
+            {
                 "name": "check outstanding",
                 "description": "Check if a specific invoice reference is still outstanding.",
                 "mutating": false,

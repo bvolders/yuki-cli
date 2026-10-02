@@ -162,7 +162,7 @@ fn day(date: &str) -> &str {
 }
 
 /// Days between two dates; far apart when either is no date.
-fn days_apart(a: &str, b: &str) -> i64 {
+pub(super) fn days_apart(a: &str, b: &str) -> i64 {
     match (epoch_days(a), epoch_days(b)) {
         (Some(a), Some(b)) => (a - b).abs(),
         _ => i64::MAX,
