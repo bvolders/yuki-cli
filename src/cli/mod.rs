@@ -571,11 +571,12 @@ pub struct InvoiceInputs {
 }
 
 impl InvoiceInputs {
-    pub fn source(&self) -> sales_invoice::Source {
+    /// The invoice file or template; `None` when neither is given.
+    pub fn source(&self) -> Option<sales_invoice::Source> {
         match (&self.file, &self.template) {
-            (Some(file), _) => sales_invoice::Source::File(file.into()),
-            (None, Some(name)) => sales_invoice::Source::Template(name.clone()),
-            (None, None) => unreachable!("clap requires --file, --template or --prepared"),
+            (Some(file), _) => Some(sales_invoice::Source::File(file.into())),
+            (None, Some(name)) => Some(sales_invoice::Source::Template(name.clone())),
+            (None, None) => None,
         }
     }
 

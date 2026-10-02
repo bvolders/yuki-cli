@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::invoice_number::same_number;
+use crate::cli::sales_invoice::InvoiceError;
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::ledger::{Ledger, LedgerFormat};
@@ -174,7 +175,7 @@ impl Numbers {
 
     /// Record the claim as reserved for the prepared invoice whose content
     /// hash is `hash`; refused while an entry holds the number.
-    pub fn reserve_prepared(&mut self, claim: &Claim<'_>, hash: &str) -> Result<(), YukiError> {
+    pub fn reserve_prepared(&mut self, claim: &Claim<'_>, hash: &str) -> Result<(), InvoiceError> {
         self.claim(claim, Status::Reserved, Some(hash))
     }
 
@@ -183,9 +184,9 @@ impl Numbers {
         claim: &Claim<'_>,
         status: Status,
         hash: Option<&str>,
-    ) -> Result<(), YukiError> {
+    ) -> Result<(), InvoiceError> {
         if let Some(held) = self.holder(claim.admin, claim.number) {
-            return Err(YukiError::Config(format!(
+            return Err(InvoiceError::InvalidInput(format!(
                 "invoice number {} was already given out: {}",
                 claim.number,
                 held.status.label()
@@ -217,18 +218,23 @@ impl Numbers {
 
     /// The reservation of `admin` for `number`, checked against the content
     /// hash of the prepared invoice about to be sent.
-    pub fn check_reserved(&self, admin: &str, number: &str, hash: &str) -> Result<(), YukiError> {
+    pub fn check_reserved(
+        &self,
+        admin: &str,
+        number: &str,
+        hash: &str,
+    ) -> Result<(), InvoiceError> {
         let held = self.holder(admin, number).ok_or_else(|| {
-            YukiError::Config(format!(
+            InvoiceError::InvalidInput(format!(
                 "invoice number {number} is not reserved in this administration: prepare it again with `sales invoice prepare --out`"
             ))
         })?;
         match held.status {
             Status::Reserved if held.hash.as_deref() == Some(hash) => Ok(()),
-            Status::Reserved => Err(YukiError::Config(format!(
+            Status::Reserved => Err(InvoiceError::InvalidInput(format!(
                 "the prepared invoice {number} is not the one prepare reserved the number for: it changed since, so its PDF may not match; prepare it again"
             ))),
-            other => Err(YukiError::Config(format!(
+            other => Err(InvoiceError::InvalidInput(format!(
                 "invoice number {number} is {} already, not reserved: it was sent before",
                 other.label()
             ))),
@@ -243,7 +249,7 @@ impl Numbers {
         number: &str,
         from: Status,
         to: Status,
-    ) -> Result<(), YukiError> {
+    ) -> Result<(), InvoiceError> {
         let entry = self.latest(admin, number, &[from]).ok_or_else(|| {
             YukiError::NotFound(format!("no {} invoice number {number}", from.label()))
         })?;
@@ -281,9 +287,9 @@ impl InvoiceLedger {
 
     /// Reserve the claimed number for the prepared invoice with content
     /// hash `hash` (`prepare --out`).
-    pub fn reserve_prepared(&mut self, claim: &Claim<'_>, hash: &str) -> Result<(), YukiError> {
+    pub fn reserve_prepared(&mut self, claim: &Claim<'_>, hash: &str) -> Result<(), InvoiceError> {
         self.0.state_mut().reserve_prepared(claim, hash)?;
-        self.0.save()
+        Ok(self.0.save()?)
     }
 
     /// Write-ahead for a prepared invoice: its reservation, checked against
@@ -293,46 +299,46 @@ impl InvoiceLedger {
         admin: &str,
         number: &str,
         hash: &str,
-    ) -> Result<(), YukiError> {
+    ) -> Result<(), InvoiceError> {
         let numbers = self.0.state_mut();
         numbers.check_reserved(admin, number, hash)?;
         if let Some(entry) = numbers.latest(admin, number, &[Status::Reserved]) {
             entry.status = Status::Pending;
         }
-        self.0.save()
+        Ok(self.0.save()?)
     }
 
     /// Undo [`send_reserved`](Self::send_reserved) when nothing reached Yuki:
     /// the number is reserved again for the same content, to retry.
-    pub fn unsend(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
+    pub fn unsend(&mut self, admin: &str, number: &str) -> Result<(), InvoiceError> {
         self.0
             .state_mut()
             .transition(admin, number, Status::Pending, Status::Reserved)?;
-        self.0.save()
+        Ok(self.0.save()?)
     }
 
     /// Release a reservation that will not be sent: the number is free again.
-    pub fn release(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
+    pub fn release(&mut self, admin: &str, number: &str) -> Result<(), InvoiceError> {
         self.0
             .state_mut()
             .transition(admin, number, Status::Reserved, Status::Rejected)?;
-        self.0.save()
+        Ok(self.0.save()?)
     }
 
     /// Yuki booked `number`.
-    pub fn commit(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
+    pub fn commit(&mut self, admin: &str, number: &str) -> Result<(), InvoiceError> {
         self.0
             .state_mut()
             .transition(admin, number, Status::Pending, Status::Booked)?;
-        self.0.save()
+        Ok(self.0.save()?)
     }
 
     /// Yuki did not create `number`: free it again.
-    pub fn reject(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
+    pub fn reject(&mut self, admin: &str, number: &str) -> Result<(), InvoiceError> {
         self.0
             .state_mut()
             .transition(admin, number, Status::Pending, Status::Rejected)?;
-        self.0.save()
+        Ok(self.0.save()?)
     }
 
     /// Settle `number` by hand, after checking Yuki: a pending number as
@@ -342,13 +348,13 @@ impl InvoiceLedger {
         admin: &str,
         number: &str,
         resolution: Resolution,
-    ) -> Result<(), YukiError> {
+    ) -> Result<(), InvoiceError> {
         let reserved =
             self.list().holder(admin, number).map(|e| e.status) == Some(Status::Reserved);
         match (resolution, reserved) {
             (Resolution::Rejected, true) => self.release(admin, number),
             (Resolution::Rejected, false) => self.reject(admin, number),
-            (Resolution::Booked, true) => Err(YukiError::Config(format!(
+            (Resolution::Booked, true) => Err(InvoiceError::InvalidInput(format!(
                 "invoice number {number} is reserved, never sent: it can only be released (--as rejected)"
             ))),
             (Resolution::Booked, false) => self.commit(admin, number),
@@ -356,11 +362,11 @@ impl InvoiceLedger {
     }
 
     /// Note on the latest pending entry of `admin` for `number`.
-    pub fn note(&mut self, admin: &str, number: &str, note: &str) -> Result<(), YukiError> {
+    pub fn note(&mut self, admin: &str, number: &str, note: &str) -> Result<(), InvoiceError> {
         if let Some(entry) = self.0.state_mut().latest(admin, number, &[Status::Pending]) {
             entry.note = Some(note.to_string());
         }
-        self.0.save()
+        Ok(self.0.save()?)
     }
 }
 
@@ -401,10 +407,12 @@ fn now_utc() -> String {
 /// `sales invoice numbers`: list the numbers of administration `admin`,
 /// after settling one by hand when `resolve` is given.
 pub fn numbers(
-    admin: &str,
+    config: &Config,
+    admin: Option<&str>,
     resolve: Option<(&str, Resolution)>,
     format: Option<&str>,
-) -> Result<(), YukiError> {
+) -> Result<(), InvoiceError> {
+    let admin = config.target(admin)?.admin_id;
     let numbers = match resolve {
         Some((number, resolution)) => {
             let mut ledger = InvoiceLedger::open()?;
@@ -456,7 +464,7 @@ mod tests {
     }
 
     /// Reserve `number` for `admin` and send it: pending.
-    fn pend(ledger: &mut InvoiceLedger, admin: &str, number: &str) -> Result<(), YukiError> {
+    fn pend(ledger: &mut InvoiceLedger, admin: &str, number: &str) -> Result<(), InvoiceError> {
         ledger.reserve_prepared(&claim(admin, number), "h")?;
         ledger.send_reserved(admin, number, "h")
     }

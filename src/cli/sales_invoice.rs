@@ -862,10 +862,13 @@ pub fn load(
     source: &Source,
     overrides: &Overrides<'_>,
     send: Option<SendMode>,
-) -> Result<Invoice, YukiError> {
+) -> Result<Invoice, InvoiceError> {
     let (path, origin) = match source {
         Source::File(path) => (path.clone(), path.display().to_string()),
-        Source::Template(name) => (template_path(name)?, format!("template \"{name}\"")),
+        Source::Template(name) => (
+            template_path(name).map_err(InvoiceError::input)?,
+            format!("template \"{name}\""),
+        ),
     };
     let text = std::fs::read_to_string(&path).map_err(|e| {
         let hint = match source {
@@ -874,7 +877,7 @@ pub fn load(
             }
             _ => "",
         };
-        YukiError::Config(format!("{}: {e}{hint}", path.display()))
+        InvoiceError::InvalidInput(format!("{}: {e}{hint}", path.display()))
     })?;
     parse(&text, &origin, overrides, send)
 }
@@ -885,11 +888,11 @@ pub fn parse(
     origin: &str,
     overrides: &Overrides<'_>,
     send: Option<SendMode>,
-) -> Result<Invoice, YukiError> {
+) -> Result<Invoice, InvoiceError> {
     let spec: InvoiceSpec = toml::from_str(text)
-        .map_err(|e| YukiError::Config(format!("invalid invoice {origin}: {e}")))?;
+        .map_err(|e| InvoiceError::InvalidInput(format!("invalid invoice {origin}: {e}")))?;
     validate(spec, origin, overrides, send).map_err(|problems| {
-        YukiError::Config(format!(
+        InvoiceError::InvalidInput(format!(
             "invalid invoice {origin}:\n  - {}",
             problems.join("\n  - ")
         ))
@@ -1331,8 +1334,8 @@ pub fn content_hash(prepared: &serde_json::Value) -> String {
 }
 
 /// The refusal when `[seller]` is missing from the config.
-pub fn seller_missing() -> YukiError {
-    YukiError::Config(format!(
+pub fn seller_missing() -> InvoiceError {
+    InvoiceError::InvalidInput(format!(
         "a prepared invoice prints the issuing firm: add a [seller] table to {}:\n\n{}",
         Config::default_path().display(),
         Seller::SNIPPET
@@ -1406,8 +1409,10 @@ impl Invoice {
         prepared: &serde_json::Value,
         origin: &str,
         send: SendMode,
-    ) -> Result<(Self, String), YukiError> {
-        let bad = |e: String| YukiError::Config(format!("{origin} is not a prepared invoice: {e}"));
+    ) -> Result<(Self, String), InvoiceError> {
+        let bad = |e: String| {
+            InvoiceError::InvalidInput(format!("{origin} is not a prepared invoice: {e}"))
+        };
         let file: PreparedFile =
             serde_json::from_value(prepared.clone()).map_err(|e| bad(e.to_string()))?;
         let number = file
@@ -1489,18 +1494,19 @@ impl Invoice {
 
     /// Attach the custom PDF read from `path`, which Yuki stores instead of
     /// the invoice it would generate.
-    pub fn attach_pdf(&mut self, path: &Path) -> Result<(), YukiError> {
-        self.pdf = Some(Pdf::read(path).map_err(|e| YukiError::Config(format!("--pdf: {e}")))?);
+    pub fn attach_pdf(&mut self, path: &Path) -> Result<(), InvoiceError> {
+        self.pdf =
+            Some(Pdf::read(path).map_err(|e| InvoiceError::InvalidInput(format!("--pdf: {e}")))?);
         Ok(())
     }
 }
 
 /// Read a prepared invoice file: its JSON and content hash.
-pub fn read_prepared(path: &Path) -> Result<(serde_json::Value, String), YukiError> {
+pub fn read_prepared(path: &Path) -> Result<(serde_json::Value, String), InvoiceError> {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| YukiError::Config(format!("{}: {e}", path.display())))?;
+        .map_err(|e| InvoiceError::InvalidInput(format!("{}: {e}", path.display())))?;
     let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        YukiError::Config(format!("{} is not a prepared invoice: {e}", path.display()))
+        InvoiceError::InvalidInput(format!("{} is not a prepared invoice: {e}", path.display()))
     })?;
     let hash = content_hash(&json);
     Ok((json, hash))
@@ -1514,20 +1520,19 @@ pub fn write_prepared(
     config: &Config,
     admin_id: &str,
     out: &Path,
-) -> Result<serde_json::Value, YukiError> {
+) -> Result<serde_json::Value, InvoiceError> {
     let seller = config.seller.as_ref().ok_or_else(seller_missing)?;
-    let number = invoice
-        .number
-        .as_deref()
-        .ok_or_else(|| YukiError::Config("--out needs --number auto or a number".into()))?;
+    let number = invoice.number.as_deref().ok_or_else(|| {
+        InvoiceError::InvalidInput("--out needs --number auto or a number".into())
+    })?;
     if invoice.due_date.is_none() {
-        return Err(YukiError::Config(
+        return Err(InvoiceError::InvalidInput(
             "a prepared invoice is booked, which needs a due date: give due_days or due_date"
                 .into(),
         ));
     }
     if out.exists() {
-        return Err(YukiError::Config(format!(
+        return Err(InvoiceError::InvalidInput(format!(
             "{} exists already; choose another --out (an older prepared invoice keeps its reservation until released)",
             out.display()
         )));
@@ -1548,8 +1553,13 @@ pub fn write_prepared(
     text.push('\n');
     if let Err(e) = crate::ledger::atomic_write(out, text.as_bytes()) {
         // Nothing to send without the file: free the number again.
-        let _ = InvoiceLedger::open().and_then(|mut l| l.release(admin_id, number));
-        return Err(YukiError::Config(format!("{}: {e}", out.display())));
+        let _ = InvoiceLedger::open()
+            .map_err(InvoiceError::from)
+            .and_then(|mut l| l.release(admin_id, number));
+        return Err(InvoiceError::Yuki(YukiError::Config(format!(
+            "{}: {e}",
+            out.display()
+        ))));
     }
     Ok(json)
 }
@@ -1557,21 +1567,23 @@ pub fn write_prepared(
 /// The `--confirm` of a booking: required when `--yes` skips the prompt,
 /// and equal to the invoice number whenever given. The error says why
 /// nothing was sent.
-pub fn check_confirm(number: Option<&str>, confirm: Option<&str>, yes: bool) -> Result<(), String> {
-    match (number, confirm) {
-        (Some(number), Some(confirm)) if number == confirm => Ok(()),
-        (Some(number), Some(confirm)) => Err(format!(
+pub fn check_confirm(
+    number: Option<&str>,
+    confirm: Option<&str>,
+    yes: bool,
+) -> Result<(), InvoiceError> {
+    let refused = match (number, confirm) {
+        (Some(number), Some(confirm)) if number == confirm => return Ok(()),
+        (Some(number), Some(confirm)) => format!(
             "--confirm {confirm} is not the invoice number {number}: nothing was sent to Yuki"
-        )),
-        (_, None) if !yes => Ok(()),
-        (Some(number), None) => Err(format!(
-            "booking without a prompt needs --confirm <number>: pass --confirm {number} to book invoice {number}; nothing was sent to Yuki"
-        )),
-        (None, _) => Err(
-            "booking without a prompt needs --confirm <number>, so the invoice needs a number: book a --prepared invoice (`sales invoice prepare --number auto --out <file>`); one Yuki numbers itself can only be booked at the prompt. Nothing was sent to Yuki"
-                .into(),
         ),
-    }
+        (_, None) if !yes => return Ok(()),
+        (Some(number), None) => format!(
+            "booking without a prompt needs --confirm <number>: pass --confirm {number} to book invoice {number}; nothing was sent to Yuki"
+        ),
+        (None, _) => "booking without a prompt needs --confirm <number>, so the invoice needs a number: book a --prepared invoice (`sales invoice prepare --number auto --out <file>`); one Yuki numbers itself can only be booked at the prompt. Nothing was sent to Yuki".into(),
+    };
+    Err(InvoiceError::ConfirmationRequired(refused))
 }
 
 /// Whether a confirmation prompt can be asked and answered.
@@ -1617,7 +1629,7 @@ pub async fn submit(
     invoice: &Invoice,
     format: Option<&str>,
     quiet: bool,
-) -> Result<SalesInvoicesImport, SubmitError> {
+) -> Result<SalesInvoicesImport, InvoiceError> {
     let target = config.target(admin)?;
     let mut client = SalesClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
@@ -1625,10 +1637,10 @@ pub async fn submit(
         .process_sales_invoices(target.admin_id, &invoice.to_xml())
         .await
         .map_err(|e| match e.delivery() {
-            Delivery::Unknown => SubmitError::OutcomeUnknown(format!(
+            Delivery::Unknown => InvoiceError::OutcomeUnknown(format!(
                 "{e}: the invoice may already have been created in Yuki — check 'To be sent'/'Sales' before retrying"
             )),
-            Delivery::NotSent | Delivery::Refused => SubmitError::Yuki(e),
+            Delivery::NotSent | Delivery::Refused => InvoiceError::Yuki(e),
         })?;
 
     if !quiet {
@@ -1651,7 +1663,7 @@ pub async fn submit_numbered(
     prepared: Option<&str>,
     format: Option<&str>,
     quiet: bool,
-) -> Result<Verdict, SubmitError> {
+) -> Result<Verdict, InvoiceError> {
     let (Some(number), Some(hash)) = (&invoice.number, prepared) else {
         let import = submit(config, admin, invoice, format, quiet).await?;
         return Ok(verdict(&import, invoice));
@@ -1662,7 +1674,9 @@ pub async fn submit_numbered(
     let result = submit(config, admin, invoice, format, quiet)
         .await
         .map(|import| verdict(&import, invoice));
-    let outcome = InvoiceLedger::open().and_then(|mut ledger| match &result {
+    let outcome = InvoiceLedger::open()
+        .map_err(InvoiceError::from)
+        .and_then(|mut ledger| match &result {
         Ok(Verdict::Done) => ledger.commit(admin_id, number).map(|()| true),
         // Booked under this number, only not sent as asked.
         Ok(Verdict::SendIncomplete(message)) => ledger
@@ -1670,7 +1684,7 @@ pub async fn submit_numbered(
             .and_then(|()| ledger.commit(admin_id, number))
             .map(|()| true),
         // Nothing reached Yuki: the prepared invoice keeps its number, to retry.
-        Err(SubmitError::Yuki(_)) => {
+        Err(InvoiceError::Yuki(_)) => {
             ledger.unsend(admin_id, number)?;
             eprintln!(
                 "invoice number {number} is reserved again for this prepared invoice: nothing reached Yuki, so run the same create --prepared again"
@@ -1681,9 +1695,7 @@ pub async fn submit_numbered(
         Ok(Verdict::ReferenceMismatch(message)) => {
             ledger.note(admin_id, number, message).map(|()| false)
         }
-        Ok(Verdict::Rejected { freed: false, .. }) | Err(SubmitError::OutcomeUnknown(_)) => {
-            Ok(false)
-        }
+        Ok(Verdict::Rejected { freed: false, .. }) | Err(_) => Ok(false),
     });
     match outcome {
         Ok(true) => {}
@@ -1763,20 +1775,86 @@ pub fn verdict(import: &SalesInvoicesImport, invoice: &Invoice) -> Verdict {
     Verdict::Done
 }
 
-/// Why [`submit`] failed.
+/// Why a sales invoice command stopped, raised where it is found, with the
+/// error kind the CLI reports.
 #[derive(Debug)]
-pub enum SubmitError {
-    /// Nothing reached Yuki, or Yuki refused it unprocessed
-    /// ([`Delivery::NotSent`], [`Delivery::Refused`]).
+pub enum InvoiceError {
+    /// From Yuki or the configuration; for [`submit`], nothing reached Yuki
+    /// or Yuki refused it unprocessed ([`Delivery::NotSent`],
+    /// [`Delivery::Refused`]). Its kind is the [`YukiError`]'s.
     Yuki(YukiError),
+    /// The invoice, its file, the flags or the number are not acceptable;
+    /// nothing was sent (`invalid_input`).
+    InvalidInput(String),
+    /// Not confirmed, or not confirmable without a prompt; nothing was sent.
+    ConfirmationRequired(String),
+    /// Yuki answered, but did not create or book it as asked.
+    Rejected(String),
+    /// Booked, but not emailed as asked.
+    SendIncomplete(String),
+    /// Booked under another reference than the number sent.
+    ReferenceMismatch(String),
     /// The request may have been processed, without an answer saying how
     /// ([`Delivery::Unknown`]): a timeout, a dropped connection, a fault.
     OutcomeUnknown(String),
 }
 
-impl From<YukiError> for SubmitError {
+impl InvoiceError {
+    /// The error kind; `error` for [`Yuki`](Self::Yuki), whose own kind the
+    /// CLI reports instead.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Yuki(_) => "error",
+            Self::InvalidInput(_) => "invalid_input",
+            Self::ConfirmationRequired(_) => "confirmation_required",
+            Self::Rejected(_) => "invoice_rejected",
+            Self::SendIncomplete(_) => "send_incomplete",
+            Self::ReferenceMismatch(_) => "reference_mismatch",
+            Self::OutcomeUnknown(_) => "outcome_unknown",
+        }
+    }
+
+    /// A configuration error is a problem with the input; anything else
+    /// stays a Yuki error.
+    pub fn input(e: YukiError) -> Self {
+        match e {
+            YukiError::Config(message) => Self::InvalidInput(message),
+            other => Self::Yuki(other),
+        }
+    }
+}
+
+impl std::fmt::Display for InvoiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Yuki(e) => write!(f, "{e}"),
+            Self::InvalidInput(m)
+            | Self::ConfirmationRequired(m)
+            | Self::Rejected(m)
+            | Self::SendIncomplete(m)
+            | Self::ReferenceMismatch(m)
+            | Self::OutcomeUnknown(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for InvoiceError {}
+
+impl From<YukiError> for InvoiceError {
     fn from(e: YukiError) -> Self {
         Self::Yuki(e)
+    }
+}
+
+impl Verdict {
+    /// The run's result: success when Yuki did as asked.
+    pub fn into_result(self) -> Result<(), InvoiceError> {
+        match self {
+            Self::Done => Ok(()),
+            Self::Rejected { message, .. } => Err(InvoiceError::Rejected(message)),
+            Self::SendIncomplete(message) => Err(InvoiceError::SendIncomplete(message)),
+            Self::ReferenceMismatch(message) => Err(InvoiceError::ReferenceMismatch(message)),
+        }
     }
 }
 
@@ -1816,6 +1894,169 @@ fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<
         OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
         OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The commands.
+
+/// What `sales invoice create` was asked.
+pub struct CreateArgs<'a> {
+    /// The invoice file or template; `None` with `prepared`.
+    pub source: Option<Source>,
+    pub overrides: Overrides<'a>,
+    /// A prepared invoice (`prepare --out`), booked exactly.
+    pub prepared: Option<&'a Path>,
+    /// A custom PDF, with `prepared` only.
+    pub pdf: Option<&'a Path>,
+    /// `None` is a draft.
+    pub send: Option<SendMode>,
+    pub dry_run: bool,
+    /// The invoice number, repeated, for a booking without a prompt.
+    pub confirm: Option<&'a str>,
+}
+
+/// `sales invoice create`.
+pub async fn create(
+    load_config: impl Fn() -> Result<Config, YukiError>,
+    admin: Option<&str>,
+    args: CreateArgs<'_>,
+    yes: bool,
+    quiet: bool,
+    format: Option<&str>,
+) -> Result<(), InvoiceError> {
+    if args.pdf.is_some() && args.prepared.is_none() {
+        return Err(InvoiceError::InvalidInput(
+            "--pdf needs --prepared: prepare the invoice with `sales invoice prepare --out <file.json>`, render the PDF from that file, then `create --prepared <file.json> --pdf <pdf>`".into(),
+        ));
+    }
+    // A prepared invoice: exactly that content, its number still reserved
+    // for it in this administration.
+    let mut binding: Option<String> = None;
+    let invoice = match (args.prepared, &args.source) {
+        (Some(path), _) => {
+            let send = args.send.ok_or_else(|| {
+                InvoiceError::InvalidInput(
+                    "a prepared invoice is booked: add --send email|peppol|both, or --book".into(),
+                )
+            })?;
+            let (json, hash) = read_prepared(path)?;
+            let (mut invoice, admin_id) =
+                Invoice::from_prepared(&json, &path.display().to_string(), send)?;
+            if let Some(pdf) = args.pdf {
+                invoice.attach_pdf(pdf)?;
+            }
+            let config = load_config()?;
+            if config.seller.is_none() {
+                return Err(seller_missing());
+            }
+            let target = config.target(admin)?;
+            if target.admin_id != admin_id {
+                return Err(InvoiceError::InvalidInput(format!(
+                    "{} was prepared for administration {admin_id}, not {} ({}): select it with --admin",
+                    path.display(),
+                    target.config_name,
+                    target.admin_id
+                )));
+            }
+            let number = invoice.number.as_deref().unwrap_or_default();
+            InvoiceLedger::peek()?.check_reserved(&admin_id, number, &hash)?;
+            binding = Some(hash);
+            invoice
+        }
+        (None, Some(source)) => load(source, &args.overrides, args.send)?,
+        (None, None) => unreachable!("clap requires --file, --template or --prepared"),
+    };
+    // A dry run makes no API call (and, unprepared, needs no configuration).
+    if args.dry_run {
+        if !quiet {
+            eprintln!("{}\n", invoice.preview(None));
+            eprintln!("Dry run: nothing was sent to Yuki. xmlDoc:");
+        }
+        println!("{}", invoice.to_display_xml());
+        return Ok(());
+    }
+    let config = load_config()?;
+    let target = config.target(admin)?;
+    crate::cli::invoice_ledger::warn(&InvoiceLedger::peek()?, target.admin_id);
+    // A booking without a prompt names the number it books.
+    if invoice.send.is_some() {
+        check_confirm(invoice.number.as_deref(), args.confirm, yes)?;
+    }
+    if !(quiet && yes) {
+        eprintln!("{}\n", invoice.preview(Some(target.config_name)));
+    } else if let Some(line) = invoice.booking_line() {
+        // Even quiet, a booking is announced.
+        eprintln!("{line}");
+    }
+    if !yes {
+        if !can_prompt() {
+            return Err(InvoiceError::ConfirmationRequired(
+                "sales invoice create writes to Yuki; pass --yes to confirm in non-interactive mode, or --dry-run to preview only".into(),
+            ));
+        }
+        if !confirm(&invoice.question())? {
+            return Err(InvoiceError::ConfirmationRequired(
+                "not confirmed: nothing was sent to Yuki".into(),
+            ));
+        }
+    }
+    submit_numbered(&config, admin, &invoice, binding.as_deref(), format, quiet)
+        .await?
+        .into_result()
+}
+
+/// `sales invoice prepare`: print the resolved invoice; with `out`, also
+/// write it there and reserve its number.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare(
+    load_config: impl Fn() -> Result<Config, YukiError>,
+    admin: Option<&str>,
+    source: &Source,
+    overrides: &Overrides<'_>,
+    number: Option<&crate::cli::invoice_number::NumberRequest>,
+    out: Option<&Path>,
+    quiet: bool,
+) -> Result<(), InvoiceError> {
+    let mut invoice = load(source, overrides, None)?;
+    // The config, when there is one, gives the issuing firm.
+    let config = match number {
+        Some(_) => Some(load_config()?),
+        None => load_config().ok(),
+    };
+    let seller = config.as_ref().and_then(|c| c.seller.as_ref());
+    if out.is_some() && seller.is_none() {
+        return Err(seller_missing());
+    }
+    if let Some(config) = &config
+        && let Ok(target) = config.target(admin)
+    {
+        crate::cli::invoice_ledger::warn(&InvoiceLedger::peek()?, target.admin_id);
+    }
+    if let (Some(request), Some(config)) = (number, &config) {
+        config.target(admin)?;
+        invoice.number =
+            Some(crate::cli::invoice_number::resolve(config, admin, request, &invoice.date).await?);
+    }
+    let json = match (out, &config) {
+        (Some(out), Some(config)) => {
+            let admin_id = config.target(admin)?.admin_id;
+            let json = write_prepared(&invoice, config, admin_id, out)?;
+            if !quiet {
+                let number = invoice.number.as_deref().unwrap_or_default();
+                let out = out.display();
+                eprintln!(
+                    "Reserved invoice number {number} for this content in {out}. Render the PDF from it, then: yuki sales invoice create --prepared {out} --pdf <pdf> --send email (add --yes --confirm {number} without a prompt; free the number instead with: yuki sales invoice numbers --resolve {number} --as rejected)"
+                );
+            }
+            json
+        }
+        _ => invoice.prepared_for(seller),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json).expect("serialize invoice")
+    );
+    Ok(())
 }
 
 /// List the saved templates, each validated as `create` would read it.

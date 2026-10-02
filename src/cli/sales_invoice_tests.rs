@@ -1003,12 +1003,16 @@ fn a_booking_without_the_prompt_names_its_number() {
         check_confirm(Some("2026-20"), None, false).is_ok(),
         "the prompt asks"
     );
-    let err = check_confirm(Some("2026-20"), None, true).unwrap_err();
+    let err = check_confirm(Some("2026-20"), None, true)
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("needs --confirm <number>: pass --confirm 2026-20"),
         "{err}"
     );
-    let err = check_confirm(Some("2026-20"), Some("2026-21"), false).unwrap_err();
+    let err = check_confirm(Some("2026-20"), Some("2026-21"), false)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("is not the invoice number 2026-20"), "{err}");
     assert!(check_confirm(None, Some("2026-20"), true).is_err());
     assert!(check_confirm(None, None, true).is_err());

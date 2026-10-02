@@ -9,6 +9,7 @@
 //! given this way, so once invoices are numbered here, number them all here.
 
 use crate::cli::invoice_ledger::{InvoiceLedger, Numbers};
+use crate::cli::sales_invoice::InvoiceError;
 use crate::cli::setup_domain;
 use crate::client::archive::ArchiveClient;
 use crate::config::Config;
@@ -163,10 +164,10 @@ pub async fn resolve(
     admin: Option<&str>,
     request: &NumberRequest,
     date: &str,
-) -> Result<String, YukiError> {
+) -> Result<String, InvoiceError> {
     let year: u32 = date[..4]
         .parse()
-        .map_err(|_| YukiError::Config(format!("'{date}' has no year")))?;
+        .map_err(|_| InvoiceError::InvalidInput(format!("'{date}' has no year")))?;
     let mut years = vec![year];
     if let NumberRequest::Given(number) = request
         && let Some(n) = year_number(number)
@@ -186,14 +187,14 @@ pub fn choose(
     archive: &[String],
     ledger: &Numbers,
     admin: &str,
-) -> Result<String, YukiError> {
+) -> Result<String, InvoiceError> {
     let held: Vec<String> = ledger.taken_numbers(admin).map(str::to_string).collect();
     let number = match request {
         NumberRequest::Auto => next_free(archive, &held, year),
         NumberRequest::Given(number) => number.clone(),
     };
     if taken(archive, &number) {
-        return Err(YukiError::Config(format!(
+        return Err(InvoiceError::InvalidInput(format!(
             "invoice number {number} is already in the sales archive"
         )));
     }
@@ -207,7 +208,7 @@ pub fn choose(
             }
             _ => "booked",
         });
-        return Err(YukiError::Config(format!(
+        return Err(InvoiceError::InvalidInput(format!(
             "invoice number {number} was already given out: {status}"
         )));
     }

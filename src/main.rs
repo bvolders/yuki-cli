@@ -4,6 +4,7 @@ use std::process;
 use clap::{CommandFactory, Parser};
 use owo_colors::OwoColorize;
 use yuki_cli::cli::Commands;
+use yuki_cli::cli::sales_invoice::InvoiceError;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
     DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, SalesCommands,
@@ -17,17 +18,9 @@ use yuki_cli::output::{ListOptions, format_error_json, is_tty};
 enum AppError {
     Yuki(YukiError),
     Other(anyhow::Error),
-    ConfirmationRequired(String),
-    /// Yuki answered, but did not accept every invoice.
-    InvoiceRejected(String),
-    /// An invoice file or template that cannot be read or is invalid.
-    InvalidInput(String),
-    /// A write whose request went out without a usable answer.
-    OutcomeUnknown(String),
-    /// Yuki booked an invoice under another reference than the number sent.
-    ReferenceMismatch(String),
-    /// Yuki booked an invoice but did not email it as asked.
-    SendIncomplete(String),
+    /// A failure with its own error kind (`invalid_input`,
+    /// `confirmation_required`, `outcome_unknown`, …), always exit code 1.
+    Kinded(&'static str, String),
 }
 
 impl fmt::Display for AppError {
@@ -35,14 +28,7 @@ impl fmt::Display for AppError {
         match self {
             Self::Yuki(e) => write!(f, "{e}"),
             Self::Other(e) => write!(f, "{e}"),
-            Self::ConfirmationRequired(message)
-            | Self::InvoiceRejected(message)
-            | Self::InvalidInput(message)
-            | Self::OutcomeUnknown(message)
-            | Self::ReferenceMismatch(message)
-            | Self::SendIncomplete(message) => {
-                write!(f, "{message}")
-            }
+            Self::Kinded(_, message) => write!(f, "{message}"),
         }
     }
 }
@@ -59,17 +45,24 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+impl From<InvoiceError> for AppError {
+    fn from(e: InvoiceError) -> Self {
+        match e {
+            InvoiceError::Yuki(e) => Self::Yuki(e),
+            other => Self::Kinded(other.kind(), other.to_string()),
+        }
+    }
+}
+
 impl AppError {
+    fn confirmation_required(message: impl Into<String>) -> Self {
+        Self::Kinded("confirmation_required", message.into())
+    }
+
     fn exit_code(&self) -> u8 {
         match self {
             Self::Yuki(e) => e.exit_code(),
-            Self::Other(_) => 1,
-            Self::ConfirmationRequired(_)
-            | Self::InvoiceRejected(_)
-            | Self::InvalidInput(_)
-            | Self::OutcomeUnknown(_)
-            | Self::ReferenceMismatch(_)
-            | Self::SendIncomplete(_) => 1,
+            Self::Other(_) | Self::Kinded(..) => 1,
         }
     }
 
@@ -83,21 +76,8 @@ impl AppError {
                 _ => "error",
             },
             Self::Other(_) => "error",
-            Self::ConfirmationRequired(_) => "confirmation_required",
-            Self::InvoiceRejected(_) => "invoice_rejected",
-            Self::InvalidInput(_) => "invalid_input",
-            Self::OutcomeUnknown(_) => "outcome_unknown",
-            Self::ReferenceMismatch(_) => "reference_mismatch",
-            Self::SendIncomplete(_) => "send_incomplete",
+            Self::Kinded(kind, _) => kind,
         }
-    }
-}
-
-/// A configuration error from reading an invoice is a problem with the input.
-fn invalid_input(e: YukiError) -> AppError {
-    match e {
-        YukiError::Config(message) => AppError::InvalidInput(message),
-        other => other.into(),
     }
 }
 
@@ -213,8 +193,8 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                 }
                 ProfileCommands::Remove { name } => {
                     if !cli.yes {
-                        return Err(AppError::ConfirmationRequired(
-                            "profile removal requires --yes".into(),
+                        return Err(AppError::confirmation_required(
+                            "profile removal requires --yes",
                         ));
                     }
                     yuki_cli::cli::account::profile_remove(&mut config, &name, format, cli.quiet)?;
@@ -473,193 +453,43 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         dry_run,
                         confirm,
                     } => {
-                        use yuki_cli::cli::invoice_ledger::InvoiceLedger;
-                        use yuki_cli::cli::sales_invoice::{self, Invoice, SendMode};
-                        let send = if book { Some(SendMode::Book) } else { send };
-                        if pdf.is_some() && prepared.is_none() {
-                            return Err(AppError::InvalidInput(
-                                "--pdf needs --prepared: prepare the invoice with `sales invoice prepare --out <file.json>`, render the PDF from that file, then `create --prepared <file.json> --pdf <pdf>`".into(),
-                            ));
-                        }
-                        // A prepared invoice: exactly that content, its number
-                        // still reserved for it in this administration.
-                        let mut binding: Option<String> = None;
-                        let invoice = match &prepared {
-                            Some(file) => {
-                                let send = send.ok_or_else(|| {
-                                    AppError::InvalidInput(
-                                        "a prepared invoice is booked: add --send email|peppol|both, or --book".into(),
-                                    )
-                                })?;
-                                let path = std::path::Path::new(file);
-                                let (json, hash) =
-                                    sales_invoice::read_prepared(path).map_err(invalid_input)?;
-                                let (mut invoice, admin_id) =
-                                    Invoice::from_prepared(&json, file, send)
-                                        .map_err(invalid_input)?;
-                                if let Some(pdf) = &pdf {
-                                    invoice
-                                        .attach_pdf(std::path::Path::new(pdf))
-                                        .map_err(invalid_input)?;
-                                }
-                                let config = load()?;
-                                if config.seller.is_none() {
-                                    return Err(invalid_input(sales_invoice::seller_missing()));
-                                }
-                                let target = config.target(admin)?;
-                                if target.admin_id != admin_id {
-                                    return Err(AppError::InvalidInput(format!(
-                                        "{file} was prepared for administration {admin_id}, not {} ({}): select it with --admin",
-                                        target.config_name, target.admin_id
-                                    )));
-                                }
-                                let number = invoice.number.as_deref().unwrap_or_default();
-                                InvoiceLedger::peek()?
-                                    .check_reserved(&admin_id, number, &hash)
-                                    .map_err(invalid_input)?;
-                                binding = Some(hash);
-                                invoice
-                            }
-                            None => {
-                                sales_invoice::load(&inputs.source(), &inputs.overrides(), send)
-                                    .map_err(invalid_input)?
-                            }
+                        use yuki_cli::cli::sales_invoice::{self, CreateArgs, SendMode};
+                        let args = CreateArgs {
+                            source: inputs.source(),
+                            overrides: inputs.overrides(),
+                            prepared: prepared.as_deref().map(std::path::Path::new),
+                            pdf: pdf.as_deref().map(std::path::Path::new),
+                            send: if book { Some(SendMode::Book) } else { send },
+                            dry_run,
+                            confirm: confirm.as_deref(),
                         };
-                        // A dry run makes no API call (and, unprepared, needs no
-                        // configuration).
-                        if dry_run {
-                            if !cli.quiet {
-                                eprintln!("{}\n", invoice.preview(None));
-                                eprintln!("Dry run: nothing was sent to Yuki. xmlDoc:");
-                            }
-                            println!("{}", invoice.to_display_xml());
-                            return Ok(());
-                        }
-                        let config = load()?;
-                        let target = config.target(admin)?;
-                        yuki_cli::cli::invoice_ledger::warn(
-                            &InvoiceLedger::peek()?,
-                            target.admin_id,
-                        );
-                        // A booking without a prompt names the number it books.
-                        if invoice.send.is_some() {
-                            sales_invoice::check_confirm(
-                                invoice.number.as_deref(),
-                                confirm.as_deref(),
-                                cli.yes,
-                            )
-                            .map_err(AppError::ConfirmationRequired)?;
-                        }
-                        if !(cli.quiet && cli.yes) {
-                            eprintln!("{}\n", invoice.preview(Some(target.config_name)));
-                        } else if let Some(line) = invoice.booking_line() {
-                            // Even quiet, a booking is announced.
-                            eprintln!("{line}");
-                        }
-                        if !cli.yes {
-                            if !sales_invoice::can_prompt() {
-                                return Err(AppError::ConfirmationRequired(
-                                    "sales invoice create writes to Yuki; pass --yes to confirm in non-interactive mode, or --dry-run to preview only".into(),
-                                ));
-                            }
-                            if !sales_invoice::confirm(&invoice.question())? {
-                                return Err(AppError::ConfirmationRequired(
-                                    "not confirmed: nothing was sent to Yuki".into(),
-                                ));
-                            }
-                        }
-                        let verdict = sales_invoice::submit_numbered(
-                            &config,
-                            admin,
-                            &invoice,
-                            binding.as_deref(),
-                            format,
-                            cli.quiet,
-                        )
-                        .await
-                        .map_err(|e| match e {
-                            sales_invoice::SubmitError::Yuki(e) => AppError::from(e),
-                            sales_invoice::SubmitError::OutcomeUnknown(message) => {
-                                AppError::OutcomeUnknown(message)
-                            }
-                        })?;
-                        match verdict {
-                            sales_invoice::Verdict::Done => {}
-                            sales_invoice::Verdict::Rejected { message, .. } => {
-                                return Err(AppError::InvoiceRejected(message));
-                            }
-                            sales_invoice::Verdict::ReferenceMismatch(message) => {
-                                return Err(AppError::ReferenceMismatch(message));
-                            }
-                            sales_invoice::Verdict::SendIncomplete(message) => {
-                                return Err(AppError::SendIncomplete(message));
-                            }
-                        }
+                        sales_invoice::create(load, admin, args, cli.yes, cli.quiet, format)
+                            .await?;
                     }
                     SalesInvoiceCommands::Prepare {
                         inputs,
                         number,
                         out,
                     } => {
-                        use yuki_cli::cli::{invoice_number, sales_invoice};
-                        let mut invoice =
-                            sales_invoice::load(&inputs.source(), &inputs.overrides(), None)
-                                .map_err(invalid_input)?;
-                        // The config, when there is one, gives the issuing firm.
-                        let config = match &number {
-                            Some(_) => Some(load()?),
-                            None => load().ok(),
-                        };
-                        let seller = config.as_ref().and_then(|c| c.seller.as_ref());
-                        if out.is_some() && seller.is_none() {
-                            return Err(invalid_input(sales_invoice::seller_missing()));
-                        }
-                        if let Some(config) = &config
-                            && let Ok(target) = config.target(admin)
-                        {
-                            use yuki_cli::cli::invoice_ledger::{InvoiceLedger, warn};
-                            warn(&InvoiceLedger::peek()?, target.admin_id);
-                        }
-                        if let (Some(request), Some(config)) = (&number, &config) {
-                            config.target(admin)?;
-                            invoice.number = Some(
-                                invoice_number::resolve(config, admin, request, &invoice.date)
-                                    .await
-                                    .map_err(invalid_input)?,
-                            );
-                        }
-                        let json = match (&out, &config, seller) {
-                            (Some(out), Some(config), Some(_)) => {
-                                let admin_id = config.target(admin)?.admin_id;
-                                let json = sales_invoice::write_prepared(
-                                    &invoice,
-                                    config,
-                                    admin_id,
-                                    std::path::Path::new(out),
-                                )
-                                .map_err(invalid_input)?;
-                                if !cli.quiet {
-                                    let number = invoice.number.as_deref().unwrap_or_default();
-                                    eprintln!(
-                                        "Reserved invoice number {number} for this content in {out}. Render the PDF from it, then: yuki sales invoice create --prepared {out} --pdf <pdf> --send email (add --yes --confirm {number} without a prompt; free the number instead with: yuki sales invoice numbers --release {number})"
-                                    );
-                                }
-                                json
-                            }
-                            _ => invoice.prepared_for(seller),
-                        };
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json).expect("serialize invoice")
-                        );
+                        let source = inputs.source().expect("clap requires --file or --template");
+                        yuki_cli::cli::sales_invoice::prepare(
+                            load,
+                            admin,
+                            &source,
+                            &inputs.overrides(),
+                            number.as_ref(),
+                            out.as_deref().map(std::path::Path::new),
+                            cli.quiet,
+                        )
+                        .await?;
                     }
                     SalesInvoiceCommands::Numbers {
                         resolve,
                         resolution,
                     } => {
-                        let config = load()?;
                         yuki_cli::cli::invoice_ledger::numbers(
-                            config.target(admin)?.admin_id,
+                            &load()?,
+                            admin,
                             resolve.as_deref().zip(resolution),
                             format,
                         )?;
@@ -842,7 +672,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     {
                         Outcome::Done => {}
                         Outcome::NeedsConfirmation(message) => {
-                            return Err(AppError::ConfirmationRequired(message));
+                            return Err(AppError::confirmation_required(message));
                         }
                         Outcome::NeedsAttention(message) => {
                             return Err(AppError::Other(anyhow::anyhow!(message)));
@@ -890,8 +720,8 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                 } => {
                     // Require explicit confirmation for non-interactive uploads.
                     if !yuki_cli::cli::interactive() && !cli.yes {
-                        return Err(AppError::ConfirmationRequired(
-                            "upload file is a mutating operation; pass --yes to confirm in non-interactive mode".into(),
+                        return Err(AppError::confirmation_required(
+                            "upload file is a mutating operation; pass --yes to confirm in non-interactive mode",
                         ));
                     }
                     let config = load()?;
