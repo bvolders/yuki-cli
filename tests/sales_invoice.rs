@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{RequestLog, mock_yuki, soap_response, yuki};
+use common::{RequestLog, actions, bodies, json, response, stderr, yuki};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -64,64 +64,34 @@ const SALES_ARCHIVE: &str = r#"<Documents xmlns="">
 </Documents>"#;
 
 fn mock(result: String) -> (String, RequestLog) {
-    mock_yuki(move |action, _| match action {
-        "Authenticate" => soap_response("Authenticate", "session-1"),
-        "ProcessSalesInvoices" => soap_response("ProcessSalesInvoices", &result),
-        "SetCurrentDomain" => soap_response("SetCurrentDomain", ""),
-        "DocumentsInFolder" => soap_response("DocumentsInFolder", SALES_ARCHIVE),
+    common::mock(move |r| match r.action.as_str() {
+        "Authenticate" => (200, response("Authenticate", "session-1")),
+        "ProcessSalesInvoices" => (200, response("ProcessSalesInvoices", &result)),
+        "SetCurrentDomain" => (200, response("SetCurrentDomain", "")),
+        "DocumentsInFolder" => (200, response("DocumentsInFolder", SALES_ARCHIVE)),
         other => panic!("unexpected call {other}"),
     })
 }
 
-fn home_with_config(root: &str) -> TempDir {
-    let home = TempDir::new().expect("temp home");
-    let dir = home.path().join(".config/yuki");
-    std::fs::create_dir_all(dir.join("invoices")).expect("config dir");
-    std::fs::write(
-        dir.join("config.toml"),
-        format!(
-            r#"api_key = "test-key"
-default_admin = "example"
-region = "be"
-
-[administrations.example]
-domain_id = "domain-1"
-admin_id = "admin-1"
-name = "Example BV"
-base_url = "{root}"
-"#
-        ),
-    )
-    .expect("write config");
-    std::fs::write(dir.join("invoices/hosting.toml"), TEMPLATE).expect("write template");
+fn home(root: &str) -> TempDir {
+    let home = common::home_with_config(root, "test-key", "");
+    let dir = home.path().join(".config/yuki/invoices");
+    std::fs::create_dir_all(&dir).expect("invoices dir");
+    std::fs::write(dir.join("hosting.toml"), TEMPLATE).expect("write template");
     home
 }
 
-fn actions(log: &RequestLog) -> Vec<String> {
-    log.lock()
-        .expect("log")
-        .iter()
-        .map(|r| r.action.clone())
-        .collect()
-}
-
 fn sent_body(log: &RequestLog) -> String {
-    log.lock()
-        .expect("log")
-        .iter()
-        .find(|r| r.action == "ProcessSalesInvoices")
-        .map(|r| r.body.clone())
+    bodies(log, "ProcessSalesInvoices")
+        .into_iter()
+        .next()
         .expect("ProcessSalesInvoices was called")
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 #[test]
 fn a_template_draft_is_created_with_yes() {
     let (root, log) = mock(import_response(true, false, false, ""));
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = yuki(
         &home,
         &[
@@ -140,7 +110,7 @@ fn a_template_draft_is_created_with_yes() {
         ],
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    let json = json(&output);
     assert_eq!(json["total"], 1);
     assert_eq!(json["items"][0]["Succeeded"], "Yes");
     assert_eq!(json["items"][0]["Processed"], "No");
@@ -173,7 +143,7 @@ fn send_email_books_and_emails_the_invoice() {
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     let (root, log) = mock(escaped);
-    let home = home_with_config(&root);
+    let home = home(&root);
     let file = home.path().join("adhoc.toml");
     std::fs::write(&file, AD_HOC).expect("write invoice");
     let output = yuki(
@@ -192,7 +162,7 @@ fn send_email_books_and_emails_the_invoice() {
         ],
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    let json = json(&output);
     let row = &json["items"][0];
     assert_eq!(
         (&row["Processed"], &row["Email Sent"], &row["Reference"]),
@@ -229,7 +199,7 @@ fn a_send_yuki_did_not_carry_out_fails_even_when_quiet() {
         (true, false, "did not email it"),
     ] {
         let (root, _log) = mock(import_response(true, processed, email_sent, "2026-0043"));
-        let home = home_with_config(&root);
+        let home = home(&root);
         let output = yuki(
             &home,
             &[
@@ -254,7 +224,7 @@ fn a_send_yuki_did_not_carry_out_fails_even_when_quiet() {
 #[test]
 fn a_rejected_invoice_exits_non_zero_after_printing_yukis_answer() {
     let (root, _log) = mock(import_response(false, false, false, ""));
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = yuki(
         &home,
         &[
@@ -269,7 +239,7 @@ fn a_rejected_invoice_exits_non_zero_after_printing_yukis_answer() {
         ],
     );
     assert_eq!(output.status.code(), Some(1));
-    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    let json = json(&output);
     assert_eq!(json["items"][0]["Message"], "Contact not found");
     let err = stderr(&output);
     let envelope: Value =
@@ -287,7 +257,7 @@ fn a_rejected_invoice_exits_non_zero_after_printing_yukis_answer() {
 #[test]
 fn a_dry_run_prints_the_document_and_makes_no_call() {
     let (root, log) = mock(String::new());
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = yuki(
         &home,
         &[
@@ -339,7 +309,7 @@ fn a_dry_run_needs_no_configuration() {
 #[test]
 fn without_a_terminal_it_refuses_unless_yes_is_given() {
     let (root, log) = mock(String::new());
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = yuki(
         &home,
         &["sales", "invoice", "create", "--template", "hosting"],
@@ -354,7 +324,7 @@ fn without_a_terminal_it_refuses_unless_yes_is_given() {
 #[test]
 fn an_invalid_file_is_reported_before_anything_else() {
     let (root, log) = mock(String::new());
-    let home = home_with_config(&root);
+    let home = home(&root);
     let file = home.path().join("bad.toml");
     std::fs::write(&file, AD_HOC.replace("country = \"BE\"\n", "")).expect("write invoice");
     let output = yuki(
@@ -377,7 +347,7 @@ fn an_invalid_file_is_reported_before_anything_else() {
 
 #[test]
 fn templates_lists_valid_and_invalid_templates() {
-    let home = home_with_config("http://127.0.0.1:9/ws");
+    let home = home("http://127.0.0.1:9/ws");
     let dir = home.path().join(".config/yuki/invoices");
     std::fs::write(dir.join("broken.toml"), "[contact]\n").expect("write template");
     std::fs::write(dir.join("notes.txt"), "not a template").expect("write other file");
@@ -386,7 +356,7 @@ fn templates_lists_valid_and_invalid_templates() {
         &["sales", "invoice", "templates", "--output", "json"],
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    let json = json(&output);
     let items = json["items"].as_array().expect("items");
     assert_eq!(items.len(), 2, "{json}");
     assert_eq!(items[0]["Name"], "broken");
@@ -403,7 +373,7 @@ fn templates_lists_valid_and_invalid_templates() {
 #[test]
 fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
     let (root, log) = mock(import_response(true, true, false, "2026-20"));
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = home.path().join(".config/yuki/invoices");
     let pdf = b"%PDF-1.7\nmade-up invoice body\n%%EOF\n";
     std::fs::write(dir.join("hosting.pdf"), pdf).expect("write pdf");
@@ -462,7 +432,7 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
         ],
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    let json = json(&output);
     // The archive file is named after the number, not the local file.
     assert_eq!(json["items"][0]["PDF"], "Invoice 2026-20.pdf");
     let body = sent_body(&log);
@@ -479,7 +449,7 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
 #[test]
 fn a_template_with_a_pdf_is_refused() {
     let (root, log) = mock(String::new());
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = home.path().join(".config/yuki/invoices");
     std::fs::write(
         dir.join("monthly.toml"),
@@ -505,11 +475,11 @@ fn a_template_with_a_pdf_is_refused() {
 #[test]
 fn a_lost_answer_warns_that_the_invoice_may_exist() {
     // The mock drops the connection once it has read the request.
-    let (root, log) = mock_yuki(|action, _| match action {
-        "Authenticate" => soap_response("Authenticate", "session-1"),
-        _ => String::new(),
+    let (root, log) = common::mock(|r| match r.action.as_str() {
+        "Authenticate" => (200, response("Authenticate", "session-1")),
+        _ => (0, String::new()),
     });
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = yuki(
         &home,
         &[
@@ -534,7 +504,7 @@ fn a_lost_answer_warns_that_the_invoice_may_exist() {
 #[test]
 fn number_auto_takes_the_next_number_from_the_sales_archive() {
     let (root, log) = mock(import_response(true, true, false, "2026-20"));
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = yuki(
         &home,
         &[
@@ -584,7 +554,7 @@ fn number_auto_takes_the_next_number_from_the_sales_archive() {
 #[test]
 fn a_number_already_in_the_archive_is_refused_before_any_write() {
     let (root, log) = mock(String::new());
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = yuki(
         &home,
         &[
@@ -635,7 +605,7 @@ fn a_dry_run_cannot_pick_an_automatic_number() {
 #[test]
 fn prepare_and_create_agree_on_every_figure() {
     let (root, log) = mock(String::new());
-    let home = home_with_config(&root);
+    let home = home(&root);
     let args = [
         "--template",
         "hosting",
@@ -652,7 +622,7 @@ fn prepare_and_create_agree_on_every_figure() {
     prepare.extend_from_slice(&args);
     let output = yuki(&home, &prepare);
     assert!(output.status.success(), "{}", stderr(&output));
-    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    let json = json(&output);
     assert_eq!(json["number"], "2026-20");
     assert_eq!(json["date"]["text"], "30 september 2026");
     assert_eq!(json["due_date"]["iso"], "2026-10-30");
@@ -697,7 +667,7 @@ fn prepare_and_create_agree_on_every_figure() {
 fn ledger_rows(home: &TempDir) -> Vec<Value> {
     let output = yuki(home, &["sales", "invoice", "numbers", "--output", "json"]);
     assert!(output.status.success(), "{}", stderr(&output));
-    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    let json = json(&output);
     json["items"].as_array().cloned().unwrap_or_default()
 }
 
@@ -722,7 +692,7 @@ fn book_number(home: &TempDir, number: &str) -> std::process::Output {
 #[test]
 fn the_ledger_records_a_booking_and_blocks_the_number() {
     let (root, _log) = mock(import_response(true, true, false, "2026-20"));
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = book_number(&home, "2026-20");
     assert!(output.status.success(), "{}", stderr(&output));
     // Quiet, a booking still says so in one line.
@@ -758,14 +728,14 @@ fn the_ledger_records_a_booking_and_blocks_the_number() {
             "auto",
         ],
     );
-    let json: Value = serde_json::from_slice(&prepare.stdout).expect("JSON stdout");
+    let json = json(&prepare);
     assert_eq!(json["number"], "2026-21");
 }
 
 #[test]
 fn a_clean_rejection_frees_the_number() {
     let (root, _log) = mock(import_response(false, false, false, ""));
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = book_number(&home, "2026-20");
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(ledger_rows(&home)[0]["Status"], "rejected");
@@ -783,19 +753,19 @@ fn a_clean_rejection_frees_the_number() {
             "auto",
         ],
     );
-    let json: Value = serde_json::from_slice(&prepare.stdout).expect("JSON stdout");
+    let json = json(&prepare);
     assert_eq!(json["number"], "2026-20");
 }
 
 #[test]
 fn an_unknown_outcome_keeps_the_number_pending_until_resolved() {
-    let (root, _log) = mock_yuki(|action, _| match action {
-        "Authenticate" => soap_response("Authenticate", "session-1"),
-        "SetCurrentDomain" => soap_response("SetCurrentDomain", ""),
-        "DocumentsInFolder" => soap_response("DocumentsInFolder", SALES_ARCHIVE),
-        _ => String::new(),
+    let (root, _log) = common::mock(|r| match r.action.as_str() {
+        "Authenticate" => (200, response("Authenticate", "session-1")),
+        "SetCurrentDomain" => (200, response("SetCurrentDomain", "")),
+        "DocumentsInFolder" => (200, response("DocumentsInFolder", SALES_ARCHIVE)),
+        _ => (0, String::new()),
     });
-    let home = home_with_config(&root);
+    let home = home(&root);
     let output = book_number(&home, "2026-20");
     assert_eq!(output.status.code(), Some(1));
     let err = stderr(&output);

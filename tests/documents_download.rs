@@ -3,8 +3,7 @@
 
 mod common;
 
-use common::{RequestLog, mock_yuki, soap_response, yuki};
-use serde_json::Value;
+use common::{RequestLog, actions, json, response, yuki};
 use tempfile::TempDir;
 
 /// `%PDF-1.4 made-up` in base64, with a line break as Yuki may send it.
@@ -12,17 +11,23 @@ const PDF_BASE64: &str = "JVBERi0xLjQg\nbWFkZS11cA==";
 const PDF: &[u8] = b"%PDF-1.4 made-up";
 
 fn mock() -> (String, RequestLog) {
-    mock_yuki(|action, _| match action {
-        "Authenticate" => soap_response("Authenticate", "session-1"),
-        "FindDocument" => soap_response(
-            "FindDocument",
-            r#"<Document ID="doc-1"><Subject>Invoice</Subject><FileName>Invoice 2026-19.pdf</FileName></Document>"#,
+    common::mock(|r| match r.action.as_str() {
+        "Authenticate" => (200, response("Authenticate", "session-1")),
+        "FindDocument" => (
+            200,
+            response(
+                "FindDocument",
+                r#"<Document ID="doc-1"><Subject>Invoice</Subject><FileName>Invoice 2026-19.pdf</FileName></Document>"#,
+            ),
         ),
-        "DocumentBinaryData" => soap_response("DocumentBinaryData", PDF_BASE64),
-        "GetTransactionDocument" => soap_response(
-            "GetTransactionDocument",
-            &format!(
-                "<fileName>../Factuur &amp; co.pdf</fileName><filedata>{PDF_BASE64}</filedata>"
+        "DocumentBinaryData" => (200, response("DocumentBinaryData", PDF_BASE64)),
+        "GetTransactionDocument" => (
+            200,
+            response(
+                "GetTransactionDocument",
+                &format!(
+                    "<fileName>../Factuur &amp; co.pdf</fileName><filedata>{PDF_BASE64}</filedata>"
+                ),
             ),
         ),
         other => panic!("unexpected call {other}"),
@@ -30,26 +35,7 @@ fn mock() -> (String, RequestLog) {
 }
 
 fn home_with_config(root: &str) -> TempDir {
-    let home = TempDir::new().expect("temp home");
-    let dir = home.path().join(".config/yuki");
-    std::fs::create_dir_all(&dir).expect("config dir");
-    std::fs::write(
-        dir.join("config.toml"),
-        format!(
-            "api_key = \"test-key\"\ndefault_admin = \"example\"\n\n[administrations.example]\n\
-             domain_id = \"domain-1\"\nadmin_id = \"admin-1\"\nbase_url = \"{root}\"\n"
-        ),
-    )
-    .expect("write config");
-    home
-}
-
-fn actions(log: &RequestLog) -> Vec<String> {
-    log.lock()
-        .expect("log")
-        .iter()
-        .map(|r| r.action.clone())
-        .collect()
+    common::home_with_config(root, "test-key", "")
 }
 
 #[test]
@@ -77,7 +63,7 @@ fn download_saves_the_file_under_its_archive_name() {
     );
     let saved = dir.join("Invoice 2026-19.pdf");
     assert_eq!(std::fs::read(&saved).unwrap(), PDF);
-    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let json = json(&output);
     assert_eq!(json["items"][0]["Bytes"], PDF.len().to_string());
     assert_eq!(
         actions(&log),

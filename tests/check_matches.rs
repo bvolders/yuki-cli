@@ -4,8 +4,7 @@
 
 mod common;
 
-use common::{RequestLog, mock_yuki, soap_response as response, yuki};
-use serde_json::Value;
+use common::{RequestLog, json, response, yuki};
 use tempfile::TempDir;
 
 fn item(contact: &str, date: &str, open: &str, country: &str, method: &str) -> String {
@@ -109,44 +108,16 @@ fn outstanding() -> String {
 
 /// Serve the mock on a random port; returns the API root and the request log.
 fn mock() -> (String, RequestLog) {
-    mock_yuki(|action, body| match action {
-        "Authenticate" => response("Authenticate", "session-1"),
-        "SetCurrentDomain" => response("SetCurrentDomain", ""),
-        "OutstandingCreditorItems" => outstanding(),
-        "GLAccountTransactionsAndContact" => {
-            let account = body
-                .split("<yuki:GLAccountCode>")
-                .nth(1)
-                .and_then(|rest| rest.split('<').next())
-                .unwrap_or_default();
-            gl(account)
-        }
-        other => response(other, ""),
+    common::mock(|r| match r.action.as_str() {
+        "Authenticate" => (200, response("Authenticate", "session-1")),
+        "OutstandingCreditorItems" => (200, outstanding()),
+        "GLAccountTransactionsAndContact" => (200, gl(r.param("GLAccountCode"))),
+        other => (200, response(other, "")),
     })
 }
 
 fn home_with_config(root: &str) -> TempDir {
-    let home = TempDir::new().expect("temp home");
-    let dir = home.path().join(".config/yuki");
-    std::fs::create_dir_all(&dir).expect("config dir");
-    std::fs::write(
-        dir.join("config.toml"),
-        format!(
-            r#"api_key = "test-key"
-default_admin = "example"
-region = "be"
-
-[administrations.example]
-domain_id = "domain-1"
-admin_id = "admin-1"
-name = "Example BV"
-base_url = "{root}"
-bank_accounts = ["550000"]
-"#
-        ),
-    )
-    .expect("write config");
-    home
+    common::home_with_config(root, "test-key", "bank_accounts = [\"550000\"]\n")
 }
 
 #[test]
@@ -156,7 +127,7 @@ fn check_matches_labels_every_open_item_from_the_mocked_ledger() {
     let output = yuki(&home, &["check", "matches", "--output", "json"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "check matches failed: {stderr}");
-    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    let json = json(&output);
     let rows = json["items"].as_array().expect("items");
     let label = |supplier: &str, open: &str| {
         let row = rows

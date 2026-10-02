@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{RequestLog, mock_yuki, soap_response, yuki};
+use common::{RequestLog, bodies, response, stdout_json, yuki};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -32,15 +32,16 @@ fn page_number(body: &str) -> u32 {
 /// A mock whose listings answer `page(n)` for page `n`, and only for the
 /// domain of the administration selected with `--admin second`.
 fn mock(page: fn(u32) -> String) -> (String, RequestLog) {
-    mock_yuki(move |action, body| match action {
-        "Authenticate" => soap_response("Authenticate", "session-1"),
-        "SearchContacts" | "GetSuppliersAndCustomers" => {
-            let inner = if body.contains("<yuki:domainID>domain-2</yuki:domainID>") {
-                page(page_number(body))
+    common::mock(move |r| match r.action.as_str() {
+        "Authenticate" => (200, response("Authenticate", "session-1")),
+        action @ ("SearchContacts" | "GetSuppliersAndCustomers") => {
+            let inner = if r.param("domainID") == "domain-2" {
+                page(page_number(&r.body))
             } else {
                 String::new()
             };
-            soap_response(action, &format!("<Contacts xmlns=\"\">{inner}</Contacts>"))
+            let reply = format!("<Contacts xmlns=\"\">{inner}</Contacts>");
+            (200, response(action, &reply))
         }
         other => panic!("unexpected call {other}"),
     })
@@ -48,50 +49,20 @@ fn mock(page: fn(u32) -> String) -> (String, RequestLog) {
 
 /// Two administrations; the tests select the second, which is not the default.
 fn home_with_config(root: &str) -> TempDir {
-    let home = TempDir::new().expect("temp home");
-    let dir = home.path().join(".config/yuki");
-    std::fs::create_dir_all(&dir).expect("config dir");
-    std::fs::write(
-        dir.join("config.toml"),
-        format!(
-            r#"api_key = "test-key"
-default_admin = "first"
-
-[administrations.first]
-domain_id = "domain-1"
-admin_id = "admin-1"
-base_url = "{root}"
-
-[administrations.second]
-domain_id = "domain-2"
-admin_id = "admin-2"
-base_url = "{root}"
-"#
-        ),
-    )
-    .expect("write config");
-    home
+    let second = format!(
+        "\n[administrations.second]\ndomain_id = \"domain-2\"\nadmin_id = \"admin-2\"\nbase_url = \"{root}\"\n"
+    );
+    common::home_with_config(root, "test-key", &second)
 }
 
 fn run(home: &TempDir, args: &[&str]) -> Value {
     let mut all = vec!["--admin", "second", "--output", "json"];
     all.extend_from_slice(args);
-    let output = yuki(home, &all);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("JSON stdout")
+    stdout_json(yuki(home, &all))
 }
 
 fn calls(log: &RequestLog, action: &str) -> Vec<String> {
-    log.lock()
-        .expect("log")
-        .iter()
-        .filter(|r| r.action == action)
-        .map(|r| r.body.clone())
-        .collect()
+    bodies(log, action)
 }
 
 #[test]
@@ -182,7 +153,7 @@ fn a_listing_stops_at_the_page_cap_and_says_so() {
         &["--admin", "second", "--output", "json", "contacts", "list"],
     );
     assert!(output.status.success());
-    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    let json = common::json(&output);
     assert_eq!(json["total"], 5000);
     assert_eq!(calls(&log, "GetSuppliersAndCustomers").len(), 50);
     let err = String::from_utf8_lossy(&output.stderr);

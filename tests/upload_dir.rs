@@ -11,54 +11,25 @@
 //!
 //! The access key "bad-key" is refused at Authenticate.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod common;
 
-use common::yuki;
+use common::{Request, RequestLog as Log, fault, json, response, stderr, yuki};
 use serde_json::Value;
 use tempfile::TempDir;
 
 const STATE: &str = ".yuki-sync.json";
-
-fn envelope(body: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>{body}</soap:Body></soap:Envelope>"#
-    )
-}
-
-fn response(op: &str, inner: &str) -> String {
-    envelope(&format!(
-        r#"<{op}Response xmlns="http://www.theyukicompany.com/"><{op}Result>{inner}</{op}Result></{op}Response>"#
-    ))
-}
-
-fn fault(message: &str) -> String {
-    envelope(&format!(
-        "<soap:Fault><faultcode>soap:Server</faultcode><faultstring>{message}</faultstring></soap:Fault>"
-    ))
-}
 
 fn document(id: &str, date: &str, contact: &str, file: &str) -> String {
     format!(
         "<Document ID=\"{id}\"><Subject>Factuur</Subject><DocumentDate>{date}T00:00:00</DocumentDate>\
          <Amount>1.00</Amount><ContactName>{contact}</ContactName><FileName>{file}</FileName></Document>"
     )
-}
-
-/// The raw (still escaped) text of a request parameter.
-fn param<'a>(body: &'a str, name: &str) -> &'a str {
-    body.split(&format!("<yuki:{name}>"))
-        .nth(1)
-        .and_then(|rest| rest.split("</yuki:").next())
-        .unwrap_or_default()
 }
 
 /// The archive the seeding tests find. inkoop holds 500 filler documents on
@@ -106,126 +77,62 @@ fn documents_in_folder(folder: &str, start: &str) -> String {
     response("DocumentsInFolder", &docs)
 }
 
-/// What the mock saw: each SOAP action, with the uploaded file name or the
-/// folder and offset when it has one.
-type Log = Arc<Mutex<Vec<String>>>;
-
-fn serve(mut stream: TcpStream, log: &Log, uploads: &AtomicUsize) {
-    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).ok();
-    let (mut action, mut length) = (String::new(), 0usize);
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
-            break;
-        }
-        let lower = header.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            length = v.trim().parse().unwrap_or(0);
-        } else if lower.starts_with("soapaction:") {
-            action = header["soapaction:".len()..]
-                .trim()
-                .trim_matches('"')
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-                .to_string();
-        }
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).ok();
-    let body = String::from_utf8_lossy(&body);
-    let (status, reply, entry) = match action.as_str() {
-        "Authenticate" if param(&body, "accessKey") == "bad-key" => {
-            (500, fault("Invalid access key"), action.clone())
-        }
-        "Authenticate" => (200, response("Authenticate", "session-1"), action.clone()),
+fn reply(r: &Request, uploads: &AtomicUsize) -> (u16, String) {
+    match r.action.as_str() {
+        "Authenticate" if r.param("accessKey") == "bad-key" => (500, fault("Invalid access key")),
+        "Authenticate" => (200, response("Authenticate", "session-1")),
         "UploadDocument" => {
-            let name = param(&body, "fileName").to_string();
-            let entry = format!("UploadDocument {name}");
+            let name = r.param("fileName");
             if name.contains("hang") {
-                log.lock().expect("log").push(entry);
                 std::thread::sleep(Duration::from_secs(600));
-                return;
+                (0, String::new())
             } else if name.contains("broken") {
-                (500, fault("Server was unable to process request."), entry)
+                (500, fault("Server was unable to process request."))
             } else if name.contains("denied") {
-                (401, "Unauthorized".to_string(), entry)
+                (401, "Unauthorized".to_string())
             } else if name.contains("expire") {
-                (500, fault("Invalid session ID"), entry)
+                (500, fault("Invalid session ID"))
             } else if name.contains("garbled") {
-                (502, "Bad gateway".to_string(), entry)
+                (502, "Bad gateway".to_string())
             } else {
                 let n = uploads.fetch_add(1, Ordering::SeqCst) + 1;
-                (200, response("UploadDocument", &format!("doc-{n}")), entry)
+                (200, response("UploadDocument", &format!("doc-{n}")))
             }
         }
-        "DocumentsInFolder" => {
-            let folder = param(&body, "folderID");
-            let start = param(&body, "startRecord");
-            (
-                200,
-                documents_in_folder(folder, start),
-                format!("DocumentsInFolder {folder} {start}"),
-            )
-        }
-        "SetCurrentDomain" => (
+        "DocumentsInFolder" => (
             200,
-            response("SetCurrentDomain", ""),
-            format!("SetCurrentDomain {}", param(&body, "domainID")),
+            documents_in_folder(r.param("folderID"), r.param("startRecord")),
         ),
-        _ => (200, response(&action, ""), action.clone()),
-    };
-    log.lock().expect("log").push(entry);
-    write!(
-        stream,
-        "HTTP/1.1 {status} X\r\nContent-Type: text/xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-        reply.len()
-    )
-    .ok();
+        other => (200, response(other, "")),
+    }
 }
 
 fn mock_yuki() -> (String, Log) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
-    let root = format!("http://{}/ws", listener.local_addr().expect("addr"));
-    let seen: Log = Arc::default();
-    let log = Arc::clone(&seen);
-    std::thread::spawn(move || {
-        let uploads = Arc::new(AtomicUsize::new(0));
-        for stream in listener.incoming().flatten() {
-            let (log, uploads) = (Arc::clone(&log), Arc::clone(&uploads));
-            std::thread::spawn(move || serve(stream, &log, &uploads));
-        }
-    });
-    (root, seen)
+    let uploads = Arc::new(AtomicUsize::new(0));
+    common::mock(move |r| reply(r, &uploads))
 }
 
-fn home_with_key(root: &str, key: &str) -> TempDir {
-    let home = TempDir::new().expect("temp home");
-    let dir = home.path().join(".config/yuki");
-    std::fs::create_dir_all(&dir).expect("config dir");
-    std::fs::write(
-        dir.join("config.toml"),
-        format!(
-            r#"api_key = "{key}"
-default_admin = "example"
-region = "be"
-
-[administrations.example]
-domain_id = "domain-1"
-admin_id = "admin-1"
-name = "Example BV"
-base_url = "{root}"
-"#
-        ),
-    )
-    .expect("write config");
-    home
+/// What the mock saw: each SOAP action, with the uploaded file name or the
+/// folder and offset when it has one.
+fn summary(seen: &Log) -> Vec<String> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|r| match r.action.as_str() {
+            "UploadDocument" => format!("UploadDocument {}", r.param("fileName")),
+            "DocumentsInFolder" => format!(
+                "DocumentsInFolder {} {}",
+                r.param("folderID"),
+                r.param("startRecord")
+            ),
+            "SetCurrentDomain" => format!("SetCurrentDomain {}", r.param("domainID")),
+            other => other.to_string(),
+        })
+        .collect()
 }
 
-fn home_with_config(root: &str) -> TempDir {
-    home_with_key(root, "test-key")
+fn home(root: &str) -> TempDir {
+    common::home_with_config(root, "test-key", "")
 }
 
 /// A receipts directory holding `files` (relative path, content).
@@ -252,10 +159,6 @@ fn mark(home: &TempDir, file: &Path, extra: &[&str]) -> Output {
     yuki(home, &args)
 }
 
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 #[track_caller]
 fn ok(out: &Output) {
     assert!(out.status.success(), "{}", stderr(out));
@@ -267,16 +170,6 @@ fn fails(out: &Output, code: i32, needle: &str) {
     let err = stderr(out);
     assert_eq!(out.status.code(), Some(code), "{err}");
     assert!(err.contains(needle), "{needle:?} not in: {err}");
-}
-
-fn json(output: &Output) -> Value {
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
-        panic!(
-            "JSON stdout ({e}): {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            stderr(output)
-        )
-    })
 }
 
 /// The output row for `path`.
@@ -330,8 +223,7 @@ fn entry_for(dir: &Path, rel: &str) -> Option<Value> {
 }
 
 fn uploads(seen: &Log) -> Vec<String> {
-    seen.lock()
-        .unwrap()
+    summary(seen)
         .iter()
         .filter_map(|a| a.strip_prefix("UploadDocument ").map(str::to_string))
         .collect()
@@ -345,7 +237,7 @@ fn calls(seen: &Log) -> usize {
 fn a_dry_run_makes_no_calls_and_writes_nothing() {
     let (root, seen) = mock_yuki();
     // The config points at the live mock, so any call would be seen.
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[
         ("2026/a.pdf", "a"),
         ("2026/b.PNG", "b"),
@@ -378,7 +270,7 @@ fn a_dry_run_makes_no_calls_and_writes_nothing() {
 #[test]
 fn a_non_interactive_run_without_yes_refuses_before_any_call() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("a.pdf", "a")]);
     for args in [&[][..], &["--seed-from-yuki"][..]] {
         fails(
@@ -394,7 +286,7 @@ fn a_non_interactive_run_without_yes_refuses_before_any_call() {
 #[test]
 fn uploads_new_files_and_leaves_uncertain_ones_pending() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[
         ("2026/a.pdf", "a"),
         ("2026/b-broken.pdf", "b"),
@@ -459,7 +351,7 @@ fn uploads_new_files_and_leaves_uncertain_ones_pending() {
 #[test]
 fn file_names_are_xml_escaped_in_the_request() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("Tom & Jerry <x>.pdf", "tj")]);
     ok(&run(&home, dir.path(), &["--yes"]));
     assert_eq!(uploads(&seen), ["Tom &amp; Jerry &lt;x&gt;.pdf"]);
@@ -468,7 +360,7 @@ fn file_names_are_xml_escaped_in_the_request() {
 /// Wait until the mock has seen `what`.
 fn wait_for(seen: &Log, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !seen.lock().unwrap().iter().any(|a| a == what) {
+    while !summary(seen).iter().any(|a| a == what) {
         assert!(Instant::now() < deadline, "mock never saw {what}");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -477,7 +369,7 @@ fn wait_for(seen: &Log, what: &str) {
 #[test]
 fn a_killed_run_leaves_its_upload_pending_and_releases_the_lock() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("a-hang.pdf", "a")]);
     let mut child = Command::new(env!("CARGO_BIN_EXE_yuki"))
         .args(["upload", "dir", dir.path().to_str().unwrap(), "--yes"])
@@ -514,7 +406,7 @@ fn a_killed_run_leaves_its_upload_pending_and_releases_the_lock() {
 #[test]
 fn the_first_uploads_failing_alike_stop_the_run() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[
         ("a-garbled.pdf", "a"),
         ("b-garbled.pdf", "b"),
@@ -530,7 +422,7 @@ fn the_first_uploads_failing_alike_stop_the_run() {
 #[test]
 fn a_renamed_or_moved_file_is_not_uploaded_again() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("in/receipt.pdf", "same bytes")]);
     ok(&run(&home, dir.path(), &["--yes"]));
     std::fs::create_dir_all(dir.path().join("2026/vendor")).unwrap();
@@ -560,7 +452,7 @@ fn a_renamed_or_moved_file_is_not_uploaded_again() {
 #[test]
 fn forget_by_path_keeps_the_record_of_content_that_moved() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("a.pdf", "first")]);
     ok(&run(&home, dir.path(), &["--yes"]));
     // a.pdf is renamed to b.pdf, and a new a.pdf appears.
@@ -581,7 +473,7 @@ fn forget_by_path_keeps_the_record_of_content_that_moved() {
 #[test]
 fn a_changed_file_is_not_uploaded_until_resolved() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("inv.pdf", "version 1"), ("other.pdf", "o")]);
     ok(&run(&home, dir.path(), &["--yes"]));
     std::fs::write(dir.path().join("inv.pdf"), "version 2").unwrap();
@@ -605,7 +497,7 @@ fn a_changed_file_is_not_uploaded_until_resolved() {
 #[test]
 fn max_caps_the_uploads_of_one_run() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("a.pdf", "a"), ("b.pdf", "b"), ("c.pdf", "c")]);
     let out = run(&home, dir.path(), &["--yes", "--max", "2"]);
     ok(&out);
@@ -618,7 +510,7 @@ fn max_caps_the_uploads_of_one_run() {
 #[test]
 fn an_http_refusal_stops_the_run_and_undoes_its_write_ahead() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("a.pdf", "a"), ("b-denied.pdf", "b"), ("c.pdf", "c")]);
     let out = run(&home, dir.path(), &["--yes"]);
     fails(&out, 2, "API calls made: 3");
@@ -637,7 +529,7 @@ fn an_http_refusal_stops_the_run_and_undoes_its_write_ahead() {
 #[test]
 fn an_auth_fault_stops_the_run_but_stays_pending() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("b-expire.pdf", "b"), ("c.pdf", "c")]);
     let out = run(&home, dir.path(), &["--yes"]);
     fails(&out, 2, "Invalid session");
@@ -655,7 +547,7 @@ fn an_auth_fault_stops_the_run_but_stays_pending() {
 #[test]
 fn the_call_count_is_printed_when_authentication_fails() {
     let (root, _seen) = mock_yuki();
-    let home = home_with_key(&root, "bad-key");
+    let home = common::home_with_config(&root, "bad-key", "");
     let dir = receipts(&[("a.pdf", "a")]);
     fails(&run(&home, dir.path(), &["--yes"]), 2, "API calls made: 1");
 }
@@ -663,7 +555,7 @@ fn the_call_count_is_printed_when_authentication_fails() {
 #[test]
 fn a_corrupt_state_file_is_refused_and_left_alone() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let corrupt = "{\"version\": 1, \"files\": {";
     let dir = receipts(&[("a.pdf", "a"), (STATE, corrupt)]);
     for args in [
@@ -683,7 +575,7 @@ fn a_corrupt_state_file_is_refused_and_left_alone() {
 #[test]
 fn the_path_must_be_the_sync_root() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("2026/bol/a.pdf", "a"), ("2026/other/b.pdf", "b")]);
     ok(&run(&home, dir.path(), &["--yes"]));
 
@@ -713,7 +605,7 @@ fn the_path_must_be_the_sync_root() {
 #[test]
 fn seeding_records_unique_name_matches_after_selecting_the_administration() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[
         ("2026/bol-com/2026-08-30_bol-com_111.pdf", "bol"),
         ("2026/vercel/2026-09-07_vercel_REF12345.pdf", "vercel"),
@@ -762,7 +654,7 @@ fn seeding_records_unique_name_matches_after_selecting_the_administration() {
     assert!(err.contains("API calls made: 6"), "{err}");
     // Paging ends on an empty page, advancing by what each page held.
     assert_eq!(
-        *seen.lock().unwrap(),
+        summary(&seen),
         [
             "Authenticate",
             "SetCurrentDomain domain-1",
@@ -788,7 +680,7 @@ fn seeding_records_unique_name_matches_after_selecting_the_administration() {
 #[test]
 fn seeding_records_nothing_when_paging_looks_wrong() {
     let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
+    let home = home(&root);
     let dir = receipts(&[("old-3.pdf", "o")]);
     let args = ["--seed-from-yuki", "--yes", "--seed-folder", "verkoop"];
     fails(

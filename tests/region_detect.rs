@@ -4,22 +4,18 @@
 //! its `-`-separated parts is that region's code (`key-be`, `key-nl-be`).
 //! Nothing leaves the machine.
 
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::net::TcpListener;
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
 
 mod common;
 
-use common::{stdout_json, yuki, yuki_with_env};
+use common::{RequestLog, fault, response, stderr, stdout_json, yuki, yuki_with_env};
 
 use tempfile::TempDir;
 use yuki_cli::cli::init::{Deployment, InitIo, detect, run_with};
 use yuki_cli::client::Region;
 use yuki_cli::error::YukiError;
-
-/// `(path, operation)` of every request the mock received.
-type RequestLog = Arc<Mutex<Vec<(String, String)>>>;
 
 struct Mock {
     base: String,
@@ -40,114 +36,45 @@ impl Mock {
             .join(",")
     }
 
-    fn requests(&self) -> Vec<(String, String)> {
-        self.log.lock().expect("log").clone()
-    }
-
     /// Requests for `operation`, as the region code (first path segment) each went to.
     fn calls(&self, operation: &str) -> Vec<String> {
         let mut regions: Vec<String> = self
-            .requests()
-            .into_iter()
-            .filter(|(_, op)| op == operation)
-            .map(|(path, _)| path.split('/').nth(1).unwrap_or_default().to_string())
+            .log
+            .lock()
+            .expect("log")
+            .iter()
+            .filter(|r| r.action == operation)
+            .map(|r| region_of(&r.path).to_string())
             .collect();
         regions.sort();
         regions
     }
 }
 
-fn envelope(body: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>{body}</soap:Body></soap:Envelope>"#
-    )
-}
-
-fn between<'a>(text: &'a str, open: &str, close: &str) -> &'a str {
-    text.split_once(open)
-        .and_then(|(_, rest)| rest.split_once(close))
-        .map_or("", |(inner, _)| inner)
+/// The region code of a request path, `/{code}/ws/...`.
+fn region_of(path: &str) -> &str {
+    path.split('/').nth(1).unwrap_or_default()
 }
 
 fn mock_yuki() -> Mock {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
-    let base = format!("http://{}", listener.local_addr().expect("addr"));
-    let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
-    let seen = Arc::clone(&log);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let mut request_line = String::new();
-            reader.read_line(&mut request_line).ok();
-            let path = request_line
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_default()
-                .to_string();
-            let (mut action, mut length) = (String::new(), 0usize);
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                    break;
-                }
-                let lower = line.to_ascii_lowercase();
-                if let Some(v) = lower.strip_prefix("content-length:") {
-                    length = v.trim().parse().unwrap_or(0);
-                } else if lower.starts_with("soapaction:") {
-                    action = line["soapaction:".len()..]
-                        .trim()
-                        .trim_matches('"')
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or_default()
-                        .to_string();
-                }
+    let (root, log) = common::mock(|r| {
+        let code = region_of(&r.path);
+        match r.action.as_str() {
+            "Authenticate" if r.param("accessKey").split('-').any(|part| part == code) => {
+                (200, response("Authenticate", &format!("session-{code}")))
             }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).ok();
-            let body = String::from_utf8_lossy(&body);
-            let code = path.split('/').nth(1).unwrap_or_default().to_string();
-
-            let (status, reply) = match action.as_str() {
-                "Authenticate" => {
-                    let key = between(&body, "<yuki:accessKey>", "</yuki:accessKey>");
-                    if key.split('-').any(|part| part == code) {
-                        (
-                            "200 OK",
-                            envelope(&format!(
-                                r#"<AuthenticateResponse xmlns="http://www.theyukicompany.com/"><AuthenticateResult>session-{code}</AuthenticateResult></AuthenticateResponse>"#
-                            )),
-                        )
-                    } else {
-                        (
-                            "500 Internal Server Error",
-                            envelope(
-                                "<soap:Fault><faultcode>soap:Server</faultcode><faultstring>Invalid access key</faultstring></soap:Fault>",
-                            ),
-                        )
-                    }
-                }
-                _ => {
-                    let upper = code.to_ascii_uppercase();
-                    (
-                        "200 OK",
-                        envelope(&format!(
-                            r#"<AdministrationsResponse xmlns="http://www.theyukicompany.com/"><AdministrationsResult><Administrations xmlns=""><Administration ID="admin-{code}"><Name>Voorbeeld {upper} BV</Name><DomainID>domain-{code}</DomainID></Administration></Administrations></AdministrationsResult></AdministrationsResponse>"#
-                        )),
-                    )
-                }
-            };
-            seen.lock().expect("log").push((path, action));
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Type: text/xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-                reply.len()
-            )
-            .ok();
+            "Authenticate" => (500, fault("Invalid access key")),
+            _ => {
+                let upper = code.to_ascii_uppercase();
+                let admins = format!(
+                    r#"<Administrations xmlns=""><Administration ID="admin-{code}"><Name>Voorbeeld {upper} BV</Name><DomainID>domain-{code}</DomainID></Administration></Administrations>"#
+                );
+                (200, response("Administrations", &admins))
+            }
         }
     });
+    // The mock serves every region under its own path below the host.
+    let base = root.trim_end_matches("/ws").to_string();
     Mock { base, log }
 }
 
@@ -166,10 +93,6 @@ fn config_path(home: &TempDir) -> std::path::PathBuf {
 fn saved_config(home: &TempDir) -> toml::Value {
     toml::from_str(&std::fs::read_to_string(config_path(home)).expect("config"))
         .expect("valid TOML")
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 fn init(home: &TempDir, mock: &Mock, args: &[&str]) -> Output {
