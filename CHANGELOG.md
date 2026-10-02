@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **accounts**: `accounts balance` now reports the balance at the end of `--period` (or today, if the period is still running) instead of at its start, and adds an `As Of` column with that date. Scripts reading the old start-of-period figure, or indexing columns, must adjust.
 - **contacts**: `contacts search` shows `HID`, `Code`, `City` and `VAT Number` columns (the fields an invoice template takes) between the existing ones; scripts indexing columns must adjust.
-- **yuki-client**: `ContactClient::search_contacts` takes `(option, value)`, `option` being one of the new `contact::SEARCH_OPTIONS`; `Contact` gains `code`, `hid`, `city` and `vat_number` and derives `Default`.
+- **yuki-client**: `ContactClient::search_contacts` takes `(domain_id, option, value)`, `option` being one of the new `contact::SEARCH_OPTIONS`, and `get_suppliers_and_customers(_page)` takes `domain_id` first; `Contact` gains `code`, `hid`, `city` and `vat_number` and derives `Default`.
 - **yuki-client**: 0.3.0. `AccountingInfoClient::get_transaction_details` now takes `(administration_id, gl_account_code, start_date, end_date)` instead of a transaction ID, because `GetTransactionDetails` has no transaction-ID parameter; `TransactionDetail` gains `contact_name`.
 
 ### Added
@@ -20,7 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- **contacts**: `contacts search` returned every contact whatever the query, because it sent a `searchQuery` parameter `SearchContacts` does not have. It now sends the schema's `searchOption`, `searchValue`, `sortOrder`, `modifiedAfter` (as `xsi:nil`), `active` and `pageNumber`, searches all fields by default or the one `--by` names, includes inactive contacts, and follows pagination. `SoapEnvelope::nil_param` sends such nillable parameters.
+- **contacts**: `contacts search` returned every contact whatever the query, because it sent a `searchQuery` parameter `SearchContacts` does not have. It now sends the schema's `searchOption`, `searchValue`, `sortOrder`, `modifiedAfter` (as `xsi:nil`), `active` and `pageNumber`, searches all fields by default or the one `--by` names, includes inactive contacts, and follows pagination.
+- **contacts**: `contacts search` and `contacts list` ignored `--admin` and read the key's default administration; they now send its `domainID`. Both listings stop at a page whose first contact repeats, and after 50 pages (5000 contacts) with a warning, so a listing always ends. `SoapEnvelope::nil_param` sends such nillable parameters.
 - **sales**: `sales items` now honours `--region`, `--base-url` and their environment variables, like every other command.
 
 ## [0.1.13](https://github.com/rvben/yuki-cli/compare/v0.1.12...v0.1.13) - 2026-09-28

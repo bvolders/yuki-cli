@@ -1,9 +1,16 @@
-use crate::client::contact::{Contact, ContactClient, SEARCH_OPTIONS};
+use crate::client::contact::{Contact, ContactClient, MAX_CONTACTS, SEARCH_OPTIONS};
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::output::{
     ListOptions, OutputFormat, apply_pagination, format_json, format_table, is_tty, select_fields,
 };
+
+/// Say so when a listing stopped at the page cap rather than at its end.
+fn warn_if_cut_short(count: usize) {
+    if count >= MAX_CONTACTS {
+        eprintln!("warning: stopped after {MAX_CONTACTS} contacts; refine the query");
+    }
+}
 
 fn yes_no(value: bool) -> String {
     if value { "Yes" } else { "No" }.to_string()
@@ -48,7 +55,10 @@ pub async fn search(
     let target = config.target(admin)?;
     let mut client = ContactClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
-    let contacts = client.search_contacts(option, query).await?;
+    let contacts = client
+        .search_contacts(target.domain_id, option, query)
+        .await?;
+    warn_if_cut_short(contacts.len());
 
     let headers: Vec<String> = [
         "ID",
@@ -124,7 +134,10 @@ pub async fn list(
     let target = config.target(admin)?;
     let mut client = ContactClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
-    let contacts = client.get_suppliers_and_customers(contact_type).await?;
+    let contacts = client
+        .get_suppliers_and_customers(target.domain_id, contact_type)
+        .await?;
+    warn_if_cut_short(contacts.len());
 
     let mut headers = vec![
         "ID".into(),
