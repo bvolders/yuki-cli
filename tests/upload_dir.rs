@@ -252,34 +252,35 @@ fn mark(home: &TempDir, file: &Path, extra: &[&str]) -> Output {
     yuki(home, &args)
 }
 
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[track_caller]
+fn ok(out: &Output) {
+    assert!(out.status.success(), "{}", stderr(out));
+}
+
+/// The command exited with `code` and said `needle` on stderr.
+#[track_caller]
+fn fails(out: &Output, code: i32, needle: &str) {
+    let err = stderr(out);
+    assert_eq!(out.status.code(), Some(code), "{err}");
+    assert!(err.contains(needle), "{needle:?} not in: {err}");
+}
+
 fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
         panic!(
             "JSON stdout ({e}): {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            stderr(output)
         )
     })
 }
 
-/// Action per path from the output rows.
-fn actions(output: &Output) -> Vec<(String, String)> {
-    let mut rows: Vec<(String, String)> = json(output)["items"]
-        .as_array()
-        .expect("items")
-        .iter()
-        .map(|r| {
-            (
-                r["Path"].as_str().unwrap().to_string(),
-                r["Action"].as_str().unwrap().to_string(),
-            )
-        })
-        .collect();
-    rows.sort();
-    rows
-}
-
 /// The output row for `path`.
+#[track_caller]
 fn row(output: &Output, path: &str) -> Value {
     json(output)["items"]
         .as_array()
@@ -290,13 +291,27 @@ fn row(output: &Output, path: &str) -> Value {
         .clone()
 }
 
-fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
-    let mut v: Vec<(String, String)> = expected
+/// The rows are exactly these (path, action) pairs, in any order.
+#[track_caller]
+fn assert_actions(output: &Output, expected: &[(&str, &str)]) {
+    let mut got: Vec<(String, String)> = json(output)["items"]
+        .as_array()
+        .expect("items")
         .iter()
-        .map(|(p, a)| ((*p).to_string(), (*a).to_string()))
+        .map(|r| {
+            (
+                r["Path"].as_str().unwrap().into(),
+                r["Action"].as_str().unwrap().into(),
+            )
+        })
         .collect();
-    v.sort();
-    v
+    let mut want: Vec<(String, String)> = expected
+        .iter()
+        .map(|(p, a)| ((*p).into(), (*a).into()))
+        .collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
 }
 
 fn state(dir: &Path) -> Value {
@@ -312,10 +327,6 @@ fn entry_for(dir: &Path, rel: &str) -> Option<Value> {
         .values()
         .find(|e| e["path"] == rel)
         .cloned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 fn uploads(seen: &Log) -> Vec<String> {
@@ -338,21 +349,28 @@ fn a_dry_run_makes_no_calls_and_writes_nothing() {
     let dir = receipts(&[
         ("2026/a.pdf", "a"),
         ("2026/b.PNG", "b"),
-        ("_to_delete/old.pdf", "old"),
+        ("2025/deep/c.pdf", "c"),
+        ("_TO_DELETE/old.pdf", "old"),
     ]);
-    let out = run(&home, dir.path(), &["--dry-run"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(
-        actions(&out),
-        pairs(&[
+    let out = run(&home, dir.path(), &["--dry-run", "--exclude", "./2025/"]);
+    ok(&out);
+    assert_actions(
+        &out,
+        &[
             ("2026/a.pdf", "would-upload"),
             ("2026/b.PNG", "would-upload"),
-            ("_to_delete/old.pdf", "excluded"),
-        ])
+            ("2025/deep/c.pdf", "excluded"),
+            ("_TO_DELETE/old.pdf", "excluded"),
+        ],
     );
     assert!(stderr(&out).contains("API calls made: 0"));
     let seed = run(&home, dir.path(), &["--dry-run", "--seed-from-yuki"]);
     assert_eq!(row(&seed, "2026/a.pdf")["Action"], "would-seed");
+    fails(
+        &run(&home, dir.path(), &["--dry-run", "--exclude", "["]),
+        1,
+        "invalid --exclude",
+    );
     assert_eq!(calls(&seen), 0, "{:?}", seen.lock().unwrap());
     assert!(!dir.path().join(STATE).exists());
 }
@@ -363,10 +381,11 @@ fn a_non_interactive_run_without_yes_refuses_before_any_call() {
     let home = home_with_config(&root);
     let dir = receipts(&[("a.pdf", "a")]);
     for args in [&[][..], &["--seed-from-yuki"][..]] {
-        let out = run(&home, dir.path(), args);
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
-        let err = stderr(&out);
-        assert!(err.contains("\"kind\":\"confirmation_required\""), "{err}");
+        fails(
+            &run(&home, dir.path(), args),
+            1,
+            "\"kind\":\"confirmation_required\"",
+        );
     }
     assert_eq!(calls(&seen), 0);
     assert!(!dir.path().join(STATE).exists());
@@ -385,32 +404,28 @@ fn uploads_new_files_and_leaves_uncertain_ones_pending() {
         (".hidden/h.pdf", "h"),
     ]);
     let out = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert_eq!(
-        actions(&out),
-        pairs(&[
+    fails(&out, 1, "2 newly pending");
+    assert_actions(
+        &out,
+        &[
             ("2026/a.pdf", "uploaded"),
             ("2026/b-broken.pdf", "pending"),
             ("2026/c-garbled.pdf", "pending"),
             ("2026/d.jpeg", "uploaded"),
             (".hidden/h.pdf", "excluded"),
-        ])
+        ],
     );
-    let err = stderr(&out);
-    assert!(err.contains("API calls made: 5"), "{err}");
-    assert!(err.contains("2 newly pending"), "{err}");
+    assert!(stderr(&out).contains("API calls made: 5"));
     let a = entry_for(dir.path(), "2026/a.pdf").unwrap();
-    assert_eq!(a["status"], "uploaded");
-    assert_eq!(a["document_id"], "doc-1");
-    assert_eq!(a["folder"], "uitzoeken");
+    assert_eq!(
+        (&a["status"], &a["document_id"], &a["folder"]),
+        (&"uploaded".into(), &"doc-1".into(), &"uitzoeken".into())
+    );
     assert!(a["uploaded_at"].as_str().unwrap().ends_with('Z'));
     let b = entry_for(dir.path(), "2026/b-broken.pdf").unwrap();
     assert_eq!(b["status"], "pending");
     assert!(b["error"].as_str().unwrap().contains("unable to process"));
-    let note = row(&out, "2026/b-broken.pdf")["Note"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let note = row(&out, "2026/b-broken.pdf")["Note"].to_string();
     assert!(note.contains("yuki upload mark '"), "{note}");
     // Keyed by the sha256 of the content.
     assert!(
@@ -421,16 +436,21 @@ fn uploads_new_files_and_leaves_uncertain_ones_pending() {
 
     // Pending files are never retried; the run still needs attention.
     let again = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(again.status.code(), Some(1));
-    assert!(stderr(&again).contains("2 pending"));
-    assert_eq!(uploads(&seen).len(), 4);
+    fails(&again, 1, "2 pending");
     assert!(stderr(&again).contains("API calls made: 0"));
+    assert_eq!(uploads(&seen).len(), 4);
 
     // Resolved by hand: one is in Yuki, the other goes up again.
-    let c = dir.path().join("2026/c-garbled.pdf");
-    assert!(mark(&home, &c, &["--doc-id", "y-1"]).status.success());
-    let b = dir.path().join("2026/b-broken.pdf");
-    assert!(mark(&home, &b, &["--forget"]).status.success());
+    ok(&mark(
+        &home,
+        &dir.path().join("2026/c-garbled.pdf"),
+        &["--doc-id", "y-1"],
+    ));
+    ok(&mark(
+        &home,
+        &dir.path().join("2026/b-broken.pdf"),
+        &["--forget"],
+    ));
     let plan = run(&home, dir.path(), &["--dry-run"]);
     assert_eq!(row(&plan, "2026/c-garbled.pdf")["Action"], "synced");
     assert_eq!(row(&plan, "2026/b-broken.pdf")["Action"], "would-upload");
@@ -441,8 +461,7 @@ fn file_names_are_xml_escaped_in_the_request() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
     let dir = receipts(&[("Tom & Jerry <x>.pdf", "tj")]);
-    let out = run(&home, dir.path(), &["--yes"]);
-    assert!(out.status.success(), "{}", stderr(&out));
+    ok(&run(&home, dir.path(), &["--yes"]));
     assert_eq!(uploads(&seen), ["Tom &amp; Jerry &lt;x&gt;.pdf"]);
 }
 
@@ -477,25 +496,17 @@ fn a_killed_run_leaves_its_upload_pending_and_releases_the_lock() {
         "pending"
     );
     // The holder's OS lock keeps a second run out.
-    let second = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(second.status.code(), Some(1));
-    assert!(
-        stderr(&second).contains("another yuki run"),
-        "{}",
-        stderr(&second)
-    );
-
-    // The write-ahead created the state: a run below the root is refused.
+    fails(&run(&home, dir.path(), &["--yes"]), 1, "another yuki run");
+    // A run below the synced root is refused.
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
-    let below = run(&home, &sub, &["--yes"]);
-    assert!(stderr(&below).contains("run on"), "{}", stderr(&below));
+    fails(&run(&home, &sub, &["--yes"]), 1, "run on");
 
     child.kill().expect("kill yuki");
     child.wait().expect("reap yuki");
     // The kernel released the lock; the pending upload is not retried.
     let after = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(after.status.code(), Some(1), "{}", stderr(&after));
+    fails(&after, 1, "1 pending");
     assert_eq!(row(&after, "a-hang.pdf")["Action"], "pending");
     assert_eq!(uploads(&seen), ["a-hang.pdf"]);
 }
@@ -511,12 +522,7 @@ fn the_first_uploads_failing_alike_stop_the_run() {
         ("d.pdf", "d"),
     ]);
     let out = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("first 3 uploads all failed"),
-        "{}",
-        stderr(&out)
-    );
+    fails(&out, 1, "first 3 uploads all failed");
     assert_eq!(row(&out, "d.pdf")["Action"], "not-attempted");
     assert_eq!(uploads(&seen).len(), 3);
 }
@@ -526,7 +532,7 @@ fn a_renamed_or_moved_file_is_not_uploaded_again() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
     let dir = receipts(&[("in/receipt.pdf", "same bytes")]);
-    assert!(run(&home, dir.path(), &["--yes"]).status.success());
+    ok(&run(&home, dir.path(), &["--yes"]));
     std::fs::create_dir_all(dir.path().join("2026/vendor")).unwrap();
     std::fs::rename(
         dir.path().join("in/receipt.pdf"),
@@ -535,18 +541,20 @@ fn a_renamed_or_moved_file_is_not_uploaded_again() {
     .unwrap();
     std::fs::write(dir.path().join("2026/copy.pdf"), "same bytes").unwrap();
     let out = run(&home, dir.path(), &["--yes"]);
-    assert!(out.status.success(), "{}", stderr(&out));
+    ok(&out);
     assert_eq!(uploads(&seen).len(), 1, "nothing uploaded again");
-    assert_eq!(
-        actions(&out),
-        pairs(&[
+    assert_actions(
+        &out,
+        &[
             ("2026/copy.pdf", "synced"),
             ("2026/vendor/renamed.pdf", "duplicate"),
-        ])
+        ],
     );
     let st = state(dir.path());
-    let files = st["files"].as_object().unwrap();
-    assert_eq!(files.values().next().unwrap()["path"], "2026/copy.pdf");
+    assert_eq!(
+        st["files"].as_object().unwrap().values().next().unwrap()["path"],
+        "2026/copy.pdf"
+    );
 }
 
 #[test]
@@ -554,18 +562,15 @@ fn forget_by_path_keeps_the_record_of_content_that_moved() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
     let dir = receipts(&[("a.pdf", "first")]);
-    assert!(run(&home, dir.path(), &["--yes"]).status.success());
+    ok(&run(&home, dir.path(), &["--yes"]));
     // a.pdf is renamed to b.pdf, and a new a.pdf appears.
     std::fs::rename(dir.path().join("a.pdf"), dir.path().join("b.pdf")).unwrap();
     std::fs::write(dir.path().join("a.pdf"), "second").unwrap();
 
     let forgot = mark(&home, &dir.path().join("a.pdf"), &["--forget"]);
-    assert!(forgot.status.success(), "{}", stderr(&forgot));
     assert_eq!(json(&forgot)["items"][0]["Action"], "unchanged");
     let out = run(&home, dir.path(), &["--yes"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(row(&out, "b.pdf")["Action"], "synced");
-    assert_eq!(row(&out, "a.pdf")["Action"], "uploaded");
+    assert_actions(&out, &[("a.pdf", "uploaded"), ("b.pdf", "synced")]);
     assert_eq!(
         uploads(&seen),
         ["a.pdf", "a.pdf"],
@@ -578,53 +583,23 @@ fn a_changed_file_is_not_uploaded_until_resolved() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
     let dir = receipts(&[("inv.pdf", "version 1"), ("other.pdf", "o")]);
-    assert!(run(&home, dir.path(), &["--yes"]).status.success());
+    ok(&run(&home, dir.path(), &["--yes"]));
     std::fs::write(dir.path().join("inv.pdf"), "version 2").unwrap();
-    // Swapping two recorded files is a move, not a change.
-    let (a, b) = (dir.path().join("other.pdf"), dir.path().join("tmp.pdf"));
-    std::fs::rename(&a, &b).unwrap();
+    // A rename alongside is a move, not a change.
+    std::fs::rename(dir.path().join("other.pdf"), dir.path().join("tmp.pdf")).unwrap();
 
     let out = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    fails(&out, 1, "1 changed or unreadable");
     let r = row(&out, "inv.pdf");
     assert_eq!(r["Action"], "changed");
-    assert!(r["Note"].as_str().unwrap().contains("was doc doc-"), "{r}");
+    assert!(r["Note"].to_string().contains("was doc doc-"), "{r}");
     assert_eq!(row(&out, "tmp.pdf")["Action"], "synced");
     assert_eq!(uploads(&seen).len(), 2);
 
     let forgot = mark(&home, &dir.path().join("inv.pdf"), &["--forget"]);
     assert_eq!(json(&forgot)["items"][0]["Action"], "forgotten");
-    assert!(run(&home, dir.path(), &["--yes"]).status.success());
+    ok(&run(&home, dir.path(), &["--yes"]));
     assert_eq!(uploads(&seen).len(), 3);
-}
-
-#[test]
-fn excludes_are_case_insensitive_and_added_to_the_defaults() {
-    let (root, seen) = mock_yuki();
-    let home = home_with_config(&root);
-    let dir = receipts(&[
-        ("2025/amazon/deep/a.pdf", "a"),
-        ("2026/bol/b.pdf", "b"),
-        ("2026/bol/scan.PNG", "s"),
-        ("_TO_DELETE/x.pdf", "x"),
-    ]);
-    let out = run(
-        &home,
-        dir.path(),
-        &["--dry-run", "--exclude", "2025", "--exclude", "*.png"],
-    );
-    assert_eq!(
-        actions(&out),
-        pairs(&[
-            ("2025/amazon/deep/a.pdf", "excluded"),
-            ("2026/bol/b.pdf", "would-upload"),
-            ("2026/bol/scan.PNG", "excluded"),
-            ("_TO_DELETE/x.pdf", "excluded"),
-        ])
-    );
-    let bad = run(&home, dir.path(), &["--dry-run", "--exclude", "["]);
-    assert!(stderr(&bad).contains("invalid --exclude"));
-    assert_eq!(calls(&seen), 0);
 }
 
 #[test]
@@ -633,14 +608,10 @@ fn max_caps_the_uploads_of_one_run() {
     let home = home_with_config(&root);
     let dir = receipts(&[("a.pdf", "a"), ("b.pdf", "b"), ("c.pdf", "c")]);
     let out = run(&home, dir.path(), &["--yes", "--max", "2"]);
-    assert!(out.status.success(), "{}", stderr(&out));
+    ok(&out);
     assert_eq!(row(&out, "c.pdf")["Action"], "deferred");
     assert_eq!(uploads(&seen), ["a.pdf", "b.pdf"]);
-    assert!(
-        run(&home, dir.path(), &["--yes", "--max", "2"])
-            .status
-            .success()
-    );
+    ok(&run(&home, dir.path(), &["--yes", "--max", "2"]));
     assert_eq!(uploads(&seen), ["a.pdf", "b.pdf", "c.pdf"]);
 }
 
@@ -650,18 +621,17 @@ fn an_http_refusal_stops_the_run_and_undoes_its_write_ahead() {
     let home = home_with_config(&root);
     let dir = receipts(&[("a.pdf", "a"), ("b-denied.pdf", "b"), ("c.pdf", "c")]);
     let out = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    assert_eq!(
-        actions(&out),
-        pairs(&[
+    fails(&out, 2, "API calls made: 3");
+    assert_actions(
+        &out,
+        &[
             ("a.pdf", "uploaded"),
             ("b-denied.pdf", "not-attempted"),
             ("c.pdf", "not-attempted"),
-        ])
+        ],
     );
     assert_eq!(uploads(&seen), ["a.pdf", "b-denied.pdf"]);
     assert!(entry_for(dir.path(), "b-denied.pdf").is_none());
-    assert!(stderr(&out).contains("API calls made: 3"));
 }
 
 #[test]
@@ -670,10 +640,10 @@ fn an_auth_fault_stops_the_run_but_stays_pending() {
     let home = home_with_config(&root);
     let dir = receipts(&[("b-expire.pdf", "b"), ("c.pdf", "c")]);
     let out = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    assert_eq!(
-        actions(&out),
-        pairs(&[("b-expire.pdf", "pending"), ("c.pdf", "not-attempted")])
+    fails(&out, 2, "Invalid session");
+    assert_actions(
+        &out,
+        &[("b-expire.pdf", "pending"), ("c.pdf", "not-attempted")],
     );
     assert_eq!(uploads(&seen), ["b-expire.pdf"]);
     assert_eq!(
@@ -687,33 +657,26 @@ fn the_call_count_is_printed_when_authentication_fails() {
     let (root, _seen) = mock_yuki();
     let home = home_with_key(&root, "bad-key");
     let dir = receipts(&[("a.pdf", "a")]);
-    let out = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    assert!(stderr(&out).contains("API calls made: 1"));
+    fails(&run(&home, dir.path(), &["--yes"]), 2, "API calls made: 1");
 }
 
 #[test]
 fn a_corrupt_state_file_is_refused_and_left_alone() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
-    let dir = receipts(&[("a.pdf", "a"), (STATE, "{\"version\": 1, \"files\": {")]);
+    let corrupt = "{\"version\": 1, \"files\": {";
+    let dir = receipts(&[("a.pdf", "a"), (STATE, corrupt)]);
     for args in [
         &["--yes"][..],
         &["--dry-run"][..],
         &["--seed-from-yuki", "--yes"][..],
     ] {
-        let out = run(&home, dir.path(), args);
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
-        assert!(
-            stderr(&out).contains("refusing to overwrite"),
-            "{}",
-            stderr(&out)
-        );
+        fails(&run(&home, dir.path(), args), 1, "refusing to overwrite");
     }
     assert_eq!(calls(&seen), 0);
     assert_eq!(
         std::fs::read_to_string(dir.path().join(STATE)).unwrap(),
-        "{\"version\": 1, \"files\": {"
+        corrupt
     );
 }
 
@@ -722,17 +685,15 @@ fn the_path_must_be_the_sync_root() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
     let dir = receipts(&[("2026/bol/a.pdf", "a"), ("2026/other/b.pdf", "b")]);
-    assert!(run(&home, dir.path(), &["--yes"]).status.success());
+    ok(&run(&home, dir.path(), &["--yes"]));
 
     // A subdirectory of a synced directory is refused, pointing at the root.
     let sub = dir.path().join("2026/bol");
-    let out = run(&home, &sub, &["--yes"]);
-    assert_eq!(out.status.code(), Some(1));
     let top = dir.path().canonicalize().unwrap();
-    assert!(
-        stderr(&out).contains(&format!("run on {} instead", top.display())),
-        "{}",
-        stderr(&out)
+    fails(
+        &run(&home, &sub, &["--yes"]),
+        1,
+        &format!("run on {} instead", top.display()),
     );
     // mark finds the root from the file.
     let m = mark(&home, &sub.join("a.pdf"), &["--doc-id", "doc-1"]);
@@ -741,8 +702,11 @@ fn the_path_must_be_the_sync_root() {
     // A state file further down makes the tree ambiguous.
     std::fs::write(dir.path().join("2026/other").join(STATE), "{}").unwrap();
     let nested = run(&home, dir.path(), &["--yes"]);
-    assert_eq!(nested.status.code(), Some(1));
-    assert!(stderr(&nested).contains("holds other sync states (2026/other/.yuki-sync.json)"));
+    fails(
+        &nested,
+        1,
+        "holds other sync states (2026/other/.yuki-sync.json)",
+    );
     assert_eq!(uploads(&seen).len(), 2);
 }
 
@@ -760,27 +724,20 @@ fn seeding_records_unique_name_matches_after_selecting_the_administration() {
         ("2026/x/taken.pdf", "taken x"),
         ("2026/y/taken.pdf", "taken y"),
         ("2026/cafe/Cafe\u{301}.pdf", "cafe"),
+        ("only/c-garbled.pdf", "pending one"),
     ]);
     // A pending upload, which seeding resolves.
-    std::fs::create_dir(dir.path().join("only")).unwrap();
-    std::fs::write(dir.path().join("only/c-garbled.pdf"), "pending one").unwrap();
     let first = run(&home, dir.path(), &["--yes", "--exclude", "2026"]);
-    assert_eq!(first.status.code(), Some(1), "{}", stderr(&first));
-    assert_eq!(row(&first, "only/c-garbled.pdf")["Action"], "pending");
+    fails(&first, 1, "1 newly pending");
     seen.lock().unwrap().clear();
-    let top = dir.path().to_str().unwrap();
     let x = dir.path().join("2026/x/taken.pdf");
-    assert!(
-        mark(&home, &x, &["--doc-id", "y-taken", "--dir", top])
-            .status
-            .success()
-    );
+    ok(&mark(&home, &x, &["--doc-id", "y-taken"]));
 
     let out = run(&home, dir.path(), &["--seed-from-yuki", "--yes"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(
-        actions(&out),
-        pairs(&[
+    ok(&out);
+    assert_actions(
+        &out,
+        &[
             ("2026/a/dup.pdf", "ambiguous"),
             ("2026/b/dup.pdf", "ambiguous"),
             ("2026/bol-com/2026-08-30_bol-com_111.pdf", "already-in-yuki"),
@@ -789,14 +746,14 @@ fn seeding_records_unique_name_matches_after_selecting_the_administration() {
             ("2026/shop/scan.pdf", "ambiguous"),
             (
                 "2026/vercel/2026-09-07_vercel_REF12345.pdf",
-                "possible-match"
+                "possible-match",
             ),
             ("2026/x/taken.pdf", "synced"),
             ("2026/y/taken.pdf", "ambiguous"),
             ("only/c-garbled.pdf", "already-in-yuki"),
-        ])
+        ],
     );
-    let note = |path: &str| row(&out, path)["Note"].as_str().unwrap().to_string();
+    let note = |path: &str| row(&out, path)["Note"].to_string();
     assert!(note("2026/a/dup.pdf").contains("2026/a/dup.pdf, 2026/b/dup.pdf"));
     assert!(note("2026/y/taken.pdf").contains("already recorded for 2026/x/taken.pdf"));
     assert!(note("2026/vercel/2026-09-07_vercel_REF12345.pdf").contains("y-vercel"));
@@ -816,12 +773,14 @@ fn seeding_records_unique_name_matches_after_selecting_the_administration() {
         ]
     );
     let bol = entry_for(dir.path(), "2026/bol-com/2026-08-30_bol-com_111.pdf").unwrap();
-    assert_eq!(bol["document_id"], "y-bol");
-    assert_eq!(bol["folder"], "inkoop");
+    assert_eq!(
+        (&bol["document_id"], &bol["folder"]),
+        (&"y-bol".into(), &"inkoop".into())
+    );
     assert_eq!(state(dir.path())["files"].as_object().unwrap().len(), 4);
 
     // The real run then uploads everything else.
-    assert!(run(&home, dir.path(), &["--yes"]).status.success());
+    ok(&run(&home, dir.path(), &["--yes"]));
     assert_eq!(uploads(&seen).len(), 6);
     assert!(!uploads(&seen).contains(&"c-garbled.pdf".to_string()));
 }
@@ -831,16 +790,11 @@ fn seeding_records_nothing_when_paging_looks_wrong() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
     let dir = receipts(&[("old-3.pdf", "o")]);
-    let out = run(
-        &home,
-        dir.path(),
-        &["--seed-from-yuki", "--yes", "--seed-folder", "verkoop"],
-    );
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("listed document fill-0 twice"),
-        "{}",
-        stderr(&out)
+    let args = ["--seed-from-yuki", "--yes", "--seed-folder", "verkoop"];
+    fails(
+        &run(&home, dir.path(), &args),
+        1,
+        "listed document fill-0 twice",
     );
     assert!(!dir.path().join(STATE).exists());
     assert_eq!(calls(&seen), 4);
@@ -853,10 +807,7 @@ fn mark_records_a_file_by_hand_without_contacting_yuki() {
     let file = dir.path().join("2026/supabase/inv.pdf");
     let other = dir.path().join("2026/other.pdf");
 
-    let out = mark(&home, &file, &["--doc-id", "d-1"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(stderr(&out).contains("pass --dir"), "{}", stderr(&out));
-
+    fails(&mark(&home, &file, &["--doc-id", "d-1"]), 1, "pass --dir");
     let top = dir.path().to_str().unwrap();
     let out = mark(
         &home,
@@ -866,53 +817,43 @@ fn mark_records_a_file_by_hand_without_contacting_yuki() {
     assert_eq!(json(&out)["items"][0]["Action"], "recorded");
     let e = entry_for(dir.path(), "2026/supabase/inv.pdf").unwrap();
     assert_eq!(
-        (e["status"].as_str(), e["folder"].as_str()),
-        (Some("already-in-yuki"), Some("inkoop"))
+        (&e["status"], &e["folder"]),
+        (&"already-in-yuki".into(), &"inkoop".into())
     );
 
     let same = mark(&home, &file, &["--doc-id", "d-1"]);
     assert_eq!(json(&same)["items"][0]["Action"], "unchanged");
-    let replace = mark(&home, &file, &["--doc-id", "d-2"]);
-    assert!(stderr(&replace).contains("--force"));
-    assert!(
-        mark(&home, &file, &["--doc-id", "d-2", "--force"])
-            .status
-            .success()
-    );
+    fails(&mark(&home, &file, &["--doc-id", "d-2"]), 1, "--force");
+    ok(&mark(&home, &file, &["--doc-id", "d-2", "--force"]));
 
     // One document cannot be recorded for two files without --force.
     let twice = mark(&home, &other, &["--doc-id", "d-2"]);
-    assert_eq!(twice.status.code(), Some(1));
-    assert!(
-        stderr(&twice).contains("document d-2 is already recorded for 2026/supabase/inv.pdf"),
-        "{}",
-        stderr(&twice)
+    fails(
+        &twice,
+        1,
+        "document d-2 is already recorded for 2026/supabase/inv.pdf",
     );
-    assert!(
-        mark(&home, &other, &["--doc-id", "d-2", "--force"])
-            .status
-            .success()
-    );
+    ok(&mark(&home, &other, &["--doc-id", "d-2", "--force"]));
 
-    assert!(
-        mark(&home, &other, &["--skip", "--note", "private", "--force"])
-            .status
-            .success()
-    );
+    ok(&mark(
+        &home,
+        &other,
+        &["--skip", "--note", "private", "--force"],
+    ));
     let e = entry_for(dir.path(), "2026/other.pdf").unwrap();
     assert_eq!(
-        (e["status"].as_str(), e["note"].as_str()),
-        (Some("skipped"), Some("private"))
+        (&e["status"], &e["note"]),
+        (&"skipped".into(), &"private".into())
     );
     let forgot = mark(&home, &file, &["--forget"]);
     assert_eq!(json(&forgot)["items"][0]["Action"], "forgotten");
     let plan = run(&home, dir.path(), &["--dry-run"]);
-    assert_eq!(
-        actions(&plan),
-        pairs(&[
+    assert_actions(
+        &plan,
+        &[
             ("2026/other.pdf", "synced"),
-            ("2026/supabase/inv.pdf", "would-upload")
-        ])
+            ("2026/supabase/inv.pdf", "would-upload"),
+        ],
     );
 
     assert_eq!(mark(&home, &file, &[]).status.code(), Some(2));

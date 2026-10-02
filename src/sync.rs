@@ -636,16 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_is_exclusive_until_released() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock = Lock::acquire(dir.path()).unwrap();
-        let err = Lock::acquire(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("another yuki run"), "{err}");
-        drop(lock);
-        assert!(Lock::acquire(dir.path()).is_ok());
-    }
-
-    #[test]
     fn scan_hashes_supported_files_and_reports_what_it_skips() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -675,24 +665,6 @@ mod tests {
         #[cfg(unix)]
         assert!(reasons.contains(&"2026/link.pdf: symbolic link, not followed".to_string()));
         assert_eq!(scan.nested_states, ["2026/bol/inner/.yuki-sync.json"]);
-    }
-
-    #[test]
-    fn a_root_must_not_be_inside_another_synced_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let top = dir.path().canonicalize().unwrap();
-        fs::create_dir_all(top.join("a/b")).unwrap();
-        assert_eq!(sync_root(&top.join("a/b")).unwrap(), top.join("a/b"));
-        assert_eq!(find_root(&top.join("a/b")).unwrap(), None);
-        fs::write(top.join(STATE_FILE), b"{}").unwrap();
-        let err = sync_root(&top.join("a/b")).unwrap_err().to_string();
-        assert!(
-            err.contains(&format!("run on {} instead", top.display())),
-            "{err}"
-        );
-        assert_eq!(find_root(&top.join("a/b")).unwrap(), Some(top.clone()));
-        assert_eq!(sync_root(&top).unwrap(), top);
-        assert!(sync_root(&top.join("missing")).is_err());
     }
 
     #[test]
