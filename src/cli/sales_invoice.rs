@@ -1564,7 +1564,7 @@ pub fn write_prepared(
     }
     let json = invoice.prepared_file(seller, admin_id);
     let hash = content_hash(&json);
-    InvoiceLedger::open(config)?.reserve_prepared(
+    InvoiceLedger::open()?.reserve_prepared(
         &Claim {
             admin: admin_id,
             number,
@@ -1578,7 +1578,7 @@ pub fn write_prepared(
     text.push('\n');
     if let Err(e) = crate::ledger::atomic_write(out, text.as_bytes()) {
         // Nothing to send without the file: free the number again.
-        let _ = InvoiceLedger::open(config).and_then(|mut l| l.release(admin_id, number));
+        let _ = InvoiceLedger::open().and_then(|mut l| l.release(admin_id, number));
         return Err(YukiError::Config(format!("{}: {e}", out.display())));
     }
     Ok(json)
@@ -1687,7 +1687,7 @@ pub async fn submit_numbered(
         return Ok(verdict(&import, invoice));
     };
     let admin_id = config.target(admin)?.admin_id;
-    let mut ledger = InvoiceLedger::open(config)?;
+    let mut ledger = InvoiceLedger::open()?;
     match prepared {
         Some(hash) => ledger.send_reserved(admin_id, number, hash)?,
         None => ledger.reserve(&Claim {
@@ -1703,7 +1703,7 @@ pub async fn submit_numbered(
     let result = submit(config, admin, invoice, format, quiet)
         .await
         .map(|import| verdict(&import, invoice));
-    let outcome = InvoiceLedger::open(config).and_then(|mut ledger| match &result {
+    let outcome = InvoiceLedger::open().and_then(|mut ledger| match &result {
         Ok(Verdict::Done) => ledger.commit(admin_id, number).map(|()| true),
         // Booked under this number, only not sent as asked.
         Ok(Verdict::SendIncomplete(message)) => ledger

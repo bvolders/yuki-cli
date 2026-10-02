@@ -176,13 +176,7 @@ pub async fn resolve(
     }
     let admin_id = config.target(admin)?.admin_id;
     let archive = archive_numbers(config, admin, &years).await?;
-    choose(
-        request,
-        year,
-        &archive,
-        &InvoiceLedger::peek(config)?,
-        admin_id,
-    )
+    choose(request, year, &archive, &InvoiceLedger::peek()?, admin_id)
 }
 
 /// [`resolve`] once the archive's numbers are known.

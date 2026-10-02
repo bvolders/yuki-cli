@@ -515,7 +515,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                     )));
                                 }
                                 let number = invoice.number.as_deref().unwrap_or_default();
-                                InvoiceLedger::peek(&config)?
+                                InvoiceLedger::peek()?
                                     .check_reserved(&admin_id, number, &hash)
                                     .map_err(invalid_input)?;
                                 binding = Some(hash);
@@ -549,7 +549,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         let config = load()?;
                         let target = config.target(admin)?;
                         yuki_cli::cli::invoice_ledger::warn(
-                            &InvoiceLedger::peek(&config)?,
+                            &InvoiceLedger::peek()?,
                             target.admin_id,
                         );
                         if let Some(request) = &inputs.number {
@@ -635,7 +635,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             && let Ok(target) = config.target(admin)
                         {
                             use yuki_cli::cli::invoice_ledger::{InvoiceLedger, warn};
-                            warn(&InvoiceLedger::peek(config)?, target.admin_id);
+                            warn(&InvoiceLedger::peek()?, target.admin_id);
                         }
                         if let (Some(request), Some(config)) = (&inputs.number, &config) {
                             config.target(admin)?;
@@ -693,13 +693,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             (None, None) => None,
                         };
                         let config = load()?;
-                        invoice_ledger::numbers(
-                            &config,
-                            config.target(admin)?.admin_id,
-                            admin.is_some(),
-                            settle,
-                            format,
-                        )?;
+                        invoice_ledger::numbers(config.target(admin)?.admin_id, settle, format)?;
                     }
                     SalesInvoiceCommands::Templates => {
                         yuki_cli::cli::sales_invoice::templates(format)?;

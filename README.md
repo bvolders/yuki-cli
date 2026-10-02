@@ -409,13 +409,6 @@ check "To be sent" or Sales in Yuki, then
 with `--quiet --yes`, a booking prints one line to stderr:
 `BOOKS IMMEDIATELY: <number> <customer> <gross>`. The ledger keeps each
 administration's numbers apart, and `2026-01` is the same number as `2026-1`.
-Entries written before the ledger recorded the administration belong to the
-configuration's only administration, if it has one, and are saved as such on
-the next write. With several administrations they count for none: every
-command lists them in a warning, and only
-`yuki --admin <name> sales invoice numbers --resolve <number> booked|rejected`
-(or `--release`), with an explicit `--admin`, settles one, recording it as that
-administration's.
 
 The structured reference (`+++DDD/DDDD/DDDCC+++`) has ten base digits: the
 year, then the sequence padded to six digits, for a `<year>-<seq>` number

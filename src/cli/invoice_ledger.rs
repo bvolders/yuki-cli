@@ -15,12 +15,7 @@
 //! may be given out again.
 //!
 //! Numbers belong to an administration (its `admin_id`): each administration
-//! numbers its invoices on its own. Entries written before the ledger
-//! recorded the administration are given to the configuration's only
-//! administration when it has one (and saved so on the next write);
-//! otherwise they count for none, are listed in a warning, and only
-//! `numbers --resolve`/`--release` with an explicit `--admin` settles them.
-//! Numbers compare as [`same_number`]: `2026-01` is `2026-1`.
+//! numbers its invoices on its own. Numbers compare as [`same_number`]: `2026-01` is `2026-1`.
 //!
 //! The file is a [`Ledger`]: written atomically, and locked by an OS lock on
 //! `.invoice-numbers.json.lock` only for each short read-and-write, never
@@ -68,10 +63,8 @@ impl Status {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub number: String,
-    /// The administration (`admin_id`) the number belongs to; absent in
-    /// entries written before it was recorded (see the module docs).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admin: Option<String>,
+    /// The administration (`admin_id`) the number belongs to.
+    pub admin: String,
     /// Invoice date.
     pub date: String,
     pub customer: String,
@@ -96,7 +89,7 @@ pub struct Entry {
 impl Entry {
     /// Whether the entry counts for administration `admin`.
     fn of(&self, admin: &str) -> bool {
-        self.admin.as_deref() == Some(admin)
+        self.admin == admin
     }
 }
 
@@ -126,46 +119,17 @@ pub struct Numbers {
 }
 
 impl LedgerFormat for Numbers {
-    // 2: reservations, hashes and notes.
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 1;
     const WHAT: &'static str = "invoice number ledger";
     const START_OVER: &'static str =
         " (its numbers would be given out again until the sales archive shows them)";
-    // Ledgers written before the format was versioned.
-    const UNVERSIONED: bool = true;
 }
 
 impl Numbers {
-    /// Give the entries without an administration to `admin`.
-    fn adopt(&mut self, admin: &str) {
-        for entry in self.entries.iter_mut().filter(|e| e.admin.is_none()) {
-            entry.admin = Some(admin.to_string());
-        }
-    }
-
-    /// Give the latest entry without an administration for `number` to
-    /// `admin`, so it can be settled there; whether there was one.
-    fn claim_legacy(&mut self, admin: &str, number: &str) -> bool {
-        match self
-            .entries
-            .iter_mut()
-            .rev()
-            .find(|e| e.admin.is_none() && same_number(&e.number, number))
-        {
-            Some(entry) => {
-                entry.admin = Some(admin.to_string());
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// What needs attention, as warning lines: reservations of `admin`
-    /// older than [`STALE_DAYS`] on `today` (epoch days), and entries that
-    /// belong to no administration.
+    /// Reservations of `admin` older than [`STALE_DAYS`] on `today` (epoch
+    /// days), as warning lines.
     pub fn warnings(&self, admin: &str, today: i64) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .entries_of(admin)
+        self.entries_of(admin)
             .filter(|e| e.status == Status::Reserved)
             .filter(|e| epoch_days(&e.recorded_at).is_some_and(|d| today - d > STALE_DAYS))
             .map(|e| {
@@ -176,20 +140,7 @@ impl Numbers {
                     e.customer
                 )
             })
-            .collect();
-        let orphans: Vec<&str> = self
-            .entries
-            .iter()
-            .filter(|e| e.admin.is_none() && e.status != Status::Rejected)
-            .map(|e| e.number.as_str())
-            .collect();
-        if !orphans.is_empty() {
-            out.push(format!(
-                "the invoice number ledger has numbers recorded without an administration ({}): they count for none; settle each with `yuki --admin <name> sales invoice numbers --resolve <number> booked|rejected` (or --release)",
-                orphans.join(", ")
-            ));
-        }
-        out
+            .collect()
     }
 
     /// The entry of `admin` still holding `number` (not rejected), if any.
@@ -239,7 +190,7 @@ impl Numbers {
         }
         self.entries.push(Entry {
             number: claim.number.to_string(),
-            admin: Some(claim.admin.to_string()),
+            admin: claim.admin.to_string(),
             date: claim.date.to_string(),
             customer: claim.customer.to_string(),
             gross: claim.gross.to_string(),
@@ -303,14 +254,9 @@ impl Numbers {
 pub struct InvoiceLedger(Ledger<Numbers>);
 
 impl InvoiceLedger {
-    /// Lock and load the ledger at its default path, for `config`: a
-    /// configuration with one administration takes the entries without one.
-    pub fn open(config: &Config) -> Result<Self, YukiError> {
-        let mut ledger = Self::open_at(&ledger_path())?;
-        if let Some(admin) = sole_admin(config) {
-            ledger.0.state_mut().adopt(admin);
-        }
-        Ok(ledger)
+    /// Lock and load the ledger at its default path.
+    pub fn open() -> Result<Self, YukiError> {
+        Self::open_at(&ledger_path())
     }
 
     /// Lock and load the ledger at `path`, waiting while another run holds
@@ -319,14 +265,9 @@ impl InvoiceLedger {
         Ledger::open_wait(path).map(Self)
     }
 
-    /// The numbers in the ledger at its default path, read without the lock,
-    /// for `config` as [`open`](Self::open) reads them.
-    pub fn peek(config: &Config) -> Result<Numbers, YukiError> {
-        let mut numbers = Ledger::<Numbers>::peek(&ledger_path())?.state().clone();
-        if let Some(admin) = sole_admin(config) {
-            numbers.adopt(admin);
-        }
-        Ok(numbers)
+    /// The numbers in the ledger at its default path, read without the lock.
+    pub fn peek() -> Result<Numbers, YukiError> {
+        Ok(Ledger::<Numbers>::peek(&ledger_path())?.state().clone())
     }
 
     pub fn list(&self) -> &Numbers {
@@ -426,20 +367,6 @@ impl InvoiceLedger {
     }
 }
 
-/// The `admin_id` of the configuration's only administration, if it has
-/// exactly one.
-fn sole_admin(config: &Config) -> Option<&str> {
-    match config
-        .administrations
-        .values()
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [only] => Some(only.admin_id.as_str()),
-        _ => None,
-    }
-}
-
 /// Print [`Numbers::warnings`] for `admin` to stderr.
 pub fn warn(numbers: &Numbers, admin: &str) {
     let today = std::time::SystemTime::now()
@@ -484,34 +411,22 @@ pub enum Settle<'a> {
 }
 
 /// `sales invoice numbers`: list the numbers of administration `admin`,
-/// after settling one by hand when `settle` is given. With `explicit` (an
-/// `--admin` on the command line) an entry without an administration may be
-/// settled, and is then recorded as `admin`'s.
+/// after settling one by hand when `settle` is given.
 pub fn numbers(
-    config: &Config,
     admin: &str,
-    explicit: bool,
     settle: Option<Settle<'_>>,
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let numbers = match settle {
         Some(settle) => {
-            let mut ledger = InvoiceLedger::open(config)?;
-            let (Settle::Resolve(number, _) | Settle::Release(number)) = settle;
-            let own = ledger
-                .list()
-                .entries_of(admin)
-                .any(|e| same_number(&e.number, number));
-            if explicit && !own {
-                ledger.0.state_mut().claim_legacy(admin, number);
-            }
+            let mut ledger = InvoiceLedger::open()?;
             match settle {
                 Settle::Resolve(number, status) => ledger.resolve(admin, number, status)?,
                 Settle::Release(number) => ledger.release(admin, number)?,
             }
             ledger.list().clone()
         }
-        None => InvoiceLedger::peek(config)?,
+        None => InvoiceLedger::peek()?,
     };
     warn(&numbers, admin);
     let headers: Vec<String> = [
@@ -636,31 +551,6 @@ mod tests {
     }
 
     #[test]
-    fn a_ledger_written_before_versioning_still_loads() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("invoice-numbers.json");
-        std::fs::write(
-            &path,
-            r#"{"entries": [{"number": "2026-19", "date": "2026-09-30", "customer": "X",
-                "gross": "1.00", "status": "booked", "recorded_at": "2026-09-30T10:00:00Z",
-                "invoice_pdf": "kept"}]}"#,
-        )
-        .unwrap();
-        let mut ledger = InvoiceLedger::open_at(&path).unwrap();
-        // An entry without an administration counts for none, with a warning.
-        assert_eq!(ledger.list().taken_numbers("any").count(), 0);
-        let warnings = ledger.list().warnings("any", 0);
-        assert!(
-            warnings[0].contains("without an administration (2026-19)"),
-            "{warnings:?}"
-        );
-        ledger.reserve(&claim("a1", "2026-20")).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"version\": 2"), "{text}");
-        assert!(text.contains("\"invoice_pdf\": \"kept\""), "{text}");
-    }
-
-    #[test]
     fn a_reservation_is_sent_only_for_its_content_and_can_be_released() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("invoice-numbers.json");
@@ -697,31 +587,6 @@ mod tests {
         ledger.resolve("a1", "2026-22", Status::Rejected).unwrap();
         assert!(ledger.list().holder("a1", "2026-21").is_none());
         assert!(ledger.list().holder("a1", "2026-22").is_none());
-    }
-
-    #[test]
-    fn legacy_entries_go_to_a_sole_administration_or_to_an_explicit_settle() {
-        let legacy = || {
-            let mut numbers = Numbers::default();
-            numbers.reserve(&claim("x", "2026-19")).unwrap();
-            numbers.entries[0].admin = None;
-            numbers
-        };
-        let mut sole = legacy();
-        sole.adopt("a1");
-        assert_eq!(
-            sole.holder("a1", "2026-19").unwrap().admin.as_deref(),
-            Some("a1")
-        );
-        assert!(sole.warnings("a1", 0).is_empty());
-
-        let mut many = legacy();
-        assert!(many.holder("a1", "2026-19").is_none());
-        assert!(many.settle("a1", "2026-19", Status::Booked).is_err());
-        assert!(!many.claim_legacy("a1", "2026-20"));
-        assert!(many.claim_legacy("a1", "2026-019"));
-        many.settle("a1", "2026-19", Status::Booked).unwrap();
-        assert!(many.warnings("a1", 0).is_empty());
     }
 
     #[test]
