@@ -594,7 +594,7 @@ fn a_prepared_file_needs_a_number_an_administration_and_a_due_date() {
     for (field, expect) in [
         ("number", "no number"),
         ("admin_id", "names no administration"),
-        ("due_date", "no due date"),
+        ("due_date", "needs a due date"),
     ] {
         let mut broken = json.clone();
         broken[field] = serde_json::Value::Null;

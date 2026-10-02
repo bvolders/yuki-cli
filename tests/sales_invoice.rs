@@ -682,16 +682,24 @@ fn flags_that_would_change_a_prepared_invoice_are_refused() {
     let draft = create_prepared(&home, &file, &["--yes"]);
     assert_eq!(draft.status.code(), Some(1));
     assert!(stderr(&draft).contains("a prepared invoice is booked"));
-    let loose = create(
-        &home,
-        &["--template", "hosting", "--pdf", "x.pdf", "--book", "--yes"],
-    );
-    assert_eq!(loose.status.code(), Some(1));
-    assert!(
-        stderr(&loose).contains("--pdf needs --prepared"),
-        "{}",
-        stderr(&loose)
-    );
+    // clap refuses --pdf without --prepared, alone or next to a template.
+    for args in [
+        &["--template", "hosting", "--pdf", "x.pdf", "--book", "--yes"][..],
+        &["--pdf", "x.pdf", "--book", "--yes"][..],
+    ] {
+        let loose = create(&home, args);
+        assert_eq!(loose.status.code(), Some(2), "{args:?}");
+        let err = stderr(&loose);
+        assert!(
+            err.contains("'--pdf <PATH>' cannot be used with")
+                || err.contains("required arguments were not provided:\n  --prepared <FILE>"),
+            "{args:?}: {err}"
+        );
+    }
+    // Nothing to create from.
+    let nothing = create(&home, &["--book", "--yes"]);
+    assert_eq!(nothing.status.code(), Some(1));
+    assert!(stderr(&nothing).contains("give the invoice: --file"));
     assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
 }
 

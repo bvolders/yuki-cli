@@ -482,6 +482,27 @@ impl Invoice {
         json
     }
 
+    /// What booking it as `send` needs, checked in one place for every way
+    /// an invoice is booked: a due date, and the customer's email when it is
+    /// emailed to a contact without a code.
+    pub fn check_bookable(&self, send: SendMode) -> Result<(), InvoiceError> {
+        let mut problems = Vec::new();
+        if self.due_date.is_none() {
+            problems.push("a booked invoice needs a due date: give due_days or due_date");
+        }
+        if send.email() && self.contact.code.is_none() && self.contact.email.is_none() {
+            problems.push("--send email needs contact.email for a contact without a code");
+        }
+        match problems.as_slice() {
+            [] => Ok(()),
+            _ => Err(InvoiceError::InvalidInput(format!(
+                "{} cannot be booked:\n  - {}",
+                self.origin,
+                problems.join("\n  - ")
+            ))),
+        }
+    }
+
     /// Whether a line is at 0% VAT without a `vat_mention` to explain why.
     pub fn lacks_vat_mention(&self) -> bool {
         self.vat_mention.is_none() && self.lines.iter().any(|l| l.vat_percentage == 0)
@@ -891,12 +912,16 @@ pub fn parse(
 ) -> Result<Invoice, InvoiceError> {
     let spec: InvoiceSpec = toml::from_str(text)
         .map_err(|e| InvoiceError::InvalidInput(format!("invalid invoice {origin}: {e}")))?;
-    validate(spec, origin, overrides, send).map_err(|problems| {
+    let invoice = validate(spec, origin, overrides, send).map_err(|problems| {
         InvoiceError::InvalidInput(format!(
             "invalid invoice {origin}:\n  - {}",
             problems.join("\n  - ")
         ))
-    })
+    })?;
+    if let Some(send) = send {
+        invoice.check_bookable(send)?;
+    }
+    Ok(invoice)
 }
 
 /// Collects every problem, so one run reports them all.
@@ -1021,9 +1046,6 @@ fn validate(
     let remarks = p.text("remarks", spec.remarks);
     let notes = p.text("notes", spec.notes);
     let vat_mention = p.text("vat_mention", spec.vat_mention);
-    if send.is_some() && due_date.is_none() && !p.0.iter().any(|e| e.contains("due_")) {
-        p.push("a booked invoice needs a due date: give due_days or due_date");
-    }
     if notes
         .as_ref()
         .is_some_and(|n| n.chars().count() > NOTES_MAX)
@@ -1090,10 +1112,6 @@ fn validate(
             Cents(net as i64)
         ));
     }
-    if send.is_some_and(SendMode::email) && contact.code.is_none() && contact.email.is_none() {
-        p.push("--send email needs contact.email for a contact without a code");
-    }
-
     if !p.0.is_empty() {
         return Err(p.0);
     }
@@ -1450,11 +1468,6 @@ impl Invoice {
             return Err(bad("it has no lines".into()));
         }
         let due_date = file.due_date.map(|d| d.iso);
-        if due_date.is_none() {
-            return Err(bad(
-                "it has no due date, which a booked invoice needs: give due_days or due_date and prepare it again".into(),
-            ));
-        }
         let c = file.customer;
         let invoice = Self {
             origin: origin.to_string(),
@@ -1484,11 +1497,7 @@ impl Invoice {
             lines,
             send: Some(send),
         };
-        if send.email() && invoice.contact.code.is_none() && invoice.contact.email.is_none() {
-            return Err(bad(
-                "--send email needs the customer's email for a contact without a code".into(),
-            ));
-        }
+        invoice.check_bookable(send)?;
         Ok((invoice, admin_id))
     }
 
@@ -1525,12 +1534,8 @@ pub fn write_prepared(
     let number = invoice.number.as_deref().ok_or_else(|| {
         InvoiceError::InvalidInput("--out needs --number auto or a number".into())
     })?;
-    if invoice.due_date.is_none() {
-        return Err(InvoiceError::InvalidInput(
-            "a prepared invoice is booked, which needs a due date: give due_days or due_date"
-                .into(),
-        ));
-    }
+    // A prepared invoice is booked; how it is sent is decided at create.
+    invoice.check_bookable(SendMode::Book)?;
     if out.exists() {
         return Err(InvoiceError::InvalidInput(format!(
             "{} exists already; choose another --out (an older prepared invoice keeps its reservation until released)",
@@ -1924,11 +1929,6 @@ pub async fn create(
     quiet: bool,
     format: Option<&str>,
 ) -> Result<(), InvoiceError> {
-    if args.pdf.is_some() && args.prepared.is_none() {
-        return Err(InvoiceError::InvalidInput(
-            "--pdf needs --prepared: prepare the invoice with `sales invoice prepare --out <file.json>`, render the PDF from that file, then `create --prepared <file.json> --pdf <pdf>`".into(),
-        ));
-    }
     // A prepared invoice: exactly that content, its number still reserved
     // for it in this administration.
     let mut binding: Option<String> = None;
@@ -1945,10 +1945,8 @@ pub async fn create(
             if let Some(pdf) = args.pdf {
                 invoice.attach_pdf(pdf)?;
             }
+            // The firm is in the file (and its hash): no [seller] needed.
             let config = load_config()?;
-            if config.seller.is_none() {
-                return Err(seller_missing());
-            }
             let target = config.target(admin)?;
             if target.admin_id != admin_id {
                 return Err(InvoiceError::InvalidInput(format!(
@@ -1964,7 +1962,12 @@ pub async fn create(
             invoice
         }
         (None, Some(source)) => load(source, &args.overrides, args.send)?,
-        (None, None) => unreachable!("clap requires --file, --template or --prepared"),
+        (None, None) => {
+            return Err(InvoiceError::InvalidInput(
+                "give the invoice: --file <toml>, --template <name>, or --prepared <file.json>"
+                    .into(),
+            ));
+        }
     };
     // A dry run makes no API call (and, unprepared, needs no configuration).
     if args.dry_run {

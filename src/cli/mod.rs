@@ -452,7 +452,7 @@ pub enum SalesInvoiceCommands {
     /// terminal. --dry-run prints the preview and the exact xmlDoc without
     /// contacting Yuki. Booking is immediate: there is no draft to review.
     #[command(group(
-        clap::ArgGroup::new("source").required(true).args(["file", "template", "prepared"])
+        clap::ArgGroup::new("source").args(["file", "template"])
     ))]
     Create {
         #[command(flatten)]
@@ -461,13 +461,25 @@ pub enum SalesInvoiceCommands {
         /// A prepared invoice (`prepare --out`) to book exactly: its number
         /// must still be reserved for this content. Takes no other invoice
         /// inputs; needs --send or --book.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["qty", "price", "date", "subject"])]
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["source", "qty", "price", "date", "subject"]
+        )]
         prepared: Option<String>,
 
         /// Custom invoice PDF (max 3 MB) rendered from the --prepared file.
         /// Yuki stores it, as `Invoice <number>.pdf`, instead of the invoice it
         /// would generate; the lines still set the booked amounts.
-        #[arg(long, value_name = "PATH")]
+        // clap does not require an arg that conflicts with a present one, so
+        // `requires = "prepared"` alone would let `--template … --pdf` pass:
+        // the conflict says it.
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "prepared",
+            conflicts_with = "source"
+        )]
         pdf: Option<String>,
 
         /// Book the invoice and send it: email, peppol, or both. Without it
