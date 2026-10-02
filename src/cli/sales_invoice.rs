@@ -862,10 +862,7 @@ impl XmlWriter {
 
 /// The directory saved templates live in: `invoices/` next to the config.
 pub fn templates_dir() -> PathBuf {
-    let config = Config::default_path();
-    config
-        .parent()
-        .map_or_else(|| PathBuf::from("invoices"), |dir| dir.join("invoices"))
+    Config::dir().join("invoices")
 }
 
 /// The file of template `name`; a name is letters, digits, `-` and `_`.

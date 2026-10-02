@@ -10,8 +10,7 @@
 
 use crate::cli::invoice_ledger::{InvoiceLedger, given_out};
 use crate::cli::sales_invoice::InvoiceError;
-use crate::cli::setup_domain;
-use crate::client::archive::ArchiveClient;
+use crate::cli::setup_archive;
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::folders::folder_id;
@@ -139,11 +138,7 @@ async fn archive_numbers(
     admin: Option<&str>,
     years: &[u32],
 ) -> Result<Vec<String>, YukiError> {
-    let (accounting, target) = setup_domain(config, admin).await?;
-    let session = accounting.session_id().unwrap_or_default();
-    let client = ArchiveClient::new()
-        .with_api_root(target.api_root)
-        .with_session(session);
+    let (_, client, _) = setup_archive(config, admin).await?;
     let mut files = Vec::new();
     for year in years {
         let (start, end) = parse_period(&year.to_string())?;

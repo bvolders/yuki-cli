@@ -242,6 +242,14 @@ pub struct Endpoint<'a> {
 }
 
 impl Config {
+    /// The directory the config lives in, where the invoice templates and
+    /// the invoice number ledger live too.
+    pub fn dir() -> PathBuf {
+        Self::default_path()
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    }
+
     pub fn default_path() -> PathBuf {
         #[cfg(unix)]
         {

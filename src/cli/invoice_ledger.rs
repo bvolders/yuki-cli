@@ -363,10 +363,7 @@ impl InvoiceLedger {
 
 /// The ledger file: `invoice-numbers.json` next to the config.
 pub fn ledger_path() -> PathBuf {
-    Config::default_path().parent().map_or_else(
-        || PathBuf::from("invoice-numbers.json"),
-        |dir| dir.join("invoice-numbers.json"),
-    )
+    Config::dir().join("invoice-numbers.json")
 }
 
 /// `sales invoice numbers`: list the selected administration's numbers,

@@ -7,12 +7,12 @@ use std::collections::{HashMap, HashSet};
 use futures_util::future::try_join_all;
 
 use super::resolve_period;
-use crate::cli::setup_domain;
+use crate::cli::setup_archive;
 use crate::client::Region;
 use crate::client::accounting::{
     AccountingClient, GlTransactionWithContact, OutstandingItem, TransactionType,
 };
-use crate::client::archive::{ArchiveClient, ArchiveDocument};
+use crate::client::archive::ArchiveDocument;
 use crate::config::Config;
 use crate::error::YukiError;
 pub(super) use crate::money::Cents;
@@ -729,7 +729,14 @@ pub async fn unmatched(
     quiet: bool,
 ) -> Result<(), YukiError> {
     let (start, end) = resolve_period(period)?;
-    let (accounting, target) = setup_domain(config, admin).await?;
+    // The Accounting session works on the archive too, saving an
+    // Authenticate. It also carries SetCurrentDomain(target.domain_id), so
+    // the archive is searched in the target administration's domain,
+    // deliberately: the documents must belong to the administration whose
+    // bank lines are being checked. A fresh Archive session (as `documents`
+    // and `upload` use) would search the key's default domain instead, which
+    // differs for a key that reaches several domains.
+    let (accounting, archive, target) = setup_archive(config, admin).await?;
     let setup = UnmatchedSetup::resolve(config, target.config_name, bank_accounts);
     // Read the creditors account far enough back to see invoices paid later.
     let lookback = month_start_before(&start, LOOKBACK_MONTHS);
@@ -748,19 +755,6 @@ pub async fn unmatched(
         eprintln!("Fetching booked invoices from archive...");
     }
     let admin_id = target.admin_id;
-    // The Accounting session works on the archive too, saving an Authenticate.
-    // It also carries SetCurrentDomain(target.domain_id), so the archive is
-    // searched in the target administration's domain, deliberately: the
-    // documents must belong to the administration whose bank lines are being
-    // checked. A fresh Archive session (as `documents` and `upload` use) would
-    // search the key's default domain instead, which differs for a key that
-    // reaches several domains.
-    let session = accounting
-        .session_id()
-        .ok_or_else(|| YukiError::AuthFailed("no session after authenticating".into()))?;
-    let archive = ArchiveClient::new()
-        .with_api_root(target.api_root)
-        .with_session(session);
     // The requests are independent, so they run concurrently; results keep
     // their order, so the output does not depend on timing.
     let (bank_entries, creditor_entries, transfer_entries, creditor_items, archive_docs) = tokio::try_join!(

@@ -22,6 +22,7 @@ use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 
 use crate::client::Region;
 use crate::client::accounting::AccountingClient;
+use crate::client::archive::ArchiveClient;
 use crate::config::{Config, Target};
 use crate::error::YukiError;
 
@@ -73,6 +74,24 @@ pub async fn setup_domain<'a>(
     client.authenticate(target.api_key).await?;
     client.set_current_domain(target.domain_id).await?;
     Ok((client, target))
+}
+
+/// [`setup_domain`], plus an archive client on the same session. The
+/// archive's folder listings take no administration: they read the
+/// session's current domain, which `SetCurrentDomain` set to the target's,
+/// and sharing the session saves an Authenticate.
+pub async fn setup_archive<'a>(
+    config: &'a Config,
+    admin: Option<&str>,
+) -> Result<(AccountingClient, ArchiveClient, Target<'a>), YukiError> {
+    let (accounting, target) = setup_domain(config, admin).await?;
+    let session = accounting
+        .session_id()
+        .ok_or_else(|| YukiError::AuthFailed("no session after authenticating".into()))?;
+    let archive = ArchiveClient::new()
+        .with_api_root(target.api_root)
+        .with_session(session);
+    Ok((accounting, archive, target))
 }
 
 /// Top-level CLI entry point for the Yuki bookkeeping API client.

@@ -638,13 +638,7 @@ async fn seed(
     }
 
     let config = load_config()?;
-    // DocumentsInFolder takes no administration: it reads the session's
-    // current domain, so select it first.
-    let (accounting, target) = crate::cli::setup_domain(&config, admin).await?;
-    let session = accounting.session_id().unwrap_or_default();
-    let client = ArchiveClient::new()
-        .with_api_root(target.api_root)
-        .with_session(session);
+    let (_, client, _) = crate::cli::setup_archive(&config, admin).await?;
     let mut docs: Vec<(String, ArchiveDocument)> = Vec::new();
     for (folder, id) in folders {
         let found = client.documents_in_folder_all(*id).await?;
