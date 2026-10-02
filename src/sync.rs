@@ -247,10 +247,17 @@ impl Lock {
 
 /// The lowercase hex sha256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The size and sha256 of the file at `path`, streamed rather than read whole.
+fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
+    let mut hasher = Sha256::new();
+    let size = std::io::copy(
+        &mut std::io::BufReader::new(fs::File::open(path)?),
+        &mut hasher,
+    )?;
+    Ok((size, format!("{:x}", hasher.finalize())))
 }
 
 /// A file name in the form both sides of a name match are compared in:
@@ -461,12 +468,12 @@ fn walk(dir: &Path, prefix: &str, excludes: &Excludes, out: &mut Scan) {
                 continue;
             }
             let path = entry.path();
-            match fs::read(&path) {
-                Ok(bytes) => out.files.push(Found {
+            match hash_file(&path) {
+                Ok((size, hash)) => out.files.push(Found {
                     rel,
                     path,
-                    size: bytes.len() as u64,
-                    hash: sha256_hex(&bytes),
+                    size,
+                    hash,
                 }),
                 Err(e) => out.unreadable.push((rel, e.to_string())),
             }
