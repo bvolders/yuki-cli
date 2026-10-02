@@ -8,7 +8,7 @@
 //! existing numbers are. Yuki's own counter does not learn about numbers
 //! given this way, so once invoices are numbered here, number them all here.
 
-use crate::cli::invoice_ledger::{InvoiceLedger, Ledger};
+use crate::cli::invoice_ledger::{InvoiceLedger, Numbers};
 use crate::cli::setup_domain;
 use crate::client::archive::ArchiveClient;
 use crate::config::Config;
@@ -157,8 +157,7 @@ pub async fn resolve(
         years.push(n.year);
     }
     let archive = archive_numbers(config, admin, &years).await?;
-    let ledger = InvoiceLedger::open()?;
-    choose(request, year, &archive, ledger.list())
+    choose(request, year, &archive, &InvoiceLedger::peek()?)
 }
 
 /// [`resolve`] once the archive's numbers are known.
@@ -166,7 +165,7 @@ pub fn choose(
     request: &NumberRequest,
     year: u32,
     archive: &[String],
-    ledger: &Ledger,
+    ledger: &Numbers,
 ) -> Result<String, YukiError> {
     let held: Vec<String> = ledger.taken_numbers().map(str::to_string).collect();
     let number = match request {
@@ -307,7 +306,7 @@ mod tests {
     #[test]
     fn the_ledger_holds_numbers_the_archive_does_not_show_yet() {
         let archive = numbers_in_file_names(&archive());
-        let mut ledger = Ledger::default();
+        let mut ledger = Numbers::default();
         ledger
             .reserve("2026-20", "2026-10-31", "Example BV", "121.00")
             .unwrap();

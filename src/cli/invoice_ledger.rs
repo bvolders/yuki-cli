@@ -10,16 +10,19 @@
 //! `sales invoice numbers --resolve` settles it. Only a rejected number may
 //! be given out again.
 //!
-//! The API is deliberately narrow (open, reserve, commit, reject, list,
-//! resolve) so its storage can later move to a shared write-ahead ledger.
+//! The file is a [`Ledger`]: written atomically, and locked by an OS lock on
+//! `.invoice-numbers.json.lock` only for each short read-and-write, never
+//! while Yuki is called, so a crash cannot leave it locked.
 
-use std::io::Write as _;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::Config;
 use crate::error::YukiError;
+use crate::ledger::{Ledger, LedgerFormat};
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
 use crate::period::date_from_epoch_days;
 
@@ -59,16 +62,31 @@ pub struct Entry {
     /// When the booking was recorded (or resolved by hand), UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub booked_at: Option<String>,
+    /// Fields this version does not know, kept as they are.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// The ledger's entries, in memory.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct Ledger {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Numbers {
     #[serde(default)]
     entries: Vec<Entry>,
+    /// Top-level fields this version does not know, kept as they are.
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
-impl Ledger {
+impl LedgerFormat for Numbers {
+    const VERSION: u32 = 1;
+    const WHAT: &'static str = "invoice number ledger";
+    const START_OVER: &'static str =
+        " (its numbers would be given out again until the sales archive shows them)";
+    // Ledgers written before the format was versioned.
+    const UNVERSIONED: bool = true;
+}
+
+impl Numbers {
     /// The entry still holding `number` (pending or booked), if any.
     pub fn holder(&self, number: &str) -> Option<&Entry> {
         self.entries
@@ -111,6 +129,7 @@ impl Ledger {
             status: Status::Pending,
             recorded_at: now_utc(),
             booked_at: None,
+            extra: BTreeMap::new(),
         });
         Ok(())
     }
@@ -132,11 +151,7 @@ impl Ledger {
 }
 
 /// The ledger file, locked while open so two runs cannot reserve at once.
-pub struct InvoiceLedger {
-    path: PathBuf,
-    ledger: Ledger,
-    _lock: Lock,
-}
+pub struct InvoiceLedger(Ledger<Numbers>);
 
 impl InvoiceLedger {
     /// Lock and load the ledger at its default path.
@@ -146,22 +161,16 @@ impl InvoiceLedger {
 
     /// Lock and load the ledger at `path`; a missing file is an empty ledger.
     pub fn open_at(path: &Path) -> Result<Self, YukiError> {
-        let lock = Lock::acquire(path)?;
-        let ledger = match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text)
-                .map_err(|e| YukiError::Config(format!("{}: {e}", path.display())))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ledger::default(),
-            Err(e) => return Err(YukiError::Config(format!("{}: {e}", path.display()))),
-        };
-        Ok(Self {
-            path: path.to_path_buf(),
-            ledger,
-            _lock: lock,
-        })
+        Ledger::open(path).map(Self)
     }
 
-    pub fn list(&self) -> &Ledger {
-        &self.ledger
+    /// The numbers in the ledger at its default path, read without the lock.
+    pub fn peek() -> Result<Numbers, YukiError> {
+        Ledger::<Numbers>::peek(&ledger_path()).map(|l| l.state().clone())
+    }
+
+    pub fn list(&self) -> &Numbers {
+        self.0.state()
     }
 
     /// Write-ahead: record `number` as pending before it is sent.
@@ -172,20 +181,20 @@ impl InvoiceLedger {
         customer: &str,
         gross: &str,
     ) -> Result<(), YukiError> {
-        self.ledger.reserve(number, date, customer, gross)?;
-        self.save()
+        self.0.state_mut().reserve(number, date, customer, gross)?;
+        self.0.save()
     }
 
     /// Yuki booked `number`.
     pub fn commit(&mut self, number: &str) -> Result<(), YukiError> {
-        self.ledger.settle(number, Status::Booked)?;
-        self.save()
+        self.0.state_mut().settle(number, Status::Booked)?;
+        self.0.save()
     }
 
     /// Yuki did not create `number`: free it again.
     pub fn reject(&mut self, number: &str) -> Result<(), YukiError> {
-        self.ledger.settle(number, Status::Rejected)?;
-        self.save()
+        self.0.state_mut().settle(number, Status::Rejected)?;
+        self.0.save()
     }
 
     /// Settle a pending `number` by hand, after checking Yuki.
@@ -197,68 +206,6 @@ impl InvoiceLedger {
                 "resolve a number as booked or rejected".into(),
             )),
         }
-    }
-
-    /// Write atomically: a temporary file in the same directory, flushed to
-    /// disk, renamed over the ledger, then the directory synced, so a crash
-    /// leaves the old ledger or the new one, never half of one.
-    fn save(&self) -> Result<(), YukiError> {
-        let path = &self.path;
-        let fail = |e: std::io::Error| YukiError::Config(format!("{}: {e}", path.display()));
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let text = serde_json::to_string_pretty(&self.ledger).expect("serialize ledger");
-        let tmp = sibling(path, &format!("tmp-{}", std::process::id()));
-        let mut file = std::fs::File::create(&tmp).map_err(fail)?;
-        file.write_all(text.as_bytes()).map_err(fail)?;
-        file.sync_all().map_err(fail)?;
-        drop(file);
-        std::fs::rename(&tmp, path).map_err(fail)?;
-        if let Ok(dir) = std::fs::File::open(dir) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    }
-}
-
-/// `.<file name>.<suffix>` next to `path`.
-fn sibling(path: &Path, suffix: &str) -> PathBuf {
-    let name = path
-        .file_name()
-        .map_or("ledger".into(), |n| n.to_string_lossy());
-    path.with_file_name(format!(".{name}.{suffix}"))
-}
-
-/// An exclusive lock file next to the ledger, removed when dropped.
-struct Lock(PathBuf);
-
-impl Lock {
-    fn acquire(path: &Path) -> Result<Self, YukiError> {
-        let lock = sibling(path, "lock");
-        if let Some(dir) = lock.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| YukiError::Config(format!("{}: {e}", dir.display())))?;
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
-            Ok(_) => Ok(Self(lock)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(YukiError::Config(format!(
-                    "{} is locked by another yuki run; delete {} if none is running",
-                    path.display(),
-                    lock.display()
-                )))
-            }
-            Err(e) => Err(YukiError::Config(format!("{}: {e}", lock.display()))),
-        }
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -288,17 +235,20 @@ fn now_utc() -> String {
 /// `sales invoice numbers`: list the ledger, after settling a pending
 /// number by hand when `resolve` is given.
 pub fn numbers(resolve: Option<(&str, Status)>, format: Option<&str>) -> Result<(), YukiError> {
-    let mut ledger = InvoiceLedger::open()?;
-    if let Some((number, status)) = resolve {
-        ledger.resolve(number, status)?;
-    }
+    let numbers = match resolve {
+        Some((number, status)) => {
+            let mut ledger = InvoiceLedger::open()?;
+            ledger.resolve(number, status)?;
+            ledger.list().clone()
+        }
+        None => InvoiceLedger::peek()?,
+    };
     let headers: Vec<String> = [
         "Number", "Date", "Customer", "Gross", "Status", "Recorded", "Booked",
     ]
     .map(String::from)
     .to_vec();
-    let rows: Vec<Vec<String>> = ledger
-        .list()
+    let rows: Vec<Vec<String>> = numbers
         .entries()
         .iter()
         .map(|e| {
@@ -335,7 +285,7 @@ mod tests {
                 .unwrap();
             // While open, a second run cannot open it.
             let err = InvoiceLedger::open_at(&path).err().unwrap().to_string();
-            assert!(err.contains("locked by another yuki run"), "{err}");
+            assert!(err.contains("another yuki run"), "{err}");
         }
         let mut ledger = InvoiceLedger::open_at(&path).unwrap();
         assert_eq!(
@@ -365,12 +315,41 @@ mod tests {
             ["2026-20"]
         );
         drop(ledger);
-        // Only the ledger is left: no temporary file, no lock.
-        let names: Vec<_> = std::fs::read_dir(dir.path())
+        // Only the ledger and its lock file are left, the lock released.
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(names, ["invoice-numbers.json"]);
+        names.sort();
+        assert_eq!(
+            names,
+            [".invoice-numbers.json.lock", "invoice-numbers.json"]
+        );
+        InvoiceLedger::open_at(&path).unwrap();
+    }
+
+    #[test]
+    fn a_ledger_written_before_versioning_still_loads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("invoice-numbers.json");
+        std::fs::write(
+            &path,
+            r#"{"entries": [{"number": "2026-19", "date": "2026-09-30", "customer": "X",
+                "gross": "1.00", "status": "booked", "recorded_at": "2026-09-30T10:00:00Z",
+                "invoice_pdf": "kept"}]}"#,
+        )
+        .unwrap();
+        let mut ledger = InvoiceLedger::open_at(&path).unwrap();
+        assert_eq!(
+            ledger.list().taken_numbers().collect::<Vec<_>>(),
+            ["2026-19"]
+        );
+        ledger
+            .reserve("2026-20", "2026-10-31", "X", "1.00")
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(text.contains("\"invoice_pdf\": \"kept\""), "{text}");
     }
 
     #[test]

@@ -2,14 +2,13 @@
 //! already in Yuki, keyed by content hash so a rename or move does not upload
 //! a file again.
 //!
-//! The state lives in `<root>/.yuki-sync.json` and is rewritten atomically
-//! (temporary file, fsync, rename, fsync of the directory). An OS advisory
-//! lock on `<root>/.yuki-sync.json.lock` keeps two runs apart; the kernel
-//! releases it when the holder exits or dies.
+//! The state lives in `<root>/.yuki-sync.json`, a [`Ledger`]: rewritten
+//! atomically, and locked by an OS advisory lock on `.yuki-sync.json.lock`
+//! that keeps two runs apart and that the kernel releases when the holder
+//! exits or dies.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -18,15 +17,10 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::YukiError;
+use crate::ledger::{Ledger, LedgerFormat};
 
 /// File name of the state file at the root of the synced directory.
 pub const STATE_FILE: &str = ".yuki-sync.json";
-
-/// File the advisory lock is taken on.
-pub const LOCK_FILE: &str = ".yuki-sync.json.lock";
-
-/// The state format this build reads and writes.
-pub const STATE_VERSION: u32 = 1;
 
 /// Extensions `upload dir` picks up, compared case-insensitively.
 pub const EXTENSIONS: &[&str] = &["pdf", "jpg", "jpeg", "png"];
@@ -116,7 +110,6 @@ impl Entry {
 /// The whole state file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct State {
-    pub version: u32,
     /// Hash the `files` keys are made with.
     pub hash: String,
     pub files: BTreeMap<String, Entry>,
@@ -128,7 +121,6 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            version: STATE_VERSION,
             hash: "sha256".into(),
             files: BTreeMap::new(),
             extra: BTreeMap::new(),
@@ -136,45 +128,31 @@ impl Default for State {
     }
 }
 
-impl State {
-    /// Load the state of `root`; a missing file is an empty state.
-    ///
-    /// A file that does not parse is an error, never silently replaced: it may
-    /// be the only record of what was uploaded.
-    pub fn load(root: &Path) -> Result<Self, YukiError> {
-        let path = root.join(STATE_FILE);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(YukiError::Config(format!("{}: {e}", path.display()))),
-        };
-        let corrupt = |detail: String| {
-            YukiError::Config(format!(
-                "{} is not a valid sync state ({detail}); refusing to overwrite it. \
-                 Repair it, or move it aside to start over (files already in Yuki \
-                 would then need --seed-from-yuki again)",
-                path.display()
-            ))
-        };
-        let raw: Value = serde_json::from_str(&text).map_err(|e| corrupt(e.to_string()))?;
-        match raw.get("version").and_then(Value::as_u64) {
-            Some(v) if v == u64::from(STATE_VERSION) => {}
-            Some(v) if v > u64::from(STATE_VERSION) => {
-                return Err(YukiError::Config(format!(
-                    "{} has format version {v}, newer than this yuki understands \
-                     ({STATE_VERSION}); upgrade yuki",
-                    path.display()
-                )));
-            }
-            _ => return Err(corrupt("missing or unknown \"version\"".into())),
-        }
-        let state: Self = serde_json::from_value(raw).map_err(|e| corrupt(e.to_string()))?;
-        if state.hash != "sha256" {
-            return Err(corrupt(format!("unsupported hash {:?}", state.hash)));
-        }
-        Ok(state)
-    }
+impl LedgerFormat for State {
+    const VERSION: u32 = 1;
+    const WHAT: &'static str = "sync state";
+    const START_OVER: &'static str =
+        " (files already in Yuki would then need --seed-from-yuki again)";
 
+    fn check(&self) -> Result<(), String> {
+        match self.hash.as_str() {
+            "sha256" => Ok(()),
+            other => Err(format!("unsupported hash {other:?}")),
+        }
+    }
+}
+
+/// The sync state of `root`, locked; see [`Ledger::open`].
+pub fn open(root: &Path) -> Result<Ledger<State>, YukiError> {
+    Ledger::open(&root.join(STATE_FILE))
+}
+
+/// The sync state of `root`, read without the lock: for a dry run.
+pub fn peek(root: &Path) -> Result<Ledger<State>, YukiError> {
+    Ledger::peek(&root.join(STATE_FILE))
+}
+
+impl State {
     /// The record at `rel` whose content is no longer in the tree (`present`
     /// holds the hashes scanned): a different file at that path is a changed
     /// version of it, while content that moved elsewhere keeps its record.
@@ -185,53 +163,6 @@ impl State {
                 e.path == rel && e.status != Status::Failed && !present.contains(h.as_str())
             })
             .map(|(h, e)| (h.as_str(), e))
-    }
-
-    /// Write the state of `root` atomically: a crash leaves the old or the new
-    /// file, never a partial one.
-    pub fn save(&self, root: &Path) -> Result<(), YukiError> {
-        let path = root.join(STATE_FILE);
-        let tmp = root.join(format!("{STATE_FILE}.tmp-{}", std::process::id()));
-        let mut json = serde_json::to_string_pretty(self).expect("serialize sync state");
-        json.push('\n');
-        let written = (|| {
-            let mut file = fs::File::create(&tmp)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-            fs::rename(&tmp, &path)?;
-            // Make the rename itself durable.
-            fs::File::open(root)?.sync_all()
-        })();
-        written.map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            YukiError::Config(format!("{}: {e}", path.display()))
-        })
-    }
-}
-
-/// The advisory lock on a synced directory, held while the file is open.
-#[derive(Debug)]
-pub struct Lock(#[allow(dead_code)] fs::File);
-
-impl Lock {
-    /// Take the lock of `root`, or refuse when another run holds it.
-    pub fn acquire(root: &Path) -> Result<Self, YukiError> {
-        let path = root.join(LOCK_FILE);
-        let io = |e: std::io::Error| YukiError::Config(format!("{}: {e}", path.display()));
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(io)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self(file)),
-            Err(fs::TryLockError::WouldBlock) => Err(YukiError::Config(format!(
-                "another yuki run is working on {}; try again when it has finished",
-                root.display()
-            ))),
-            Err(fs::TryLockError::Error(e)) => Err(io(e)),
-        }
     }
 }
 
@@ -562,7 +493,8 @@ mod tests {
     #[test]
     fn state_round_trips_and_keeps_unknown_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = State::default();
+        let mut ledger = open(dir.path()).unwrap();
+        let state = ledger.state_mut();
         state
             .extra
             .insert("note".into(), Value::String("kept".into()));
@@ -570,36 +502,34 @@ mod tests {
         e.extra
             .insert("matched_transaction".into(), Value::String("t-1".into()));
         state.files.insert("abc".into(), e);
-        state.save(dir.path()).unwrap();
+        ledger.save().unwrap();
         let text = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
+        assert!(text.contains("\"version\": 1"), "{text}");
         assert!(text.contains("\"matched_transaction\": \"t-1\""), "{text}");
         assert!(text.contains("\"status\": \"pending\""), "{text}");
         assert!(text.contains("\"note\": \"kept\""), "{text}");
-        let loaded = State::load(dir.path()).unwrap();
-        assert_eq!(loaded, state);
+        let loaded = peek(dir.path()).unwrap();
+        assert_eq!(loaded.state(), ledger.state());
         // An update keeps the unknown fields.
-        let updated = Entry::update(&loaded, "abc", "b.pdf", 3, Status::Uploaded);
+        let updated = Entry::update(loaded.state(), "abc", "b.pdf", 3, Status::Uploaded);
         assert_eq!(updated.extra.len(), 1);
-        // No temporary file is left behind.
-        let names: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from(STATE_FILE)]);
     }
 
     #[test]
     fn a_corrupt_or_newer_state_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(State::load(dir.path()).unwrap(), State::default());
+        assert_eq!(peek(dir.path()).unwrap().state(), &State::default());
         let path = dir.path().join(STATE_FILE);
         for (text, expect) in [
             ("{\"version\": 1, \"files\": {", "not a valid sync state"),
-            ("[]", "not a valid sync state"),
             ("{\"files\": {}}", "not a valid sync state"),
             (
                 "{\"version\": 1, \"hash\": \"sha256\", \"files\": {\"x\": {\"path\": 3}}}",
                 "not a valid sync state",
+            ),
+            (
+                "{\"version\": 1, \"hash\": \"md5\", \"files\": {}}",
+                "unsupported hash",
             ),
             (
                 "{\"version\": 9, \"hash\": \"sha256\", \"files\": {}}",
@@ -607,32 +537,9 @@ mod tests {
             ),
         ] {
             fs::write(&path, text).unwrap();
-            let err = State::load(dir.path()).unwrap_err().to_string();
+            let err = open(dir.path()).unwrap_err().to_string();
             assert!(err.contains(expect), "{text}: {err}");
         }
-    }
-
-    #[test]
-    fn a_failed_save_leaves_the_old_state_intact() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = State::default();
-        state
-            .files
-            .insert("abc".into(), entry("a.pdf", Status::Uploaded));
-        state.save(dir.path()).unwrap();
-        let before = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
-        // A directory where the temporary file would go makes the write fail
-        // before the rename, as a crash mid-write would.
-        let tmp = dir
-            .path()
-            .join(format!("{STATE_FILE}.tmp-{}", std::process::id()));
-        fs::create_dir(&tmp).unwrap();
-        state
-            .files
-            .insert("def".into(), entry("b.pdf", Status::Uploaded));
-        assert!(state.save(dir.path()).is_err());
-        let after = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
-        assert_eq!(before, after);
     }
 
     #[test]

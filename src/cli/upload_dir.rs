@@ -17,8 +17,9 @@ use crate::client::archive::{ArchiveClient, ArchiveDocument};
 use crate::config::Config;
 use crate::error::{Delivery, YukiError};
 use crate::folders::folder_id;
+use crate::ledger::Ledger;
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
-use crate::sync::{self, Entry, Excludes, Found, Lock, STATE_FILE, State, Status, shell_quote};
+use crate::sync::{self, Entry, Excludes, Found, STATE_FILE, State, Status, shell_quote};
 
 /// Options of `upload dir`.
 pub struct DirOptions<'a> {
@@ -139,8 +140,9 @@ fn name_of(f: &Found) -> &str {
 /// The directory, its state, and its files sorted into a plan.
 struct Plan {
     root: PathBuf,
-    /// The state, with the paths of renamed or moved files already updated.
-    state: State,
+    /// The state, with the paths of renamed or moved files already updated:
+    /// locked, or only read for a dry run.
+    ledger: Ledger<State>,
     /// Whether any recorded path was updated.
     moved: bool,
     /// Files to upload: new ones first, then earlier failures, in path order.
@@ -168,9 +170,9 @@ impl Plan {
     }
 }
 
-fn plan(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
+fn plan(root: PathBuf, mut ledger: Ledger<State>, excludes: &[String]) -> Result<Plan, YukiError> {
     let excludes = Excludes::new(excludes)?;
-    let mut state = State::load(&root)?;
+    let state = ledger.state();
     let scan = sync::scan(&root, &excludes)?;
     if !scan.nested_states.is_empty() {
         return Err(YukiError::Config(format!(
@@ -247,6 +249,7 @@ fn plan(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
     }
     new.extend(retries);
     let any_moved = !moved.is_empty();
+    let state = ledger.state_mut();
     for (hash, rel) in moved {
         if let Some(entry) = state.files.get_mut(&hash) {
             entry.path = rel;
@@ -254,7 +257,7 @@ fn plan(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
     }
     Ok(Plan {
         root,
-        state,
+        ledger,
         moved: any_moved,
         queue: new,
         pending,
@@ -357,9 +360,13 @@ async fn run_dir(
     let seed_folders = seed_folders(opts)?;
     let root = sync::sync_root(Path::new(opts.path))?;
     // A dry run writes nothing, so it takes no lock.
-    let _lock = (!opts.dry_run).then(|| Lock::acquire(&root)).transpose()?;
+    let ledger = if opts.dry_run {
+        sync::peek(&root)?
+    } else {
+        sync::open(&root)?
+    };
     // Accepted: concurrent first runs on /r and /r/sub can both pass these checks.
-    let mut plan = plan(root, opts.excludes)?;
+    let mut plan = plan(root, ledger, opts.excludes)?;
     if !quiet {
         print_plan(&plan, opts);
     }
@@ -407,7 +414,7 @@ async fn run_dir(
         .collect();
     if batch.is_empty() {
         if plan.moved {
-            plan.state.save(&plan.root)?;
+            plan.ledger.save()?;
         }
         if !quiet {
             rows.append(&mut plan.rows);
@@ -454,17 +461,17 @@ async fn run_dir(
             }
         };
         // Write ahead: from here until Yuki answers, the file may be in Yuki.
-        let before = plan.state.files.get(&file.hash).cloned();
         let mut entry = Entry::update(
-            &plan.state,
+            plan.ledger.state(),
             &file.hash,
             &file.rel,
             file.size,
             Status::Pending,
         );
         entry.folder = Some(opts.folder.to_string());
-        plan.state.files.insert(file.hash.clone(), entry.clone());
-        plan.state.save(&plan.root)?;
+        let ahead = plan.ledger.write_ahead(|s| {
+            s.files.insert(file.hash.clone(), entry.clone());
+        })?;
 
         if !quiet {
             eprint!("[{}/{}] {} ... ", i + 1, batch.len(), file.rel);
@@ -480,8 +487,10 @@ async fn run_dir(
                 entry.status = Status::Uploaded;
                 entry.document_id = Some(id.clone());
                 entry.uploaded_at = Some(sync::now_utc());
-                plan.state.files.insert(file.hash.clone(), entry);
-                record(&plan, &file.rel)?;
+                let saved = plan.ledger.commit(ahead, |s| {
+                    s.files.insert(file.hash.clone(), entry);
+                });
+                record(saved, &file.rel)?;
                 rows.push(Row::new(&file.rel, "uploaded").doc(Some(&id)));
                 streak = usize::MAX;
                 continue;
@@ -495,11 +504,7 @@ async fn run_dir(
             // Refused unprocessed: undo the write-ahead and stop, as every
             // further call would be refused too.
             Delivery::Refused => {
-                match before {
-                    Some(b) => plan.state.files.insert(file.hash.clone(), b),
-                    None => plan.state.files.remove(&file.hash),
-                };
-                plan.state.save(&plan.root)?;
+                plan.ledger.undo(ahead)?;
                 rows.push(Row::new(&file.rel, "not-attempted").error(e.to_string()));
                 stop = Some(e);
                 continue;
@@ -519,8 +524,10 @@ async fn run_dir(
             }
         };
         entry.error = Some(e.to_string());
-        plan.state.files.insert(file.hash.clone(), entry);
-        record(&plan, &file.rel)?;
+        let saved = plan.ledger.commit(ahead, |s| {
+            s.files.insert(file.hash.clone(), entry);
+        });
+        record(saved, &file.rel)?;
         rows.push(row);
         let kind = std::mem::discriminant(&e);
         if streak == i && first_err.is_none_or(|k| k == kind) {
@@ -555,8 +562,8 @@ async fn run_dir(
 
 /// Save the state after a result; when that fails the entry stays pending on
 /// disk, which is the safe reading.
-fn record(plan: &Plan, rel: &str) -> Result<(), YukiError> {
-    plan.state.save(&plan.root).map_err(|e| {
+fn record(saved: Result<(), YukiError>, rel: &str) -> Result<(), YukiError> {
+    saved.map_err(|e| {
         YukiError::Config(format!(
             "could not record the result for {rel}: {e}; it stays pending"
         ))
@@ -657,7 +664,8 @@ async fn seed(
     }
     // A document is claimed at most once: by the state, or by one file now.
     let recorded: HashMap<&str, &str> = plan
-        .state
+        .ledger
+        .state()
         .files
         .values()
         .filter_map(|e| Some((e.document_id.as_deref()?, e.path.as_str())))
@@ -703,7 +711,7 @@ async fn seed(
                 folder: Some(folder.clone()),
                 note: Some(format!("seeded: same file name in {folder}")),
                 ..Entry::update(
-                    &plan.state,
+                    plan.ledger.state(),
                     &file.hash,
                     &file.rel,
                     file.size,
@@ -775,11 +783,12 @@ async fn seed(
         if let Some(end) = go_ahead(confirm, &what, quiet) {
             return Ok(end);
         }
+        let state = plan.ledger.state_mut();
         for (hash, entry) in records {
             plan.pending.retain(|f| f.hash != hash);
-            plan.state.files.insert(hash, entry);
+            state.files.insert(hash, entry);
         }
-        plan.state.save(&plan.root)?;
+        plan.ledger.save()?;
     }
     Ok(outcome(plan.attention()))
 }
@@ -834,12 +843,11 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
     let bytes =
         std::fs::read(&file).map_err(|e| YukiError::Config(format!("{}: {e}", file.display())))?;
     let hash = sync::sha256_hex(&bytes);
-    let _lock = Lock::acquire(&root)?;
-    let mut state = State::load(&root)?;
+    let mut ledger = sync::open(&root)?;
 
     let (status, doc_id) = match opts.mark {
         Mark::Forget => {
-            let row = forget(&mut state, &root, &hash, &rel)?;
+            let row = forget(&mut ledger, &root, &hash, &rel)?;
             if !quiet {
                 print_rows(&[row], format);
             }
@@ -851,6 +859,7 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
         Mark::Document(id) => (Status::AlreadyInYuki, Some(id.trim().to_string())),
         Mark::Skip => (Status::Skipped, None),
     };
+    let state = ledger.state_mut();
     let claimed_by = doc_id.as_deref().and_then(|id| {
         state
             .files
@@ -886,7 +895,7 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
             )));
         }
         _ => {
-            let base = Entry::update(&state, &hash, &rel, bytes.len() as u64, status);
+            let base = Entry::update(state, &hash, &rel, bytes.len() as u64, status);
             let entry = Entry {
                 document_id: doc_id.clone(),
                 folder: opts.folder.map(str::to_string).or(base.folder.clone()),
@@ -894,7 +903,7 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
                 ..base
             };
             state.files.insert(hash, entry);
-            state.save(&root)?;
+            ledger.save()?;
             Row::new(&rel, "recorded")
                 .doc(doc_id.as_deref())
                 .note(status.as_str())
@@ -908,7 +917,13 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
 
 /// `upload mark --forget`: the file's own record, else (a changed file) the
 /// record of the earlier content at its path.
-fn forget(state: &mut State, root: &Path, hash: &str, rel: &str) -> Result<Row, YukiError> {
+fn forget(
+    ledger: &mut Ledger<State>,
+    root: &Path,
+    hash: &str,
+    rel: &str,
+) -> Result<Row, YukiError> {
+    let state = ledger.state_mut();
     let target = if state.files.contains_key(hash) {
         Some(hash.to_string())
     } else {
@@ -921,7 +936,7 @@ fn forget(state: &mut State, root: &Path, hash: &str, rel: &str) -> Result<Row, 
     Ok(match target.and_then(|h| state.files.remove(&h)) {
         None => Row::new(rel, "unchanged").note("no record to forget"),
         Some(old) => {
-            state.save(root)?;
+            ledger.save()?;
             Row::new(rel, "forgotten")
                 .doc(old.document_id.as_deref())
                 .note("the next upload dir run uploads it")
