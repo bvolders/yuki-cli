@@ -151,12 +151,14 @@ async fn archive_numbers(
 }
 
 /// The number for an invoice dated `date`: the next one for `auto`, or the
-/// given one, refused when the sales archive or the ledger already has it.
+/// given one, refused when the sales archive or `ledger` (the target's)
+/// already has it.
 pub async fn resolve(
     config: &Config,
     admin: Option<&str>,
     request: &NumberRequest,
     date: &str,
+    ledger: &InvoiceLedger,
 ) -> Result<String, InvoiceError> {
     let year: u32 = date[..4]
         .parse()
@@ -168,9 +170,8 @@ pub async fn resolve(
     {
         years.push(n.year);
     }
-    let admin_id = config.target(admin)?.admin_id;
     let archive = archive_numbers(config, admin, &years).await?;
-    choose(request, year, &archive, &InvoiceLedger::peek(admin_id)?)
+    choose(request, year, &archive, ledger)
 }
 
 /// [`resolve`] once the archive's numbers are known.

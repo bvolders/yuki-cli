@@ -1861,7 +1861,7 @@ pub struct CreateArgs<'a> {
 
 /// `sales invoice create`.
 pub async fn create(
-    load_config: impl Fn() -> Result<Config, YukiError>,
+    load_config: impl FnOnce() -> Result<Config, YukiError>,
     admin: Option<&str>,
     args: CreateArgs<'_>,
     yes: bool,
@@ -1869,8 +1869,12 @@ pub async fn create(
     format: Option<&str>,
 ) -> Result<(), InvoiceError> {
     // A prepared invoice: exactly that content, its number still reserved
-    // for it in this administration.
-    let mut binding: Option<String> = None;
+    // for it in this administration. Checking that needs the config and the
+    // ledger before a dry run, which then shows only what can be booked.
+    let mut checked: Option<(Config, InvoiceLedger, String)> = None;
+    // Loaded once: here for a prepared invoice, else after a dry run.
+    let mut load_config = Some(load_config);
+    let mut load_config = move || load_config.take().expect("the config is loaded once")();
     let invoice = match (args.prepared, &args.source) {
         (Some(path), _) => {
             let send = args.send.ok_or_else(|| {
@@ -1895,9 +1899,10 @@ pub async fn create(
                     target.admin_id
                 )));
             }
+            let ledger = InvoiceLedger::peek(&admin_id)?;
             let number = invoice.number.as_deref().unwrap_or_default();
-            InvoiceLedger::peek(&admin_id)?.check_reserved(number, &hash)?;
-            binding = Some(hash);
+            ledger.check_reserved(number, &hash)?;
+            checked = Some((config, ledger, hash));
             invoice
         }
         (None, Some(source)) => load(source, &args.overrides, args.send)?,
@@ -1917,9 +1922,15 @@ pub async fn create(
         println!("{}", invoice.to_display_xml());
         return Ok(());
     }
-    let config = load_config()?;
+    let (config, ledger, binding) = match checked {
+        Some((config, ledger, hash)) => (config, Some(ledger), Some(hash)),
+        None => (load_config()?, None, None),
+    };
     let target = config.target(admin)?;
-    InvoiceLedger::peek(target.admin_id)?.warn();
+    match ledger {
+        Some(ledger) => ledger.warn(),
+        None => InvoiceLedger::peek(target.admin_id)?.warn(),
+    }
     // A booking without a prompt names the number it books.
     if invoice.send.is_some() {
         check_confirm(invoice.number.as_deref(), args.confirm, yes)?;
@@ -1951,7 +1962,7 @@ pub async fn create(
 /// write it there and reserve its number.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare(
-    load_config: impl Fn() -> Result<Config, YukiError>,
+    load_config: impl FnOnce() -> Result<Config, YukiError>,
     admin: Option<&str>,
     source: &Source,
     overrides: &Overrides<'_>,
@@ -1960,7 +1971,7 @@ pub async fn prepare(
     quiet: bool,
 ) -> Result<(), InvoiceError> {
     let mut invoice = load(source, overrides, None)?;
-    // The config, when there is one, gives the issuing firm.
+    // The config, when there is one, gives the issuing firm; a number needs it.
     let config = match number {
         Some(_) => Some(load_config()?),
         None => load_config().ok(),
@@ -1969,20 +1980,28 @@ pub async fn prepare(
     if out.is_some() && seller.is_none() {
         return Err(seller_missing());
     }
-    if let Some(config) = &config
-        && let Ok(target) = config.target(admin)
-    {
-        InvoiceLedger::peek(target.admin_id)?.warn();
+    let target = config.as_ref().map(|c| c.target(admin)).transpose();
+    // Without a number the target is only for the warnings: optional.
+    let target = match (number, target) {
+        (Some(_), target) => target?,
+        (None, target) => target.ok().flatten(),
+    };
+    let ledger = target
+        .as_ref()
+        .map(|t| InvoiceLedger::peek(t.admin_id))
+        .transpose()?;
+    if let Some(ledger) = &ledger {
+        ledger.warn();
     }
-    if let (Some(request), Some(config)) = (number, &config) {
-        config.target(admin)?;
-        invoice.number =
-            Some(crate::cli::invoice_number::resolve(config, admin, request, &invoice.date).await?);
+    if let (Some(request), Some(config), Some(ledger)) = (number, &config, &ledger) {
+        invoice.number = Some(
+            crate::cli::invoice_number::resolve(config, admin, request, &invoice.date, ledger)
+                .await?,
+        );
     }
-    let json = match (out, &config) {
-        (Some(out), Some(config)) => {
-            let admin_id = config.target(admin)?.admin_id;
-            let json = write_prepared(&invoice, config, admin_id, out)?;
+    let json = match (out, &config, &target) {
+        (Some(out), Some(config), Some(target)) => {
+            let json = write_prepared(&invoice, config, target.admin_id, out)?;
             if !quiet {
                 let number = invoice.number.as_deref().unwrap_or_default();
                 let out = out.display();
