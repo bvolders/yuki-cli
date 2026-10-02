@@ -1,21 +1,29 @@
 //! End-to-end: `upload dir` and `upload mark` against a local mock of Yuki.
 //!
-//! The mock answers Authenticate, UploadDocument and DocumentsInFolder. An
-//! upload whose file name contains "broken" gets a SOAP fault, one containing
-//! "expire" an invalid-session fault (an authentication error).
+//! The mock answers Authenticate, SetCurrentDomain, UploadDocument and
+//! DocumentsInFolder. What an upload gets depends on its file name:
+//! - "broken": a SOAP fault (Yuki rejected it; retried),
+//! - "expire": an invalid-session fault (an authentication error; stops the run),
+//! - "garbled": HTTP 502 without a SOAP fault (result unknown),
+//! - "junk": HTTP 200 without a result element (result unknown),
+//! - anything else: a new document ID.
+//!
+//! The access key "bad-key" is refused at Authenticate.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
+use std::process::Output;
 use std::sync::{Arc, Mutex};
 
 mod common;
 
-use common::{yuki, yuki_with_env};
+use common::yuki;
 use serde_json::Value;
 use tempfile::TempDir;
 
 const STATE: &str = ".yuki-sync.json";
+const LOCK: &str = ".yuki-sync.lock";
 
 fn envelope(body: &str) -> String {
     format!(
@@ -43,18 +51,20 @@ fn document(id: &str, date: &str, contact: &str, file: &str) -> String {
     )
 }
 
+/// The raw (still escaped) text of a request parameter.
 fn param<'a>(body: &'a str, name: &str) -> &'a str {
     body.split(&format!("<yuki:{name}>"))
         .nth(1)
-        .and_then(|rest| rest.split('<').next())
+        .and_then(|rest| rest.split("</yuki:").next())
         .unwrap_or_default()
 }
 
-/// The archive the seeding tests find: inkoop holds 500 filler documents on
-/// its first page, so seeding has to page, and the interesting ones after.
+/// The archive the seeding tests find. inkoop holds 500 filler documents on
+/// its first page, so seeding has to page; verkoop answers every page with
+/// the same documents, as an API that ignores the offset would.
 fn documents_in_folder(folder: &str, start: &str) -> String {
-    let docs = match (folder, start) {
-        ("1", "0") => (0..500)
+    let filler = || -> String {
+        (0..500)
             .map(|i| {
                 document(
                     &format!("fill-{i}"),
@@ -63,7 +73,10 @@ fn documents_in_folder(folder: &str, start: &str) -> String {
                     &format!("old-{i}.pdf"),
                 )
             })
-            .collect(),
+            .collect()
+    };
+    let docs = match (folder, start) {
+        ("1", "0") | ("2", _) => filler(),
         ("1", "500") => [
             document(
                 "y-bol",
@@ -79,6 +92,10 @@ fn documents_in_folder(folder: &str, start: &str) -> String {
             ),
             document("y-scan-1", "2026-05-01", "Shop", "scan.pdf"),
             document("y-scan-2", "2026-05-02", "Shop", "scan.pdf"),
+            document("y-dup", "2026-05-03", "Shop", "dup.pdf"),
+            document("y-taken", "2026-05-04", "Shop", "taken.pdf"),
+            // Composed (NFC) here; the local file name is decomposed (NFD).
+            document("y-cafe", "2026-05-05", "Caf\u{e9}", "Caf\u{e9}.pdf"),
         ]
         .concat(),
         _ => String::new(),
@@ -86,7 +103,8 @@ fn documents_in_folder(folder: &str, start: &str) -> String {
     response("DocumentsInFolder", &docs)
 }
 
-/// What the mock saw: each SOAP action, with the uploaded file name if any.
+/// What the mock saw: each SOAP action, with the uploaded file name or the
+/// folder and offset when it has one.
 type Log = Arc<Mutex<Vec<String>>>;
 
 fn mock_yuki() -> (String, Log) {
@@ -124,6 +142,9 @@ fn mock_yuki() -> (String, Log) {
             reader.read_exact(&mut body).ok();
             let body = String::from_utf8_lossy(&body);
             let (status, reply, entry) = match action.as_str() {
+                "Authenticate" if param(&body, "accessKey") == "bad-key" => {
+                    (500, fault("Invalid access key"), action.clone())
+                }
                 "Authenticate" => (200, response("Authenticate", "session-1"), action.clone()),
                 "UploadDocument" => {
                     let name = param(&body, "fileName").to_string();
@@ -132,6 +153,10 @@ fn mock_yuki() -> (String, Log) {
                         (500, fault("Server was unable to process request."), entry)
                     } else if name.contains("expire") {
                         (500, fault("Invalid session ID"), entry)
+                    } else if name.contains("garbled") {
+                        (502, "Bad gateway".to_string(), entry)
+                    } else if name.contains("junk") {
+                        (200, envelope("<Nothing/>"), entry)
                     } else {
                         uploads += 1;
                         let id = format!("doc-{uploads}");
@@ -145,6 +170,14 @@ fn mock_yuki() -> (String, Log) {
                         200,
                         documents_in_folder(folder, start),
                         format!("DocumentsInFolder {folder} {start}"),
+                    )
+                }
+                "SetCurrentDomain" => {
+                    let domain = param(&body, "domainID").to_string();
+                    (
+                        200,
+                        response("SetCurrentDomain", ""),
+                        format!("SetCurrentDomain {domain}"),
                     )
                 }
                 _ => (200, response(&action, ""), action.clone()),
@@ -161,14 +194,14 @@ fn mock_yuki() -> (String, Log) {
     (root, seen)
 }
 
-fn home_with_config(root: &str) -> TempDir {
+fn home_with_key(root: &str, key: &str) -> TempDir {
     let home = TempDir::new().expect("temp home");
     let dir = home.path().join(".config/yuki");
     std::fs::create_dir_all(&dir).expect("config dir");
     std::fs::write(
         dir.join("config.toml"),
         format!(
-            r#"api_key = "test-key"
+            r#"api_key = "{key}"
 default_admin = "example"
 region = "be"
 
@@ -184,6 +217,10 @@ base_url = "{root}"
     home
 }
 
+fn home_with_config(root: &str) -> TempDir {
+    home_with_key(root, "test-key")
+}
+
 /// A receipts directory holding `files` (relative path, content).
 fn receipts(files: &[(&str, &str)]) -> TempDir {
     let dir = TempDir::new().expect("receipts dir");
@@ -195,14 +232,20 @@ fn receipts(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
-fn run(home: &TempDir, dir: &Path, extra: &[&str]) -> std::process::Output {
+fn run(home: &TempDir, dir: &Path, extra: &[&str]) -> Output {
     let dir = dir.to_str().unwrap();
     let mut args = vec!["upload", "dir", dir];
     args.extend_from_slice(extra);
     yuki(home, &args)
 }
 
-fn json(output: &std::process::Output) -> Value {
+fn mark(home: &TempDir, file: &Path, extra: &[&str]) -> Output {
+    let mut args = vec!["upload", "mark", file.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    yuki(home, &args)
+}
+
+fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
         panic!(
             "JSON stdout ({e}): {}\nstderr: {}",
@@ -213,7 +256,7 @@ fn json(output: &std::process::Output) -> Value {
 }
 
 /// Action per path from the output rows.
-fn actions(output: &std::process::Output) -> Vec<(String, String)> {
+fn actions(output: &Output) -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = json(output)["items"]
         .as_array()
         .expect("items")
@@ -227,6 +270,17 @@ fn actions(output: &std::process::Output) -> Vec<(String, String)> {
         .collect();
     rows.sort();
     rows
+}
+
+/// The output row for `path`.
+fn row(output: &Output, path: &str) -> Value {
+    json(output)["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["Path"] == path)
+        .unwrap_or_else(|| panic!("no row for {path}"))
+        .clone()
 }
 
 fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -253,7 +307,7 @@ fn entry_for(dir: &Path, rel: &str) -> Option<Value> {
         .cloned()
 }
 
-fn stderr(output: &std::process::Output) -> String {
+fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
@@ -265,11 +319,15 @@ fn uploads(seen: &Log) -> Vec<String> {
         .collect()
 }
 
+fn calls(seen: &Log) -> usize {
+    seen.lock().unwrap().len()
+}
+
 #[test]
-fn dry_run_makes_no_calls_writes_nothing_and_needs_no_config() {
-    let (_root, seen) = mock_yuki();
-    // No config at all: a dry run must not need one.
-    let home = TempDir::new().unwrap();
+fn a_dry_run_makes_no_calls_and_writes_nothing() {
+    let (root, seen) = mock_yuki();
+    // The config points at the live mock, so any call would be seen.
+    let home = home_with_config(&root);
     let dir = receipts(&[
         ("2026/a.pdf", "a"),
         ("2026/b.PNG", "b"),
@@ -286,10 +344,24 @@ fn dry_run_makes_no_calls_writes_nothing_and_needs_no_config() {
         ])
     );
     let err = stderr(&out);
-    assert!(err.contains("2 new, 0 already synced, 1 excluded"), "{err}");
+    assert!(err.contains("2 to upload (2 new, 0 to retry)"), "{err}");
     assert!(err.contains("API calls made: 0"), "{err}");
-    assert!(seen.lock().unwrap().is_empty());
+
+    let seed = run(&home, dir.path(), &["--dry-run", "--seed-from-yuki"]);
+    assert!(seed.status.success(), "{}", stderr(&seed));
+    assert_eq!(row(&seed, "2026/a.pdf")["Action"], "would-seed");
+
+    assert_eq!(calls(&seen), 0, "{:?}", seen.lock().unwrap());
     assert!(!dir.path().join(STATE).exists());
+    assert!(!dir.path().join(LOCK).exists());
+}
+
+#[test]
+fn a_dry_run_needs_no_config() {
+    let home = TempDir::new().unwrap();
+    let dir = receipts(&[("a.pdf", "a")]);
+    let out = run(&home, dir.path(), &["--dry-run"]);
+    assert!(out.status.success(), "{}", stderr(&out));
 }
 
 #[test]
@@ -297,17 +369,20 @@ fn a_non_interactive_run_without_yes_refuses_before_any_call() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
     let dir = receipts(&[("a.pdf", "a")]);
-    let out = run(&home, dir.path(), &[]);
-    assert_eq!(out.status.code(), Some(1));
-    let err = stderr(&out);
-    assert!(err.contains("\"kind\":\"confirmation_required\""), "{err}");
-    assert!(err.contains("--yes"), "{err}");
-    assert!(seen.lock().unwrap().is_empty());
+    for args in [&[][..], &["--seed-from-yuki"][..]] {
+        let out = run(&home, dir.path(), args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let err = stderr(&out);
+        assert!(err.contains("\"kind\":\"confirmation_required\""), "{err}");
+        assert!(err.contains("--yes"), "{err}");
+    }
+    assert_eq!(calls(&seen), 0);
     assert!(!dir.path().join(STATE).exists());
+    assert!(!dir.path().join(LOCK).exists());
 }
 
 #[test]
-fn uploads_new_files_records_failures_and_retries_only_those() {
+fn uploads_new_files_and_retries_only_the_rejected_one() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
     let dir = receipts(&[
@@ -332,16 +407,9 @@ fn uploads_new_files_records_failures_and_retries_only_those() {
         ])
     );
     assert_eq!(uploads(&seen), ["a.pdf", "b-broken.pdf", "c.jpeg"]);
-    assert!(
-        stderr(&out).contains("API calls made: 4"),
-        "{}",
-        stderr(&out)
-    );
-    assert!(
-        stderr(&out).contains("1 of 3 uploads failed"),
-        "{}",
-        stderr(&out)
-    );
+    let err = stderr(&out);
+    assert!(err.contains("API calls made: 4"), "{err}");
+    assert!(err.contains("1 of 3 uploads failed"), "{err}");
 
     let st = state(dir.path());
     assert_eq!(st["version"], 1);
@@ -354,6 +422,7 @@ fn uploads_new_files_records_failures_and_retries_only_those() {
     assert!(a["uploaded_at"].as_str().unwrap().ends_with('Z'));
     let b = entry_for(dir.path(), "2026/b-broken.pdf").unwrap();
     assert_eq!(b["status"], "failed");
+    assert_eq!(b["attempts"], 1);
     assert!(
         b["error"].as_str().unwrap().contains("unable to process"),
         "{b}"
@@ -365,6 +434,7 @@ fn uploads_new_files_records_failures_and_retries_only_those() {
             .is_some(),
         "{st}"
     );
+    assert!(!dir.path().join(LOCK).exists(), "the lock is released");
 
     // The second run retries only the failed file.
     let again = run(&home, dir.path(), &["--yes"]);
@@ -376,11 +446,117 @@ fn uploads_new_files_records_failures_and_retries_only_those() {
 
     // Once it is gone there is nothing to do, and Yuki is not contacted.
     std::fs::remove_file(dir.path().join("2026/b-broken.pdf")).unwrap();
-    let calls = seen.lock().unwrap().len();
+    let before = calls(&seen);
     let done = run(&home, dir.path(), &["--yes"]);
     assert!(done.status.success(), "{}", stderr(&done));
     assert!(stderr(&done).contains("API calls made: 0"));
-    assert_eq!(seen.lock().unwrap().len(), calls);
+    assert_eq!(calls(&seen), before);
+}
+
+#[test]
+fn file_names_are_xml_escaped_in_the_request() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("Tom & Jerry <x>.pdf", "tj")]);
+    let out = run(&home, dir.path(), &["--yes"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(uploads(&seen), ["Tom &amp; Jerry &lt;x&gt;.pdf"]);
+    assert_eq!(row(&out, "Tom & Jerry <x>.pdf")["Action"], "uploaded");
+}
+
+#[test]
+fn retries_queue_after_new_files_and_stop_after_three_attempts() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("b-broken.pdf", "b")]);
+    assert_eq!(run(&home, dir.path(), &["--yes"]).status.code(), Some(1));
+
+    // A retry waits behind new files, whatever their names.
+    std::fs::write(dir.path().join("z-new.pdf"), "z").unwrap();
+    let out = run(&home, dir.path(), &["--yes", "--max", "1"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(uploads(&seen), ["b-broken.pdf", "z-new.pdf"]);
+    assert_eq!(row(&out, "b-broken.pdf")["Action"], "deferred");
+
+    // Attempts two and three, then it is no longer retried.
+    for _ in 0..2 {
+        assert_eq!(run(&home, dir.path(), &["--yes"]).status.code(), Some(1));
+    }
+    assert_eq!(
+        entry_for(dir.path(), "b-broken.pdf").unwrap()["attempts"],
+        3
+    );
+    let before = uploads(&seen).len();
+    let out = run(&home, dir.path(), &["--yes"]);
+    assert_eq!(out.status.code(), Some(1), "still needs attention");
+    assert_eq!(uploads(&seen).len(), before, "not retried a fourth time");
+    let r = row(&out, "b-broken.pdf");
+    assert_eq!(r["Action"], "failed");
+    assert!(r["Note"].as_str().unwrap().contains("--forget"), "{r}");
+    assert!(stderr(&out).contains("failed too often to retry"));
+
+    // --forget puts it back in the queue.
+    assert!(
+        mark(&home, &dir.path().join("b-broken.pdf"), &["--forget"])
+            .status
+            .success()
+    );
+    let _ = run(&home, dir.path(), &["--yes"]);
+    assert_eq!(uploads(&seen).len(), before + 1);
+}
+
+#[test]
+fn an_uncertain_upload_is_recorded_as_unknown_and_never_retried() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("c-garbled.pdf", "c"), ("d-junk.pdf", "d"), ("e.pdf", "e")]);
+    let out = run(&home, dir.path(), &["--yes"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        actions(&out),
+        pairs(&[
+            ("c-garbled.pdf", "unknown"),
+            ("d-junk.pdf", "unknown"),
+            ("e.pdf", "uploaded"),
+        ])
+    );
+    for rel in ["c-garbled.pdf", "d-junk.pdf"] {
+        assert_eq!(entry_for(dir.path(), rel).unwrap()["status"], "unknown");
+    }
+    assert!(stderr(&out).contains("2 with an unknown upload result"));
+
+    // The next run uploads nothing, shows them, and still exits 1.
+    let again = run(&home, dir.path(), &["--yes"]);
+    assert_eq!(again.status.code(), Some(1));
+    assert_eq!(uploads(&seen).len(), 3);
+    assert_eq!(row(&again, "c-garbled.pdf")["Action"], "unknown");
+    let plan = run(&home, dir.path(), &["--dry-run"]);
+    assert!(stderr(&plan).contains("2 with an unknown upload result"));
+
+    // Resolved by hand: one is in Yuki, the other is to be uploaded again.
+    assert!(
+        mark(
+            &home,
+            &dir.path().join("c-garbled.pdf"),
+            &["--doc-id", "y-1"]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        mark(&home, &dir.path().join("d-junk.pdf"), &["--forget"])
+            .status
+            .success()
+    );
+    let plan = run(&home, dir.path(), &["--dry-run"]);
+    assert_eq!(
+        actions(&plan),
+        pairs(&[
+            ("c-garbled.pdf", "synced"),
+            ("d-junk.pdf", "would-upload"),
+            ("e.pdf", "synced"),
+        ])
+    );
 }
 
 #[test]
@@ -417,39 +593,59 @@ fn a_renamed_or_moved_file_is_not_uploaded_again() {
 }
 
 #[test]
-fn excludes_are_added_to_the_defaults() {
-    let (_root, _seen) = mock_yuki();
-    let home = TempDir::new().unwrap();
+fn a_changed_file_is_not_uploaded_until_resolved() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("inv.pdf", "version 1")]);
+    assert!(run(&home, dir.path(), &["--yes"]).status.success());
+    std::fs::write(dir.path().join("inv.pdf"), "version 2").unwrap();
+
+    let out = run(&home, dir.path(), &["--yes"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let r = row(&out, "inv.pdf");
+    assert_eq!(r["Action"], "changed");
+    assert_eq!(r["Doc ID"], "doc-1");
+    assert!(r["Note"].as_str().unwrap().contains("was doc doc-1"), "{r}");
+    assert_eq!(uploads(&seen).len(), 1);
+
+    // Forgetting the old record lets the new version go up.
+    let forgot = mark(&home, &dir.path().join("inv.pdf"), &["--forget"]);
+    assert!(forgot.status.success(), "{}", stderr(&forgot));
+    assert_eq!(json(&forgot)["items"][0]["Action"], "forgotten");
+    let out = run(&home, dir.path(), &["--yes"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(uploads(&seen).len(), 2);
+}
+
+#[test]
+fn excludes_are_case_insensitive_and_added_to_the_defaults() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
     let dir = receipts(&[
-        ("2026/amazon/a.pdf", "a"),
+        ("2025/amazon/deep/a.pdf", "a"),
         ("2026/bol/b.pdf", "b"),
-        ("2026/bol/scan.png", "s"),
-        ("_to_delete/x.pdf", "x"),
+        ("2026/bol/scan.PNG", "s"),
+        ("_TO_DELETE/x.pdf", "x"),
     ]);
     let out = run(
         &home,
         dir.path(),
-        &[
-            "--dry-run",
-            "--exclude",
-            "2026/amazon/*",
-            "--exclude",
-            "*.png",
-        ],
+        &["--dry-run", "--exclude", "2025", "--exclude", "*.png"],
     );
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         actions(&out),
         pairs(&[
-            ("2026/amazon/a.pdf", "excluded"),
+            ("2025/amazon/deep/a.pdf", "excluded"),
             ("2026/bol/b.pdf", "would-upload"),
-            ("2026/bol/scan.png", "excluded"),
-            ("_to_delete/x.pdf", "excluded"),
+            ("2026/bol/scan.PNG", "excluded"),
+            ("_TO_DELETE/x.pdf", "excluded"),
         ])
     );
     let bad = run(&home, dir.path(), &["--dry-run", "--exclude", "["]);
     assert_eq!(bad.status.code(), Some(1));
     assert!(stderr(&bad).contains("invalid --exclude"));
+    assert_eq!(calls(&seen), 0);
 }
 
 #[test]
@@ -491,6 +687,43 @@ fn an_authentication_error_stops_the_run() {
     assert_eq!(uploads(&seen), ["a.pdf", "b-expire.pdf"]);
     let files = state(dir.path())["files"].as_object().unwrap().len();
     assert_eq!(files, 1, "only the upload that happened is recorded");
+    assert!(stderr(&out).contains("API calls made: 3"));
+}
+
+#[test]
+fn the_call_count_is_printed_when_authentication_fails() {
+    let (root, _seen) = mock_yuki();
+    let home = home_with_key(&root, "bad-key");
+    let dir = receipts(&[("a.pdf", "a")]);
+    let out = run(&home, dir.path(), &["--yes"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("API calls made: 1"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_is_an_error_row_and_the_rest_still_go_up() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("a.pdf", "a"), ("locked.pdf", "l")]);
+    let locked = dir.path().join("locked.pdf");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&locked).is_ok() {
+        return; // running as root: nothing is unreadable
+    }
+    let out = run(&home, dir.path(), &["--yes"]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        actions(&out),
+        pairs(&[("a.pdf", "uploaded"), ("locked.pdf", "error")])
+    );
+    assert_eq!(uploads(&seen), ["a.pdf"]);
 }
 
 #[test]
@@ -501,7 +734,7 @@ fn a_corrupt_state_file_is_refused_and_left_alone() {
     for args in [
         &["--yes"][..],
         &["--dry-run"][..],
-        &["--seed-from-yuki"][..],
+        &["--seed-from-yuki", "--yes"][..],
     ] {
         let out = run(&home, dir.path(), args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
@@ -516,7 +749,7 @@ fn a_corrupt_state_file_is_refused_and_left_alone() {
             stderr(&out)
         );
     }
-    assert!(seen.lock().unwrap().is_empty());
+    assert_eq!(calls(&seen), 0);
     assert_eq!(
         std::fs::read_to_string(dir.path().join(STATE)).unwrap(),
         "{\"version\": 1, \"files\": {"
@@ -524,7 +757,81 @@ fn a_corrupt_state_file_is_refused_and_left_alone() {
 }
 
 #[test]
-fn seeding_records_file_name_matches_and_lists_the_rest_for_review() {
+fn a_held_lock_refuses_writes_with_its_age() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("a.pdf", "a")]);
+    std::fs::write(dir.path().join(LOCK), "{\"pid\": 4242}").unwrap();
+    for out in [
+        run(&home, dir.path(), &["--yes"]),
+        run(&home, dir.path(), &["--seed-from-yuki", "--yes"]),
+        mark(
+            &home,
+            &dir.path().join("a.pdf"),
+            &["--skip", "--dir", dir.path().to_str().unwrap()],
+        ),
+    ] {
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        let err = stderr(&out);
+        assert!(
+            err.contains("locked by another yuki run (pid 4242, taken "),
+            "{err}"
+        );
+        assert!(err.contains(" ago)"), "{err}");
+        assert!(err.contains(LOCK), "{err}");
+    }
+    // A dry run only reads, so it still works.
+    assert!(run(&home, dir.path(), &["--dry-run"]).status.success());
+    assert_eq!(calls(&seen), 0);
+    assert!(
+        dir.path().join(LOCK).exists(),
+        "someone else's lock is left alone"
+    );
+}
+
+#[test]
+fn a_subdirectory_syncs_into_the_state_above_it() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("2026/bol/a.pdf", "a"), ("2026/other/b.pdf", "b")]);
+    // Start a state at the top.
+    let b = dir.path().join("2026/other/b.pdf");
+    let top = dir.path().to_str().unwrap();
+    assert!(mark(&home, &b, &["--skip", "--dir", top]).status.success());
+
+    let sub = dir.path().join("2026/bol");
+    let out = run(&home, &sub, &["--yes"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Paths are relative to the root, and only the subdirectory is scanned.
+    assert_eq!(actions(&out), pairs(&[("2026/bol/a.pdf", "uploaded")]));
+    assert!(!sub.join(STATE).exists());
+    assert_eq!(
+        entry_for(dir.path(), "2026/bol/a.pdf").unwrap()["status"],
+        "uploaded"
+    );
+
+    // mark finds the same root from the file.
+    let again = mark(&home, &sub.join("a.pdf"), &["--doc-id", "doc-1"]);
+    assert_eq!(json(&again)["items"][0]["Path"], "2026/bol/a.pdf");
+
+    // A state file further down makes the tree ambiguous.
+    std::fs::write(
+        dir.path().join("2026/other").join(STATE),
+        "{\"version\": 1, \"hash\": \"sha256\", \"files\": {}}",
+    )
+    .unwrap();
+    let nested = run(&home, dir.path(), &["--yes"]);
+    assert_eq!(nested.status.code(), Some(1));
+    assert!(
+        stderr(&nested).contains("holds other sync states (2026/other/.yuki-sync.json)"),
+        "{}",
+        stderr(&nested)
+    );
+    assert_eq!(uploads(&seen).len(), 1);
+}
+
+#[test]
+fn seeding_records_unique_name_matches_after_selecting_the_administration() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
     let dir = receipts(&[
@@ -532,44 +839,58 @@ fn seeding_records_file_name_matches_and_lists_the_rest_for_review() {
         ("2026/vercel/2026-09-07_vercel_REF12345.pdf", "vercel"),
         ("2026/shop/scan.pdf", "scan"),
         ("2026/new/2026-09-30_acme_999.pdf", "new"),
+        // Two different local files under the one name Yuki has once.
+        ("2026/a/dup.pdf", "dup a"),
+        ("2026/b/dup.pdf", "dup b"),
+        ("2026/x/taken.pdf", "taken x"),
+        ("2026/y/taken.pdf", "taken y"),
+        // Decomposed (NFD), as macOS stores names.
+        ("2026/cafe/Cafe\u{301}.pdf", "cafe"),
     ]);
-    // Seeding uploads nothing, so it needs no --yes.
-    let out = run(&home, dir.path(), &["--seed-from-yuki"]);
+    // taken.pdf is already recorded for one file; the other cannot claim it.
+    let x = dir.path().join("2026/x/taken.pdf");
+    let top = dir.path().to_str().unwrap();
+    assert!(
+        mark(&home, &x, &["--doc-id", "y-taken", "--dir", top])
+            .status
+            .success()
+    );
+
+    let out = run(&home, dir.path(), &["--seed-from-yuki", "--yes"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         actions(&out),
         pairs(&[
+            ("2026/a/dup.pdf", "ambiguous"),
+            ("2026/b/dup.pdf", "ambiguous"),
             ("2026/bol-com/2026-08-30_bol-com_111.pdf", "already-in-yuki"),
+            ("2026/cafe/Cafe\u{301}.pdf", "already-in-yuki"),
+            ("2026/new/2026-09-30_acme_999.pdf", "not-in-yuki"),
+            ("2026/shop/scan.pdf", "ambiguous"),
             (
                 "2026/vercel/2026-09-07_vercel_REF12345.pdf",
                 "possible-match"
             ),
-            ("2026/shop/scan.pdf", "ambiguous"),
-            ("2026/new/2026-09-30_acme_999.pdf", "not-in-yuki"),
+            ("2026/x/taken.pdf", "synced"),
+            ("2026/y/taken.pdf", "ambiguous"),
         ])
     );
-    let rows = json(&out);
-    let note = |path: &str| {
-        rows["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["Path"] == path)
-            .unwrap()["Note"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-    assert!(note("2026/vercel/2026-09-07_vercel_REF12345.pdf").contains("y-vercel"));
+    let note = |path: &str| row(&out, path)["Note"].as_str().unwrap().to_string();
+    assert!(note("2026/a/dup.pdf").contains("2026/a/dup.pdf, 2026/b/dup.pdf"));
+    assert!(note("2026/y/taken.pdf").contains("already recorded for 2026/x/taken.pdf"));
     assert!(note("2026/shop/scan.pdf").contains("y-scan-1"));
+    let vercel = note("2026/vercel/2026-09-07_vercel_REF12345.pdf");
+    assert!(vercel.contains("y-vercel"), "{vercel}");
+    assert!(vercel.contains("yuki upload mark '"), "{vercel}");
     let err = stderr(&out);
     assert!(err.contains("by file name only"), "{err}");
-    // Authenticate, uitzoeken (one page), inkoop (two pages).
-    assert!(err.contains("API calls made: 4"), "{err}");
+    // Authenticate, SetCurrentDomain, uitzoeken (one page), inkoop (two pages).
+    assert!(err.contains("API calls made: 5"), "{err}");
     assert_eq!(
         *seen.lock().unwrap(),
         [
             "Authenticate",
+            "SetCurrentDomain domain-1",
             "DocumentsInFolder 7 0",
             "DocumentsInFolder 1 0",
             "DocumentsInFolder 1 500",
@@ -581,25 +902,34 @@ fn seeding_records_file_name_matches_and_lists_the_rest_for_review() {
     assert_eq!(bol["document_id"], "y-bol");
     assert_eq!(bol["folder"], "inkoop");
     assert!(bol.get("uploaded_at").is_none());
-    assert_eq!(state(dir.path())["files"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        entry_for(dir.path(), "2026/cafe/Cafe\u{301}.pdf").unwrap()["document_id"],
+        "y-cafe"
+    );
+    // The two seeded files plus the one marked by hand.
+    assert_eq!(state(dir.path())["files"].as_object().unwrap().len(), 3);
 
-    // The real run then uploads everything but the seeded file.
+    // The real run then uploads everything else.
     let up = run(&home, dir.path(), &["--yes"]);
     assert!(up.status.success(), "{}", stderr(&up));
-    assert_eq!(
-        uploads(&seen),
-        [
-            "2026-09-30_acme_999.pdf",
-            "scan.pdf",
-            "2026-09-07_vercel_REF12345.pdf"
-        ]
-    );
+    assert_eq!(uploads(&seen).len(), 6);
+    assert!(!uploads(&seen).contains(&"2026-08-30_bol-com_111.pdf".to_string()));
 }
 
-fn mark(home: &TempDir, file: &Path, extra: &[&str]) -> std::process::Output {
-    let mut args = vec!["upload", "mark", file.to_str().unwrap()];
-    args.extend_from_slice(extra);
-    yuki_with_env(home, &args, &[])
+#[test]
+fn seeding_stops_paging_when_a_page_repeats() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("old-3.pdf", "o")]);
+    let out = run(
+        &home,
+        dir.path(),
+        &["--seed-from-yuki", "--yes", "--seed-folder", "verkoop"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("repeats documents already read"));
+    assert_eq!(row(&out, "old-3.pdf")["Action"], "already-in-yuki");
+    assert_eq!(calls(&seen), 4, "{:?}", seen.lock().unwrap());
 }
 
 #[test]
@@ -625,6 +955,7 @@ fn mark_records_a_file_by_hand_without_contacting_yuki() {
     assert_eq!(e["status"], "already-in-yuki");
     assert_eq!(e["document_id"], "d-1");
     assert_eq!(e["folder"], "inkoop");
+    assert!(!dir.path().join(LOCK).exists());
 
     // Now the state file is found from the file itself; the same mark is a no-op.
     let same = mark(&home, &file, &["--doc-id", "d-1"]);

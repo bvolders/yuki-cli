@@ -418,20 +418,20 @@ pub fn generate() -> Value {
             },
             {
                 "name": "upload dir",
-                "description": "Upload the pdf/jpg/jpeg/png files under a directory that are not in Yuki yet, once each. State is kept in <path>/.yuki-sync.json, keyed by sha256, so a renamed or moved file is never uploaded again. Prints the plan, then asks; non-interactive runs need --yes. Uploads sequentially, records each upload immediately, stops on an authentication error, and exits 1 when any upload failed. --seed-from-yuki uploads nothing and records files whose name matches a Yuki document.",
+                "description": "Upload the pdf/jpg/jpeg/png files under a directory that are not in Yuki yet, once each. State is kept in .yuki-sync.json (in the nearest directory at or above <path> that has one, else <path>), keyed by sha256, so a renamed or moved file is not uploaded again; .yuki-sync.lock keeps runs apart. Prints the plan, then asks; non-interactive runs need --yes. Uploads sequentially and records each result immediately. Rejected files are retried after new files, up to 3 attempts; uncertain results are recorded as unknown and never retried automatically; changed files wait for upload mark. Stops on an authentication error and exits 1 when any file needs attention. --seed-from-yuki uploads nothing and, after confirmation, records files whose name matches exactly one unclaimed Yuki document.",
                 "mutating": true,
                 "args": [
                     {"name": "path", "type": "path", "required": true, "description": "Directory to upload from."},
                     {"name": "--folder", "type": "string", "required": false, "description": "Target folder.", "default": "uitzoeken"},
-                    {"name": "--exclude", "type": "string[]", "required": false, "description": "Glob of paths to skip; repeatable. _to_delete and .* are always skipped."},
+                    {"name": "--exclude", "type": "string[]", "required": false, "description": "Case-insensitive glob of paths to skip; repeatable. Without / it matches any path component (a directory name skips its whole subtree); with / the whole relative path. _to_delete and .* are always skipped; symbolic links are never followed."},
                     {"name": "--max", "type": "integer", "required": false, "description": "Upload at most this many files in this run.", "default": 25},
                     {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the plan only: no API calls, nothing written."},
-                    {"name": "--seed-from-yuki", "type": "boolean", "required": false, "description": "Upload nothing; record new files whose file name matches a Yuki document as already-in-yuki."},
+                    {"name": "--seed-from-yuki", "type": "boolean", "required": false, "description": "Upload nothing; record files whose file name matches exactly one unclaimed Yuki document as already-in-yuki, after confirmation."},
                     {"name": "--seed-folder", "type": "string[]", "required": false, "description": "Yuki folder to look in when seeding; repeatable. Defaults to --folder and inkoop."}
                 ],
                 "output_fields": [
-                    {"name": "Path", "type": "string", "description": "Path relative to the directory."},
-                    {"name": "Action", "type": "string", "description": "uploaded, failed, not-attempted, deferred, synced, duplicate, excluded; would-upload or would-seed on --dry-run; already-in-yuki, ambiguous, possible-match or not-in-yuki when seeding."},
+                    {"name": "Path", "type": "string", "description": "Path relative to the root of the synced tree."},
+                    {"name": "Action", "type": "string", "description": "uploaded, failed, unknown, changed, error, not-attempted, deferred, synced, duplicate, excluded; would-upload, would-retry or would-seed on --dry-run; already-in-yuki, ambiguous, possible-match or not-in-yuki when seeding."},
                     {"name": "Doc ID", "type": "string"},
                     {"name": "Error", "type": "string"},
                     {"name": "Note", "type": "string"}
@@ -445,10 +445,10 @@ pub fn generate() -> Value {
                     {"name": "file", "type": "path", "required": true, "description": "The file to record."},
                     {"name": "--doc-id", "type": "string", "required": false, "description": "The Yuki document ID the file was uploaded as."},
                     {"name": "--skip", "type": "boolean", "required": false, "description": "Never upload this file."},
-                    {"name": "--forget", "type": "boolean", "required": false, "description": "Remove the record, so the next run treats the file as new."},
+                    {"name": "--forget", "type": "boolean", "required": false, "description": "Remove the record, so the next run treats the file as new; for a changed file, the record of the earlier content at its path."},
                     {"name": "--folder", "type": "string", "required": false, "description": "The Yuki folder the document is in."},
                     {"name": "--note", "type": "string", "required": false, "description": "Note to keep with the record."},
-                    {"name": "--dir", "type": "path", "required": false, "description": "The synced directory; defaults to the nearest one above the file with a .yuki-sync.json."},
+                    {"name": "--dir", "type": "path", "required": false, "description": "Where to look for the synced directory (the nearest one at or above it with a .yuki-sync.json, else itself); defaults to looking above the file, where one must exist."},
                     {"name": "--force", "type": "boolean", "required": false, "description": "Replace an existing record."}
                 ],
                 "output_fields": [

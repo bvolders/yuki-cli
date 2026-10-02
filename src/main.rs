@@ -585,11 +585,8 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         Outcome::NeedsConfirmation(message) => {
                             return Err(AppError::ConfirmationRequired(message));
                         }
-                        Outcome::Failed { failed, attempted } => {
-                            return Err(AppError::Other(anyhow::anyhow!(
-                                "{failed} of {attempted} uploads failed; they are recorded as failed in {} and retried on the next run",
-                                yuki_cli::sync::STATE_FILE
-                            )));
+                        Outcome::NeedsAttention(message) => {
+                            return Err(AppError::Other(anyhow::anyhow!(message)));
                         }
                     }
                 }

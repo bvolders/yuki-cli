@@ -658,14 +658,21 @@ pub enum UploadCommands {
 
     /// Upload the receipts in a directory that are not in Yuki yet, once each.
     ///
-    /// Scans PATH recursively for pdf, jpg, jpeg and png files and keeps what
-    /// it did in PATH/.yuki-sync.json, keyed by content hash: a file is never
-    /// uploaded twice, even after a rename or move. Prints the plan first,
-    /// then asks before uploading (--yes skips the question; without a
-    /// terminal --yes is required). Uploads one file at a time and records
-    /// each upload as soon as it succeeds; a failed file is recorded and
-    /// retried on the next run, and an authentication error stops the run.
-    /// Exits non-zero when any upload failed.
+    /// Scans PATH recursively for pdf, jpg, jpeg and png files. What it did
+    /// is kept in .yuki-sync.json, keyed by content hash, so a renamed or
+    /// moved file is not uploaded again. The state lives in the nearest
+    /// directory at or above PATH that has one (else in PATH), so a
+    /// subdirectory can be synced on its own; a state file below PATH is an
+    /// error. Prints the plan first, then asks before uploading (--yes skips
+    /// the question; without a terminal --yes is required). Uploads one file
+    /// at a time and records each result as soon as it is known. A file Yuki
+    /// rejects is retried on later runs, after new files, up to 3 attempts. A
+    /// file whose upload result is uncertain (a timeout, a server error
+    /// without a SOAP fault) is recorded as unknown and never retried
+    /// automatically: check Yuki, then `upload mark`. A file whose content
+    /// changed since it was recorded is not uploaded until resolved with
+    /// `upload mark`. An authentication error stops the run. Exits 1 when any
+    /// file needs attention.
     ///
     /// Run once with --seed-from-yuki first to record the files Yuki already
     /// has, so they are not uploaded again.
@@ -677,9 +684,12 @@ pub enum UploadCommands {
         #[arg(long, default_value = "uitzoeken")]
         folder: String,
 
-        /// Skip paths matching this glob; repeatable. Always skipped as well:
-        /// _to_delete and .* (dotfiles and dot-directories). A pattern without
-        /// / matches any path component, one with / the whole relative path.
+        /// Skip paths matching this glob (case-insensitive); repeatable.
+        /// Always skipped as well: _to_delete and .* (dotfiles and
+        /// dot-directories). A pattern without / matches any path component,
+        /// so `2025` skips that directory and everything below it; one with /
+        /// matches the whole relative path (`*` stays in one component, `**`
+        /// crosses them). Symbolic links are never followed.
         #[arg(long = "exclude")]
         exclude: Vec<String>,
 
@@ -691,8 +701,9 @@ pub enum UploadCommands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Upload nothing; record the new files whose file name matches a
-        /// document in Yuki as already-in-yuki, and list near matches for review.
+        /// Upload nothing; record the files whose file name matches exactly one
+        /// Yuki document, claimed by no other file, as already-in-yuki, and
+        /// list ambiguous and near matches for review. Asks before writing.
         #[arg(long)]
         seed_from_yuki: bool,
 
@@ -705,8 +716,10 @@ pub enum UploadCommands {
     /// Record by hand that a file is in Yuki, should be skipped, or is to be forgotten.
     ///
     /// Updates the .yuki-sync.json of the synced directory without contacting
-    /// Yuki. The directory is --dir, else the nearest one above FILE that has
-    /// a .yuki-sync.json.
+    /// Yuki: the nearest directory at or above --dir, else above FILE, that
+    /// has one. Resolves files `upload dir` reports as unknown, failed or
+    /// changed: --doc-id when Yuki has the file, --forget to upload it (again),
+    /// --skip to keep it out.
     #[command(group(ArgGroup::new("record").required(true).args(["doc_id", "skip", "forget"])))]
     Mark {
         /// The file to record.
@@ -720,7 +733,8 @@ pub enum UploadCommands {
         #[arg(long)]
         skip: bool,
 
-        /// Remove the record, so the next run treats the file as new.
+        /// Remove the record, so the next run treats the file as new. For a
+        /// changed file, removes the record of the earlier content at its path.
         #[arg(long)]
         forget: bool,
 
@@ -732,7 +746,8 @@ pub enum UploadCommands {
         #[arg(long)]
         note: Option<String>,
 
-        /// The synced directory, when it has no .yuki-sync.json yet.
+        /// Where to look for the synced directory; it becomes the root when no
+        /// .yuki-sync.json exists at or above it yet.
         #[arg(long)]
         dir: Option<String>,
 

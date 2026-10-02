@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- **upload**: `upload dir <path>` uploads the receipts in a directory that are not in Yuki yet, once each. State is kept in `<path>/.yuki-sync.json`, keyed by content hash, written atomically after every upload. It prints a plan and asks first (`--yes` for unattended runs, `--dry-run` for the plan alone), caps a run with `--max` (default 25), skips `_to_delete`, dotfiles and `--exclude` globs, and retries failed files on the next run. `--seed-from-yuki` records files whose name matches a Yuki document; `upload mark <file> --doc-id <id>|--skip|--forget` records one by hand.
+- **upload**: `upload dir <path>` uploads the receipts in a directory that are not in Yuki yet. State is kept in `.yuki-sync.json` (nearest at or above `<path>`), keyed by content hash so a renamed or moved file is not uploaded again, written atomically after every result, and guarded by `.yuki-sync.lock`. It prints a plan and asks first (`--yes` for unattended runs, `--dry-run` for the plan alone), caps a run with `--max` (default 25), and skips `_to_delete`, dotfiles, symbolic links and `--exclude` globs. Rejected uploads are retried after new files, up to 3 attempts; an upload whose result is uncertain is recorded as `unknown` and not retried, and a changed file is not uploaded, until resolved with `upload mark`. `--seed-from-yuki` records files whose name matches exactly one unclaimed Yuki document; `upload mark <file> --doc-id <id>|--skip|--forget` records one by hand.
 
 ### Fixed
 
