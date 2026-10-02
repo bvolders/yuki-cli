@@ -369,8 +369,7 @@ fn a_non_interactive_run_without_yes_refuses_before_any_call() {
         assert!(err.contains("\"kind\":\"confirmation_required\""), "{err}");
     }
     assert_eq!(calls(&seen), 0);
-    // The lock holder claimed the root with an empty state, and nothing more.
-    assert_eq!(state(dir.path())["files"].as_object().unwrap().len(), 0);
+    assert!(!dir.path().join(STATE).exists());
 }
 
 #[test]
@@ -486,7 +485,7 @@ fn a_killed_run_leaves_its_upload_pending_and_releases_the_lock() {
         stderr(&second)
     );
 
-    // The first run claimed the root at once: a run below it is refused.
+    // The write-ahead created the state: a run below the root is refused.
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
     let below = run(&home, &sub, &["--yes"]);
@@ -843,7 +842,7 @@ fn seeding_records_nothing_when_paging_looks_wrong() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(state(dir.path())["files"].as_object().unwrap().len(), 0);
+    assert!(!dir.path().join(STATE).exists());
     assert_eq!(calls(&seen), 4);
 }
 

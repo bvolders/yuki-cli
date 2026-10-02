@@ -272,23 +272,6 @@ fn plan(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
     })
 }
 
-/// Under the lock: create the state file on a first run, so a concurrent run
-/// on a directory above or below sees this tree as synced, then check again
-/// that no state file sits above or below. A state file created here is
-/// removed again when the check fails.
-fn claim_root(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
-    let state_file = root.join(STATE_FILE);
-    let created = !state_file.exists();
-    if created {
-        State::default().save(&root)?;
-    }
-    let result = sync::sync_root(&root).and_then(|root| plan(root, excludes));
-    if result.is_err() && created {
-        let _ = std::fs::remove_file(&state_file);
-    }
-    result
-}
-
 /// Print the plan to stderr: counts, then the files that would be uploaded.
 fn print_plan(plan: &Plan, opts: &DirOptions<'_>) {
     eprintln!(
@@ -396,11 +379,8 @@ async fn run_dir(
     let root = sync::sync_root(Path::new(opts.path))?;
     // A dry run writes nothing, so it takes no lock.
     let _lock = (!opts.dry_run).then(|| Lock::acquire(&root)).transpose()?;
-    let mut plan = if opts.dry_run {
-        plan(root, opts.excludes)?
-    } else {
-        claim_root(root, opts.excludes)?
-    };
+    // Accepted: concurrent first runs on /r and /r/sub can both pass these checks.
+    let mut plan = plan(root, opts.excludes)?;
     if !quiet {
         print_plan(&plan, opts);
     }
