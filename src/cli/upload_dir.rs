@@ -54,12 +54,6 @@ pub enum Outcome {
     NeedsAttention(String),
 }
 
-/// Documents per `DocumentsInFolder` request when seeding.
-const SEED_PAGE_SIZE: usize = 500;
-
-/// Pages read from one folder at most when seeding.
-const SEED_MAX_PAGES: usize = 40;
-
 /// Uploads at the start of a run that all go wrong the same way stop it.
 const EARLY_STOP: usize = 3;
 
@@ -661,43 +655,6 @@ fn possible_match(name: &str, doc: &ArchiveDocument) -> Option<&'static str> {
     .then_some("same date and vendor")
 }
 
-/// Every document in `folder`. Any paging anomaly is an error: a listing that
-/// may be incomplete must not decide what is already in Yuki.
-async fn fetch_folder(
-    client: &ArchiveClient,
-    folder: &str,
-) -> Result<Vec<ArchiveDocument>, YukiError> {
-    let fid = folder_id(folder)?;
-    let mut docs = Vec::new();
-    let mut seen = HashSet::new();
-    for _ in 0..SEED_MAX_PAGES {
-        // From DateTime.MinValue, which the WSDL documents (for
-        // SearchDocuments) as "all years": a document without a date is not
-        // left out. Pages advance by what came back and end only with an
-        // empty page, in case Yuki returns fewer records than asked.
-        let page = client
-            .documents_in_folder_page(fid, "0001-01-01", "9999-12-31", SEED_PAGE_SIZE, docs.len())
-            .await?;
-        if page.is_empty() {
-            return Ok(docs);
-        }
-        for doc in page {
-            if !seen.insert(doc.id.clone()) {
-                return Err(YukiError::Config(format!(
-                    "Yuki listed document {} twice while paging folder {folder}, so the listing \
-                     cannot be trusted; nothing recorded",
-                    doc.id
-                )));
-            }
-            docs.push(doc);
-        }
-    }
-    Err(YukiError::Config(format!(
-        "folder {folder} still had documents after {SEED_MAX_PAGES} pages, more than seeding \
-         reads; nothing recorded"
-    )))
-}
-
 fn name_of(f: &Found) -> &str {
     f.path
         .file_name()
@@ -741,7 +698,7 @@ async fn seed(
         .with_session(session);
     let mut docs: Vec<(String, ArchiveDocument)> = Vec::new();
     for folder in seed_folders(opts) {
-        let found = fetch_folder(&client, &folder).await?;
+        let found = client.documents_in_folder_all(folder_id(&folder)?).await?;
         docs.extend(found.into_iter().map(|d| (folder.clone(), d)));
     }
 

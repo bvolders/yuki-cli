@@ -35,6 +35,14 @@ pub struct ArchiveDocument {
     pub reference: String,
 }
 
+/// The widest date range `DocumentsInFolder` takes: from `DateTime.MinValue`,
+/// which the WSDL documents (for SearchDocuments) as "all years", so
+/// undated documents are not left out.
+pub const ALL_DATES: (&str, &str) = ("0001-01-01", "9999-12-31");
+
+/// Pages [`ArchiveClient::documents_in_folder_all`] reads at most.
+pub const ALL_MAX_PAGES: usize = 40;
+
 /// Client for the Yuki Archive SOAP service.
 pub struct ArchiveClient {
     soap: SoapClient,
@@ -165,6 +173,40 @@ impl ArchiveClient {
         }
 
         Ok(collected)
+    }
+
+    /// Every document in an archive folder, dated or not, read strictly: pages
+    /// advance by what came back and end with an empty page, and a document
+    /// listed twice or more than [`ALL_MAX_PAGES`] pages are an error rather
+    /// than a listing that may be incomplete.
+    pub async fn documents_in_folder_all(
+        &self,
+        folder_id: i32,
+    ) -> Result<Vec<ArchiveDocument>, YukiError> {
+        let (start, end) = ALL_DATES;
+        let mut docs: Vec<ArchiveDocument> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..ALL_MAX_PAGES {
+            let page = self
+                .documents_in_folder_page(folder_id, start, end, Self::FOLDER_PAGE_SIZE, docs.len())
+                .await?;
+            if page.is_empty() {
+                return Ok(docs);
+            }
+            for doc in page {
+                if !seen.insert(doc.id.clone()) {
+                    return Err(YukiError::Config(format!(
+                        "Yuki listed document {} twice while paging folder {folder_id}; \
+                         the listing cannot be trusted",
+                        doc.id
+                    )));
+                }
+                docs.push(doc);
+            }
+        }
+        Err(YukiError::Config(format!(
+            "folder {folder_id} still had documents after {ALL_MAX_PAGES} pages"
+        )))
     }
 
     /// List all documents of a given document type.

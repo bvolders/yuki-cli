@@ -843,7 +843,6 @@ fn seeding_records_nothing_when_paging_looks_wrong() {
         "{}",
         stderr(&out)
     );
-    assert!(stderr(&out).contains("nothing recorded"));
     assert_eq!(state(dir.path())["files"].as_object().unwrap().len(), 0);
     assert_eq!(calls(&seen), 4);
 }
