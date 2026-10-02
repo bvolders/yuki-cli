@@ -5,6 +5,7 @@ pub mod check;
 pub mod contacts;
 pub mod documents;
 pub mod init;
+pub mod invoice_ledger;
 pub mod invoice_number;
 pub mod invoices;
 pub mod projects;
@@ -451,9 +452,10 @@ pub enum SalesInvoiceCommands {
         inputs: InvoiceInputs,
 
         /// Custom invoice PDF (max 3 MB), replacing an invoice file's `pdf`;
-        /// a template takes one only this way. Yuki stores it instead of the
-        /// invoice it would generate; the lines still set the booked amounts.
-        /// Needs --send or --book, and --number.
+        /// a template takes one only this way. Yuki stores it, as
+        /// `Invoice <number>.pdf`, instead of the invoice it would generate;
+        /// the lines still set the booked amounts. Needs --send or --book,
+        /// and the --number and --date `prepare` printed.
         #[arg(long, value_name = "PATH")]
         pdf: Option<String>,
 
@@ -473,16 +475,31 @@ pub enum SalesInvoiceCommands {
 
     /// Print the fully resolved invoice as JSON, writing nothing.
     ///
-    /// The same inputs as `create`; its number, dates (ISO and Dutch),
-    /// customer, lines, totals per VAT rate and Belgian structured payment
-    /// reference are what `create` books for the same inputs, so a PDF
-    /// rendered from it matches. With --number it reads the sales archive.
+    /// The same inputs as `create`, which sends the same number, dates,
+    /// customer and lines for them. The totals per VAT rate are the CLI's
+    /// computation; Yuki books its own. Dates come as ISO and Dutch text, with
+    /// the Belgian structured payment reference. Any `pdf` is ignored, as the
+    /// PDF does not exist yet. With --number it reads the sales archive and
+    /// the local number ledger; pass the number and date it prints to
+    /// `create --pdf`.
     #[command(group(
         clap::ArgGroup::new("source").required(true).args(["file", "template"])
     ))]
     Prepare {
         #[command(flatten)]
         inputs: InvoiceInputs,
+    },
+
+    /// List the invoice numbers given out, from the local ledger.
+    ///
+    /// A number is pending from just before Yuki is called until its answer
+    /// marks it booked or rejected. One left pending (no answer came back)
+    /// stays taken: check "To be sent"/Sales in Yuki, then settle it with
+    /// --resolve <NUMBER> booked|rejected. A rejected number can be used again.
+    Numbers {
+        /// Settle a pending number: --resolve 2026-20 booked (or rejected).
+        #[arg(long, num_args = 2, value_names = ["NUMBER", "STATUS"])]
+        resolve: Option<Vec<String>>,
     },
 
     /// List saved invoice templates (~/.config/yuki/invoices/*.toml).
@@ -516,11 +533,13 @@ pub struct InvoiceInputs {
     #[arg(long)]
     pub subject: Option<String>,
 
-    /// Invoice number (Yuki's Reference), or `auto`: one past the highest
-    /// <year>-<seq> in the sales archive's file names for the invoice
-    /// date's year. Refused when the archive already has it. Yuki's own
-    /// counter does not learn numbers given here, so once you start, number
-    /// every invoice this way. Without it, Yuki numbers the invoice.
+    /// Invoice number (Yuki's Reference) for a booked invoice (--send or
+    /// --book), or `auto`: one past the highest <year>-<seq> among the
+    /// sales archive's `Invoice <n>.pdf` files of the invoice date's year and
+    /// the numbers the local ledger holds. Refused when either has it.
+    /// Yuki's own counter does not learn numbers given here, so once you
+    /// start, number every invoice this way. Without it, Yuki numbers the
+    /// invoice. With --pdf, give the number `prepare` printed, not auto.
     #[arg(long, value_name = "REF|auto", value_parser = invoice_number::parse_number_request)]
     pub number: Option<invoice_number::NumberRequest>,
 }
@@ -542,6 +561,7 @@ impl InvoiceInputs {
             subject: self.subject.as_deref(),
             pdf: None,
             number: self.number.as_ref(),
+            preparing: false,
         }
     }
 }

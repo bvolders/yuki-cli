@@ -265,6 +265,7 @@ fn command_line_overrides_replace_the_file_values() {
         subject: Some("November"),
         pdf: None,
         number: None,
+        preparing: false,
     };
     let text = format!("subject = \"October\"\ndue_days = 14\n{MINIMAL}");
     let inv = parse(&text, "t", &overrides, None).unwrap();
@@ -531,6 +532,7 @@ fn load_booked(file: PathBuf, overrides: Overrides<'_>) -> Result<Invoice, YukiE
     let number = NumberRequest::Given("2026-20".into());
     let overrides = Overrides {
         number: Some(&number),
+        date: Some("2026-10-01"),
         ..overrides
     };
     load(&Source::File(file), &overrides, Some(SendMode::Book))
@@ -551,8 +553,9 @@ fn a_custom_pdf_is_read_relative_to_the_file_and_embedded_before_the_contact() {
     let (_dir, file) = invoice_with_pdf(b"%PDF-1.7 hello");
     let inv = load_booked(file, Overrides::default()).unwrap();
     let xml = inv.to_xml();
+    // Stored under the number, whatever the local file is called.
     assert!(
-        xml.contains("<DocumentFileName>doc.pdf</DocumentFileName>"),
+        xml.contains("<DocumentFileName>Invoice 2026-20.pdf</DocumentFileName>"),
         "{xml}"
     );
     let base64 = BASE64.encode(b"%PDF-1.7 hello");
@@ -582,7 +585,7 @@ fn a_custom_pdf_is_read_relative_to_the_file_and_embedded_before_the_contact() {
     let preview = inv.preview(None);
     assert!(
         preview.contains(
-            "custom PDF doc.pdf (14 bytes) replaces Yuki's layout; amounts in the PDF must match the lines"
+            "custom PDF doc.pdf (14 bytes), stored as Invoice 2026-20.pdf, replaces Yuki's layout; amounts in the PDF must match the lines"
         ),
         "{preview}"
     );
@@ -709,6 +712,7 @@ fn prepared_json_carries_the_figures_create_sends() {
     let number = NumberRequest::Given("2026-20".into());
     let overrides = Overrides {
         number: Some(&number),
+        preparing: true,
         ..Default::default()
     };
     let inv = parse(FULL, "t", &overrides, None).unwrap();
@@ -731,4 +735,133 @@ fn prepared_json_carries_the_figures_create_sends() {
     // Without a number there is no reference either.
     let unnumbered = invoice(FULL, None).prepared();
     assert!(unnumbered["number"].is_null() && unnumbered["payment_reference"].is_null());
+}
+
+#[test]
+fn a_numbered_draft_is_refused() {
+    for number in [NumberRequest::Auto, NumberRequest::Given("2026-20".into())] {
+        let overrides = Overrides {
+            number: Some(&number),
+            ..Default::default()
+        };
+        let err = parse(MINIMAL, "t", &overrides, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--number numbers a booked invoice: add --send or --book"),
+            "{err}"
+        );
+        // prepare takes it: it only shows the number.
+        let preparing = Overrides {
+            preparing: true,
+            ..overrides
+        };
+        assert!(parse(MINIMAL, "t", &preparing, None).is_ok());
+    }
+}
+
+#[test]
+fn a_pdf_needs_the_prepared_number_and_date() {
+    let (dir, file) = invoice_with_pdf(b"%PDF-1.7");
+    let auto = NumberRequest::Auto;
+    let overrides = Overrides {
+        number: Some(&auto),
+        ..Default::default()
+    };
+    let err = load(&Source::File(file), &overrides, Some(SendMode::Email))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("with --pdf, give the number printed on it"),
+        "{err}"
+    );
+    assert!(err.contains("with --pdf, give --date"), "{err}");
+    drop(dir);
+}
+
+#[test]
+fn prepare_reads_no_pdf() {
+    // The file names a PDF that does not exist yet: prepare does not care.
+    let text = format!("pdf = \"not-rendered-yet.pdf\"\n{MINIMAL}");
+    let overrides = Overrides {
+        preparing: true,
+        ..Default::default()
+    };
+    let inv = parse(&text, "t", &overrides, None).unwrap();
+    assert!(inv.pdf.is_none());
+    // create does.
+    let err = parse(&text, "t", &Overrides::default(), None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not-rendered-yet.pdf"), "{err}");
+}
+
+#[test]
+fn a_line_remark_goes_under_the_line_and_into_prepare() {
+    let text = MINIMAL.replace(
+        "vat_type = 1\n",
+        "vat_type = 1\nunit = \"u\"\nremarks = \"waarvan overdracht auteursrecht op ontwikkelde software van 25% of €312.50\"\n",
+    );
+    let inv = invoice(&text, None);
+    let xml = inv.to_xml();
+    assert_in_order(
+        &xml,
+        &[
+            "InvoiceLine",
+            "Description",
+            "Remarks",
+            "ProductQuantity",
+            "Product",
+        ],
+    );
+    assert!(xml.contains("<Remarks>waarvan overdracht auteursrecht op ontwikkelde software van 25% of €312.50</Remarks>"));
+    // The unit is for the PDF only.
+    assert!(!xml.contains(">u<"), "{xml}");
+    let json = inv.prepared();
+    assert_eq!(json["lines"][0]["unit"], "u");
+    assert!(
+        json["lines"][0]["remarks"]
+            .as_str()
+            .unwrap()
+            .starts_with("waarvan")
+    );
+    assert!(inv.preview(None).contains("line 1 remarks: waarvan"));
+}
+
+#[test]
+fn per_line_rounding_that_differs_is_flagged() {
+    // Three lines of 0.05 at 21%: per rate 0.15 × 21% = 0.03; per line 3 × 0.01.
+    let lines = "[[lines]]\ndescription = \"x\"\nprice = 0.05\nvat_percentage = 21\nvat_type = 1\n";
+    let text = format!("date = 2026-10-01\n[contact]\ncode = \"C\"\n{lines}{lines}{lines}");
+    let inv = invoice(&text, None);
+    assert_eq!(inv.vat(), Cents(3));
+    assert_eq!(inv.vat_per_line(), Cents(3));
+    // 0.07 × 21% = 0.0147 per line (0.01 each, 0.03), per rate 0.21 × 21% = 0.0441 (0.04).
+    let lines = lines.replace("0.05", "0.07");
+    let text = format!("date = 2026-10-01\n[contact]\ncode = \"C\"\n{lines}{lines}{lines}");
+    let inv = invoice(&text, None);
+    assert_eq!((inv.vat(), inv.vat_per_line()), (Cents(4), Cents(3)));
+    let preview = inv.preview(None);
+    assert!(
+        preview
+            .contains("!! VAT rounded per line would be 0.03 EUR, not 0.04: Yuki may book either"),
+        "{preview}"
+    );
+    assert_eq!(inv.prepared()["totals"]["vat_rounded_per_line"], "0.03");
+    assert!(invoice(MINIMAL, None).prepared()["totals"]["vat_rounded_per_line"].is_null());
+}
+
+#[test]
+fn a_booking_announces_itself_in_one_line() {
+    let number = NumberRequest::Given("2026-20".into());
+    let overrides = Overrides {
+        number: Some(&number),
+        ..Default::default()
+    };
+    let inv = parse(MINIMAL, "t", &overrides, Some(SendMode::Book)).unwrap();
+    assert_eq!(
+        inv.booking_line().unwrap(),
+        "BOOKS IMMEDIATELY: 2026-20 code C0042 1512.50 EUR"
+    );
+    assert!(invoice(MINIMAL, None).booking_line().is_none());
 }

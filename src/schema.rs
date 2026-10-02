@@ -277,7 +277,7 @@ pub fn generate() -> Value {
                     {"name": "--pdf", "type": "path", "required": false, "description": "Custom invoice PDF (max 3 MB; not allowed in a template), stored in Yuki instead of the generated invoice; replaces the file's pdf."},
                     {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it (or --book), the invoice is a draft."},
                     {"name": "--book", "type": "boolean", "required": false, "description": "Book the invoice without sending it."},
-                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number (Reference), or auto: one past the highest <year>-<seq> in the sales archive for the invoice date's year. Refused when the archive has it. Required with --pdf."},
+                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number (Reference) of a booked invoice (needs --send or --book), or auto: one past the highest <year>-<seq> in the sales archive (Invoice/Factuur <year>-<seq>.pdf) and the local ledger for the invoice date's year. Refused when either has it. With --pdf, required and explicit (not auto), with --date."},
                     {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."}
                 ],
                 "output_fields": [
@@ -292,7 +292,7 @@ pub fn generate() -> Value {
             },
             {
                 "name": "sales invoice prepare",
-                "description": "Print the fully resolved invoice as JSON (number, ISO and Dutch dates, customer, lines, totals per VAT rate, Belgian structured payment reference) for rendering a PDF; create books the same figures for the same inputs. Writes nothing; reads the sales archive with --number.",
+                "description": "Print the fully resolved invoice as JSON (number, ISO and Dutch dates, customer, lines, totals per VAT rate, Belgian structured payment reference) for rendering a PDF; create sends the same number, dates and lines for the same inputs, while the totals are the CLI's computation (Yuki books its own). Ignores any pdf. Writes nothing; reads the sales archive and the local number ledger with --number.",
                 "mutating": false,
                 "args": [
                     {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file or --template is required."},
@@ -305,6 +305,23 @@ pub fn generate() -> Value {
                 ],
                 "output_kind": "data",
                 "stdout_schema": {"type": "object", "required": ["number", "date", "customer", "lines", "totals", "payment_reference"]}
+            },
+            {
+                "name": "sales invoice numbers",
+                "description": "List the invoice numbers given out, from the local ledger (invoice-numbers.json next to the config): pending from just before Yuki is called, then booked or rejected. --resolve settles a pending number by hand after checking Yuki; makes no API call.",
+                "mutating": false,
+                "args": [
+                    {"name": "--resolve", "type": "string[]", "required": false, "description": "NUMBER STATUS: settle a pending number as booked or rejected (a local write)."}
+                ],
+                "output_fields": [
+                    {"name": "Number", "type": "string"},
+                    {"name": "Date", "type": "string"},
+                    {"name": "Customer", "type": "string"},
+                    {"name": "Gross", "type": "string"},
+                    {"name": "Status", "type": "string"},
+                    {"name": "Recorded", "type": "string"},
+                    {"name": "Booked", "type": "string"}
+                ]
             },
             {
                 "name": "sales invoice templates",

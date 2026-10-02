@@ -16,6 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::Deserialize;
 
+use crate::cli::invoice_ledger::InvoiceLedger;
 use crate::cli::invoice_number::{NumberRequest, dutch_date, structured_reference};
 use crate::client::sales::{SalesClient, SalesInvoicesImport};
 use crate::config::Config;
@@ -137,6 +138,9 @@ pub struct Overrides<'a> {
     pub pdf: Option<&'a Path>,
     /// `--number`: given here, or resolved later for `auto`.
     pub number: Option<&'a NumberRequest>,
+    /// For `prepare`: no PDF is read (it does not exist yet), and a number
+    /// needs no booking mode.
+    pub preparing: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +191,8 @@ struct LineSpec {
     vat_description: Option<String>,
     gl_account: Option<String>,
     product_code: Option<String>,
+    remarks: Option<String>,
+    unit: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +242,10 @@ pub struct Line {
     pub gl_account: Option<String>,
     /// Item number of a Yuki sales item (`Product/Reference`).
     pub product_code: Option<String>,
+    /// Shown under the line (`InvoiceLine/Remarks`), e.g. a tax note.
+    pub remarks: Option<String>,
+    /// Unit of the quantity for a rendered PDF, e.g. `u`; not sent to Yuki.
+    pub unit: Option<String>,
 }
 
 impl Line {
@@ -384,9 +394,10 @@ impl Invoice {
         }
     }
 
-    /// The fully resolved invoice as JSON, for rendering a PDF of it: the
-    /// same figures `create` sends for the same inputs. Amounts are strings
-    /// with two decimals and a dot.
+    /// The fully resolved invoice as JSON, for rendering a PDF of it: what
+    /// `create` sends for the same inputs, with the totals as the CLI
+    /// computes them (Yuki books its own). Amounts are strings with two
+    /// decimals and a dot.
     pub fn prepared(&self) -> serde_json::Value {
         use serde_json::json;
         let date = |iso: &str| json!({"iso": iso, "text": dutch_date(iso)});
@@ -415,6 +426,8 @@ impl Invoice {
             },
             "lines": self.lines.iter().map(|l| json!({
                 "description": l.description,
+                "remarks": l.remarks,
+                "unit": l.unit,
                 "qty": format_scaled(l.qty.0, QTY_DECIMALS),
                 "unit_price": l.price.to_string(),
                 "net": l.net().to_string(),
@@ -426,6 +439,8 @@ impl Invoice {
                 "net": self.net().to_string(),
                 "vat": vat.to_string(),
                 "gross": (self.net() + vat).to_string(),
+                "computed_by": "the CLI's computation, VAT per rate; Yuki books its own",
+                "vat_rounded_per_line": (self.vat_per_line() != vat).then(|| self.vat_per_line().to_string()),
                 "by_rate": rates.iter().map(|r| json!({
                     "vat_percentage": format_scaled(r.percentage, PCT_DECIMALS),
                     "net": r.base.to_string(),
@@ -511,9 +526,10 @@ impl Invoice {
             row(
                 "PDF",
                 &format!(
-                    "custom PDF {} ({}) replaces Yuki's layout; amounts in the PDF must match the lines",
+                    "custom PDF {} ({}), stored as {}, replaces Yuki's layout; amounts in the PDF must match the lines",
                     pdf.name,
-                    human_size(pdf.bytes.len() as u64)
+                    human_size(pdf.bytes.len() as u64),
+                    self.document_file_name().unwrap_or_default()
                 ),
             );
         }
@@ -549,7 +565,8 @@ impl Invoice {
         let currency = self.currency.as_deref().unwrap_or("EUR");
         let net = self.net();
         let rates = self.vat_rates();
-        let gross = net + rates.iter().map(|r| r.vat).sum();
+        let vat_total: Cents = rates.iter().map(|r| r.vat).sum();
+        let gross = net + vat_total;
         let _ = writeln!(out, "  {:<15}{:>12} {currency}", "Net", net.to_string());
         for rate in &rates {
             let _ = writeln!(
@@ -574,9 +591,57 @@ impl Invoice {
         };
         let _ = write!(
             out,
-            "  (VAT computed per rate; Yuki books its own figures{default})"
+            "  (the CLI's computation, VAT per rate; Yuki books its own{default})"
         );
+        let per_line = self.vat_per_line();
+        if per_line != vat_total {
+            let _ = write!(
+                out,
+                "\n  !! VAT rounded per line would be {per_line} {currency}, not {vat_total}: Yuki may book either"
+            );
+        }
+        for (i, line) in self.lines.iter().enumerate() {
+            if let Some(remarks) = &line.remarks {
+                let _ = write!(out, "\n  line {} remarks: {remarks}", i + 1);
+            }
+        }
         out
+    }
+
+    /// The file name Yuki stores a custom PDF under: `Invoice <number>.pdf`,
+    /// so the sales archive shows the number whatever the local file is called.
+    pub fn document_file_name(&self) -> Option<String> {
+        let pdf = self.pdf.as_ref()?;
+        Some(match &self.number {
+            Some(number) => format!("Invoice {number}.pdf"),
+            None => pdf.name.clone(),
+        })
+    }
+
+    /// VAT rounded per line instead of per rate: the other way Yuki may
+    /// compute it.
+    pub fn vat_per_line(&self) -> Cents {
+        self.lines
+            .iter()
+            .map(|l| {
+                Cents(div_round(
+                    i128::from(l.net().0) * i128::from(l.vat_percentage),
+                    100 * 10_i128.pow(PCT_DECIMALS),
+                ) as i64)
+            })
+            .sum()
+    }
+
+    /// The one line `--quiet --yes` still prints for a booking.
+    pub fn booking_line(&self) -> Option<String> {
+        self.send?;
+        Some(format!(
+            "BOOKS IMMEDIATELY: {} {} {} {}",
+            self.number.as_deref().unwrap_or("(numbered by Yuki)"),
+            self.contact.label(),
+            self.gross(),
+            self.currency.as_deref().unwrap_or("EUR")
+        ))
     }
 
     /// The `xmlDoc` of `ProcessSalesInvoices`: one `SalesInvoice` in the
@@ -621,7 +686,10 @@ impl Invoice {
         x.opt("Currency", &self.currency);
         x.opt("Remarks", &self.remarks);
         if let Some(pdf) = &self.pdf {
-            x.leaf("DocumentFileName", &pdf.name);
+            x.leaf(
+                "DocumentFileName",
+                &self.document_file_name().unwrap_or_default(),
+            );
             let encoded = BASE64.encode(&pdf.bytes);
             if embed_pdf {
                 x.leaf("DocumentBase64", &encoded);
@@ -656,6 +724,7 @@ impl Invoice {
         for line in &self.lines {
             x.open("InvoiceLine");
             x.leaf("Description", &line.description);
+            x.opt("Remarks", &line.remarks);
             x.leaf("ProductQuantity", &format_scaled(line.qty.0, QTY_DECIMALS));
             x.open("Product");
             x.leaf("Description", &line.description);
@@ -988,11 +1057,12 @@ fn validate(
         p.push("--send email needs contact.email for a contact without a code");
     }
 
-    let file_pdf = p.text("pdf", spec.pdf);
+    // `prepare` runs before the PDF exists, so it reads none.
+    let file_pdf = p.text("pdf", spec.pdf).filter(|_| !overrides.preparing);
     if file_pdf.is_some() && !allow_pdf {
         p.push("a template can't carry a PDF; pass --pdf per invoice");
     }
-    let pdf_path = match overrides.pdf {
+    let pdf_path = match overrides.pdf.filter(|_| !overrides.preparing) {
         Some(path) => Some(path.to_path_buf()),
         None if allow_pdf => file_pdf.map(|pdf| base.join(pdf)),
         None => None,
@@ -1002,13 +1072,29 @@ fn validate(
             .map_err(|e| p.push(format!("pdf: {e}")))
             .ok()
     });
-    if pdf.is_some() && send.is_none() {
-        p.push(
-            "Yuki only accepts a custom PDF on a booked invoice: add --send email|peppol|both (or --book)",
-        );
+    if pdf.is_some() {
+        if send.is_none() {
+            p.push(
+                "Yuki only accepts a custom PDF on a booked invoice: add --send email|peppol|both (or --book)",
+            );
+        }
+        match overrides.number {
+            None => p.push("a custom PDF needs --number: the number printed on it"),
+            Some(NumberRequest::Auto) => p.push(
+                "with --pdf, give the number printed on it (from `sales invoice prepare`), not auto",
+            ),
+            Some(NumberRequest::Given(_)) => {}
+        }
+        if overrides.date.is_none() {
+            p.push(
+                "with --pdf, give --date: the date printed on it (from `sales invoice prepare`)",
+            );
+        }
     }
-    if pdf.is_some() && overrides.number.is_none() {
-        p.push("a custom PDF needs --number: the number printed on it");
+    if overrides.number.is_some() && send.is_none() && !overrides.preparing {
+        p.push(
+            "--number numbers a booked invoice: add --send or --book (Yuki numbers a draft itself when it is booked)",
+        );
     }
     let number = match overrides.number {
         Some(NumberRequest::Given(number)) => Some(number.clone()),
@@ -1151,6 +1237,8 @@ fn validate_line(
     let vat_description = p.text(&field("vat_description"), spec.vat_description);
     let gl_account = p.text(&field("gl_account"), spec.gl_account);
     let product_code = p.text(&field("product_code"), spec.product_code);
+    let remarks = p.text(&field("remarks"), spec.remarks);
+    let unit = p.text(&field("unit"), spec.unit);
     let line = Line {
         description: description?,
         qty: qty?,
@@ -1160,6 +1248,8 @@ fn validate_line(
         vat_description,
         gl_account,
         product_code,
+        remarks,
+        unit,
     };
     if line.price == Cents::ZERO {
         p.push(format!(
@@ -1240,9 +1330,58 @@ pub async fn submit(
         })?;
 
     if !quiet {
-        print_import(&import, invoice.pdf.as_ref(), format);
+        print_import(&import, invoice, format);
     }
     Ok(import)
+}
+
+/// [`submit`], with a number the CLI gave reserved in the ledger first and
+/// settled by Yuki's answer: booked when the invoice was booked as asked,
+/// rejected (the number free again) when Yuki refused it or nothing was
+/// sent, and left pending when the outcome is unknown or partial.
+pub async fn submit_numbered(
+    config: &Config,
+    admin: Option<&str>,
+    invoice: &Invoice,
+    format: Option<&str>,
+    quiet: bool,
+) -> Result<SalesInvoicesImport, SubmitError> {
+    let Some(number) = &invoice.number else {
+        return submit(config, admin, invoice, format, quiet).await;
+    };
+    InvoiceLedger::open()?.reserve(
+        number,
+        &invoice.date,
+        &invoice.contact.label(),
+        &invoice.gross().to_string(),
+    )?;
+    let result = submit(config, admin, invoice, format, quiet).await;
+    let settled = match &result {
+        Ok(import) if import.failure().is_none() && unsent(import, invoice.send).is_none() => {
+            Some(true)
+        }
+        Ok(import)
+            if !import.invoices.is_empty() && import.invoices.iter().all(|i| !i.succeeded) =>
+        {
+            Some(false)
+        }
+        Err(SubmitError::Yuki(_)) => Some(false),
+        Ok(_) | Err(SubmitError::OutcomeUnknown(_)) => None,
+    };
+    let outcome = InvoiceLedger::open().and_then(|mut ledger| match settled {
+        Some(true) => ledger.commit(number),
+        Some(false) => ledger.reject(number),
+        None => Ok(()),
+    });
+    if settled.is_none() || outcome.is_err() {
+        if let Err(e) = outcome {
+            eprintln!("warning: could not update the invoice number ledger: {e}");
+        }
+        eprintln!(
+            "invoice number {number} stays pending in the ledger: check Yuki, then `yuki sales invoice numbers --resolve {number} booked` (or `rejected`)"
+        );
+    }
+    result
 }
 
 /// Why [`submit`] failed.
@@ -1272,7 +1411,7 @@ fn may_have_been_created(error: &YukiError) -> bool {
     }
 }
 
-fn print_import(import: &SalesInvoicesImport, pdf: Option<&Pdf>, format: Option<&str>) {
+fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<&str>) {
     let yes_no = |b: bool| if b { "Yes" } else { "No" }.to_string();
     let headers: Vec<String> = [
         "Succeeded",
@@ -1285,7 +1424,7 @@ fn print_import(import: &SalesInvoicesImport, pdf: Option<&Pdf>, format: Option<
     ]
     .map(String::from)
     .to_vec();
-    let pdf_name = pdf.map(|p| p.name.clone()).unwrap_or_default();
+    let pdf_name = invoice.document_file_name().unwrap_or_default();
     let rows: Vec<Vec<String>> = import
         .invoices
         .iter()

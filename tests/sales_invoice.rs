@@ -67,6 +67,7 @@ fn mock(result: String) -> (String, RequestLog) {
     mock_yuki(move |action, _| match action {
         "Authenticate" => soap_response("Authenticate", "session-1"),
         "ProcessSalesInvoices" => soap_response("ProcessSalesInvoices", &result),
+        "SetCurrentDomain" => soap_response("SetCurrentDomain", ""),
         "DocumentsInFolder" => soap_response("DocumentsInFolder", SALES_ARCHIVE),
         other => panic!("unexpected call {other}"),
     })
@@ -423,6 +424,8 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
             "--book",
             "--number",
             "2026-20",
+            "--date",
+            "2026-10-02",
             "--dry-run",
         ],
     );
@@ -433,7 +436,9 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
         xml.contains("<!-- 48 bytes base64 (36-byte PDF) -->"),
         "{xml}"
     );
-    assert!(stderr(&dry).contains("custom PDF hosting.pdf (36 bytes) replaces Yuki's layout"));
+    assert!(stderr(&dry).contains(
+        "custom PDF hosting.pdf (36 bytes), stored as Invoice 2026-20.pdf, replaces Yuki's layout"
+    ));
     assert!(actions(&log).is_empty());
 
     let output = yuki(
@@ -449,6 +454,8 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
             "--book",
             "--number",
             "2026-20",
+            "--date",
+            "2026-10-02",
             "--yes",
             "--output",
             "json",
@@ -456,10 +463,11 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
     );
     assert!(output.status.success(), "{}", stderr(&output));
     let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
-    assert_eq!(json["items"][0]["PDF"], "hosting.pdf");
+    // The archive file is named after the number, not the local file.
+    assert_eq!(json["items"][0]["PDF"], "Invoice 2026-20.pdf");
     let body = sent_body(&log);
     assert!(
-        body.contains("<DocumentFileName>hosting.pdf</DocumentFileName>"),
+        body.contains("<DocumentFileName>Invoice 2026-20.pdf</DocumentFileName>"),
         "{body}"
     );
     assert!(
@@ -548,10 +556,18 @@ fn number_auto_takes_the_next_number_from_the_sales_archive() {
         actions(&log),
         [
             "Authenticate",
+            "SetCurrentDomain",
             "DocumentsInFolder",
             "Authenticate",
             "ProcessSalesInvoices"
         ]
+    );
+    // Only the invoice year is read from the archive.
+    let list = log.lock().unwrap()[2].body.clone();
+    assert!(
+        list.contains("<yuki:startDate>2026-01-01</yuki:startDate>")
+            && list.contains("<yuki:endDate>2026-12-31</yuki:endDate>"),
+        "{list}"
     );
     let body = sent_body(&log);
     assert!(body.contains("<Reference>2026-20</Reference>"), "{body}");
@@ -579,6 +595,7 @@ fn a_number_already_in_the_archive_is_refused_before_any_write() {
             "hosting",
             "--number",
             "2026-19",
+            "--book",
             "--yes",
         ],
     );
@@ -607,6 +624,7 @@ fn a_dry_run_cannot_pick_an_automatic_number() {
             file.to_str().unwrap(),
             "--number",
             "auto",
+            "--book",
             "--dry-run",
         ],
     );
@@ -643,7 +661,10 @@ fn prepare_and_create_agree_on_every_figure() {
     assert_eq!(json["totals"]["gross"], "257.43");
     assert_eq!(json["payment_reference"], "+++202/6000/02014+++");
     // Only the archive was read.
-    assert_eq!(actions(&log), ["Authenticate", "DocumentsInFolder"]);
+    assert_eq!(
+        actions(&log),
+        ["Authenticate", "SetCurrentDomain", "DocumentsInFolder"]
+    );
 
     // create with the same inputs and the prepared number books the same.
     let number = json["number"].as_str().unwrap();
@@ -652,37 +673,165 @@ fn prepare_and_create_agree_on_every_figure() {
     create.extend_from_slice(&["--number", number]);
     let output = yuki(&home, &create);
     assert!(output.status.success(), "{}", stderr(&output));
+    // Expected values worked out by hand, not by the code under test:
+    // 2.5 × 85.10 = 212.75 net; 21% of it 44.6775 → 44.68; gross 257.43.
     let xml = String::from_utf8_lossy(&output.stdout);
-    let line = &json["lines"][0];
     for fragment in [
-        format!("<Reference>{number}</Reference>"),
-        format!("<Date>{}</Date>", json["date"]["iso"].as_str().unwrap()),
-        format!(
-            "<DueDate>{}</DueDate>",
-            json["due_date"]["iso"].as_str().unwrap()
-        ),
-        format!(
-            "<ProductQuantity>{}</ProductQuantity>",
-            line["qty"].as_str().unwrap()
-        ),
-        format!(
-            "<SalesPrice>{}</SalesPrice>",
-            line["unit_price"].as_str().unwrap()
-        ),
-        format!(
-            "<VATPercentage>{}</VATPercentage>",
-            line["vat_percentage"].as_str().unwrap()
-        ),
+        "<Reference>2026-20</Reference>",
+        "<Date>2026-09-30</Date>",
+        "<DueDate>2026-10-30</DueDate>",
+        "<ProductQuantity>2.5</ProductQuantity>",
+        "<SalesPrice>85.10</SalesPrice>",
+        "<VATPercentage>21</VATPercentage>",
     ] {
-        assert!(xml.contains(&fragment), "{fragment} missing from {xml}");
+        assert!(xml.contains(fragment), "{fragment} missing from {xml}");
     }
     let preview = stderr(&output);
-    for total in ["net", "gross"] {
-        let amount = json["totals"][total].as_str().unwrap();
-        assert!(
-            preview.contains(&format!("{amount} EUR")),
-            "{total} {amount}: {preview}"
-        );
+    for total in ["212.75 EUR", "257.43 EUR"] {
+        assert!(preview.contains(total), "{total}: {preview}");
     }
     assert!(preview.contains("44.68 EUR  (21% on 212.75)"), "{preview}");
+}
+
+/// The local ledger of numbers given out, as `sales invoice numbers` lists it.
+fn ledger_rows(home: &TempDir) -> Vec<Value> {
+    let output = yuki(home, &["sales", "invoice", "numbers", "--output", "json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    json["items"].as_array().cloned().unwrap_or_default()
+}
+
+fn book_number(home: &TempDir, number: &str) -> std::process::Output {
+    yuki(
+        home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "hosting",
+            "--number",
+            number,
+            "--book",
+            "--yes",
+            "--quiet",
+        ],
+    )
+}
+
+#[test]
+fn the_ledger_records_a_booking_and_blocks_the_number() {
+    let (root, _log) = mock(import_response(true, true, false, "2026-20"));
+    let home = home_with_config(&root);
+    let output = book_number(&home, "2026-20");
+    assert!(output.status.success(), "{}", stderr(&output));
+    // Quiet, a booking still says so in one line.
+    let err = stderr(&output);
+    assert!(
+        err.contains("BOOKS IMMEDIATELY: 2026-20 code C0042 121.00 EUR"),
+        "{err}"
+    );
+    let rows = ledger_rows(&home);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (&rows[0]["Number"], &rows[0]["Status"]),
+        (&Value::from("2026-20"), &Value::from("booked"))
+    );
+    assert!(!rows[0]["Booked"].as_str().unwrap().is_empty());
+
+    // The archive does not show 2026-20 yet; the ledger still refuses it,
+    // and auto skips it.
+    let again = book_number(&home, "2026-20");
+    assert_eq!(again.status.code(), Some(1));
+    assert!(stderr(&again).contains("invoice number 2026-20 was already given out: booked"));
+    let prepare = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "prepare",
+            "--template",
+            "hosting",
+            "--date",
+            "2026-10-02",
+            "--number",
+            "auto",
+        ],
+    );
+    let json: Value = serde_json::from_slice(&prepare.stdout).expect("JSON stdout");
+    assert_eq!(json["number"], "2026-21");
+}
+
+#[test]
+fn a_clean_rejection_frees_the_number() {
+    let (root, _log) = mock(import_response(false, false, false, ""));
+    let home = home_with_config(&root);
+    let output = book_number(&home, "2026-20");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(ledger_rows(&home)[0]["Status"], "rejected");
+    let prepare = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "prepare",
+            "--template",
+            "hosting",
+            "--date",
+            "2026-10-02",
+            "--number",
+            "auto",
+        ],
+    );
+    let json: Value = serde_json::from_slice(&prepare.stdout).expect("JSON stdout");
+    assert_eq!(json["number"], "2026-20");
+}
+
+#[test]
+fn an_unknown_outcome_keeps_the_number_pending_until_resolved() {
+    let (root, _log) = mock_yuki(|action, _| match action {
+        "Authenticate" => soap_response("Authenticate", "session-1"),
+        "SetCurrentDomain" => soap_response("SetCurrentDomain", ""),
+        "DocumentsInFolder" => soap_response("DocumentsInFolder", SALES_ARCHIVE),
+        _ => String::new(),
+    });
+    let home = home_with_config(&root);
+    let output = book_number(&home, "2026-20");
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("\"kind\":\"outcome_unknown\""), "{err}");
+    assert!(err.contains("stays pending in the ledger"), "{err}");
+    assert_eq!(ledger_rows(&home)[0]["Status"], "pending");
+
+    let again = book_number(&home, "2026-20");
+    assert!(stderr(&again).contains("already given out: pending (outcome unknown"));
+
+    // Checked in Yuki: it was not created.
+    let resolve = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "numbers",
+            "--resolve",
+            "2026-20",
+            "rejected",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(resolve.status.success(), "{}", stderr(&resolve));
+    assert_eq!(ledger_rows(&home)[0]["Status"], "rejected");
+    let bad = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "numbers",
+            "--resolve",
+            "2026-20",
+            "maybe",
+        ],
+    );
+    assert_eq!(bad.status.code(), Some(1));
 }

@@ -498,6 +498,9 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         }
                         if !(cli.quiet && cli.yes) {
                             eprintln!("{}\n", invoice.preview(Some(target.config_name)));
+                        } else if let Some(line) = invoice.booking_line() {
+                            // Even quiet, a booking is announced.
+                            eprintln!("{line}");
                         }
                         if !cli.yes {
                             if !sales_invoice::can_prompt() {
@@ -511,15 +514,16 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                 ));
                             }
                         }
-                        let import =
-                            sales_invoice::submit(&config, admin, &invoice, format, cli.quiet)
-                                .await
-                                .map_err(|e| match e {
-                                    sales_invoice::SubmitError::Yuki(e) => AppError::from(e),
-                                    sales_invoice::SubmitError::OutcomeUnknown(message) => {
-                                        AppError::OutcomeUnknown(message)
-                                    }
-                                })?;
+                        let import = sales_invoice::submit_numbered(
+                            &config, admin, &invoice, format, cli.quiet,
+                        )
+                        .await
+                        .map_err(|e| match e {
+                            sales_invoice::SubmitError::Yuki(e) => AppError::from(e),
+                            sales_invoice::SubmitError::OutcomeUnknown(message) => {
+                                AppError::OutcomeUnknown(message)
+                            }
+                        })?;
                         if let Some(failure) = import
                             .failure()
                             .or_else(|| sales_invoice::unsent(&import, invoice.send))
@@ -529,9 +533,12 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     }
                     SalesInvoiceCommands::Prepare { inputs } => {
                         use yuki_cli::cli::{invoice_number, sales_invoice};
-                        let mut invoice =
-                            sales_invoice::load(&inputs.source(), &inputs.overrides(), None)
-                                .map_err(invalid_input)?;
+                        let overrides = sales_invoice::Overrides {
+                            preparing: true,
+                            ..inputs.overrides()
+                        };
+                        let mut invoice = sales_invoice::load(&inputs.source(), &overrides, None)
+                            .map_err(invalid_input)?;
                         if let Some(request) = &inputs.number {
                             let config = load()?;
                             config.target(admin)?;
@@ -546,6 +553,28 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             serde_json::to_string_pretty(&invoice.prepared())
                                 .expect("serialize invoice")
                         );
+                    }
+                    SalesInvoiceCommands::Numbers { resolve } => {
+                        use yuki_cli::cli::invoice_ledger::{self, Status};
+                        let resolve = match resolve.as_deref() {
+                            Some([number, status]) => {
+                                let status = match status.to_ascii_lowercase().as_str() {
+                                    "booked" => Status::Booked,
+                                    "rejected" => Status::Rejected,
+                                    other => {
+                                        return Err(AppError::InvalidInput(format!(
+                                            "--resolve takes booked or rejected, not {other}"
+                                        )));
+                                    }
+                                };
+                                Some((number.clone(), status))
+                            }
+                            _ => None,
+                        };
+                        invoice_ledger::numbers(
+                            resolve.as_ref().map(|(n, s)| (n.as_str(), *s)),
+                            format,
+                        )?;
                     }
                     SalesInvoiceCommands::Templates => {
                         yuki_cli::cli::sales_invoice::templates(format)?;

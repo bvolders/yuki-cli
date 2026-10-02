@@ -2,11 +2,14 @@
 //! beforehand can show the number Yuki will book.
 //!
 //! Yuki names the PDFs in the sales archive after the invoice number:
-//! `Invoice 2026-19.pdf`. `--number auto` reads that folder, takes the
-//! highest `<year>-<seq>` of the invoice date's year and adds one, padded as
-//! the existing numbers are. Yuki's own counter does not learn about numbers
+//! `Invoice 2026-19.pdf`. `--number auto` reads that folder for the invoice
+//! year, adds the numbers the local ledger ([`invoice_ledger`]) still holds,
+//! takes the highest `<year>-<seq>` of that year and adds one, padded as the
+//! existing numbers are. Yuki's own counter does not learn about numbers
 //! given this way, so once invoices are numbered here, number them all here.
 
+use crate::cli::invoice_ledger::{InvoiceLedger, Ledger};
+use crate::cli::setup_domain;
 use crate::client::archive::ArchiveClient;
 use crate::config::Config;
 use crate::error::YukiError;
@@ -55,34 +58,36 @@ pub fn year_number(text: &str) -> Option<YearNumber> {
     })
 }
 
-/// The `<year>-<seq>` a file name ends with before its extension, as in
-/// `Invoice 2026-19.pdf`. The number must follow a non-digit, so a report
-/// named `..._2026-01-01_2026-01-31.pdf` (a date) does not count.
+/// The number of an invoice PDF in the sales archive: a `.pdf` named
+/// `Invoice <year>-<seq>` or `Factuur <year>-<seq>` (any case), as Yuki names
+/// them. Any other file, such as a timesheet or a date-stamped report, has
+/// no number even when its name holds something like `2026-01`.
 pub fn number_in_file_name(name: &str) -> Option<YearNumber> {
-    let stem = match name.rsplit_once('.') {
-        Some((stem, _)) => stem,
-        None => name,
-    };
-    let start = stem
-        .char_indices()
-        .rev()
-        .find(|(_, c)| !(c.is_ascii_digit() || *c == '-'))
-        .map_or(0, |(i, c)| i + c.len_utf8());
-    let tail = &stem[start..];
-    // In `2026-01-31` the tail would be the whole date: not one number.
-    if tail.matches('-').count() != 1 {
-        return None;
-    }
-    year_number(tail)
+    let lower = name.trim().to_ascii_lowercase();
+    let stem = lower.strip_suffix(".pdf")?;
+    let rest = stem
+        .strip_prefix("invoice ")
+        .or_else(|| stem.strip_prefix("factuur "))?;
+    year_number(rest.trim())
 }
 
-/// The next number for `year` after the numbers in `files`: one past the
-/// highest, with its sequence zero-padded to the widest padded sequence of
-/// that year (Yuki's own are not padded: `2026-9`, `2026-10`).
-pub fn next_number(files: &[String], year: u32) -> String {
-    let numbers: Vec<YearNumber> = files
+/// The invoice numbers among `files`, as `<year>-<seq>` text.
+pub fn numbers_in_file_names(files: &[String]) -> Vec<String> {
+    files
         .iter()
         .filter_map(|f| number_in_file_name(f))
+        .map(|n| format!("{}-{:0width$}", n.year, n.seq, width = n.digits))
+        .collect()
+}
+
+/// The next number for `year` after `numbers` (`<year>-<seq>` texts; others
+/// are ignored): one past the highest, with its sequence zero-padded to the
+/// widest padded sequence of that year (Yuki's own are not padded:
+/// `2026-9`, `2026-10`).
+pub fn next_number(numbers: &[String], year: u32) -> String {
+    let numbers: Vec<YearNumber> = numbers
+        .iter()
+        .filter_map(|n| year_number(n))
         .filter(|n| n.year == year)
         .collect();
     let seq = numbers.iter().map(|n| n.seq).max().unwrap_or(0) + 1;
@@ -95,55 +100,96 @@ pub fn next_number(files: &[String], year: u32) -> String {
     format!("{year}-{seq:0width$}")
 }
 
-/// Whether a file in `files` already carries `number`: the same year and
-/// sequence for a `<year>-<seq>` number (`2026-019` is `2026-19`), else a
-/// file stem ending in `number` after a non-alphanumeric character.
-pub fn taken(files: &[String], number: &str) -> bool {
-    if let Some(wanted) = year_number(number) {
-        return files
+/// Whether `numbers` holds `number`: the same year and sequence for a
+/// `<year>-<seq>` number (`2026-019` is `2026-19`), else the same text.
+pub fn taken(numbers: &[String], number: &str) -> bool {
+    match year_number(number) {
+        Some(wanted) => numbers
             .iter()
-            .filter_map(|f| number_in_file_name(f))
-            .any(|n| n.year == wanted.year && n.seq == wanted.seq);
+            .filter_map(|n| year_number(n))
+            .any(|n| n.year == wanted.year && n.seq == wanted.seq),
+        None => numbers.iter().any(|n| n == number),
     }
-    files.iter().any(|f| {
-        let stem = f.rsplit_once('.').map_or(f.as_str(), |(stem, _)| stem);
-        stem.strip_suffix(number)
-            .is_some_and(|before| before.chars().last().is_none_or(|c| !c.is_alphanumeric()))
-    })
 }
 
-/// The file names in the sales (`verkoop`) archive folder.
-async fn sales_file_names(config: &Config, admin: Option<&str>) -> Result<Vec<String>, YukiError> {
-    let target = config.target(admin)?;
-    let mut client = ArchiveClient::new().with_api_root(target.api_root);
-    client.authenticate(target.api_key).await?;
-    let documents = client
-        .documents_in_folder(folder_id("verkoop")?, "2000-01-01", "2099-12-31")
-        .await?;
-    Ok(documents.into_iter().map(|d| d.file_name).collect())
+/// The invoice numbers in the sales (`verkoop`) archive for `years`, each
+/// year read on its own date range.
+async fn archive_numbers(
+    config: &Config,
+    admin: Option<&str>,
+    years: &[u32],
+) -> Result<Vec<String>, YukiError> {
+    let (accounting, target) = setup_domain(config, admin).await?;
+    let session = accounting.session_id().unwrap_or_default();
+    let client = ArchiveClient::new()
+        .with_api_root(target.api_root)
+        .with_session(session);
+    let mut files = Vec::new();
+    for year in years {
+        let documents = client
+            .documents_in_folder(
+                folder_id("verkoop")?,
+                &format!("{year}-01-01"),
+                &format!("{year}-12-31"),
+            )
+            .await?;
+        files.extend(documents.into_iter().map(|d| d.file_name));
+    }
+    Ok(numbers_in_file_names(&files))
 }
 
-/// The number for an invoice dated `date`, checked against the sales
-/// archive: the next one for `auto`, or the given one if no file has it.
+/// The number for an invoice dated `date`: the next one for `auto`, or the
+/// given one, refused when the sales archive or the ledger already has it.
 pub async fn resolve(
     config: &Config,
     admin: Option<&str>,
     request: &NumberRequest,
     date: &str,
 ) -> Result<String, YukiError> {
-    let files = sales_file_names(config, admin).await?;
+    let year: u32 = date[..4]
+        .parse()
+        .map_err(|_| YukiError::Config(format!("'{date}' has no year")))?;
+    let mut years = vec![year];
+    if let NumberRequest::Given(number) = request
+        && let Some(n) = year_number(number)
+        && n.year != year
+    {
+        years.push(n.year);
+    }
+    let archive = archive_numbers(config, admin, &years).await?;
+    let ledger = InvoiceLedger::open()?;
+    choose(request, year, &archive, ledger.list())
+}
+
+/// [`resolve`] once the archive's numbers are known.
+pub fn choose(
+    request: &NumberRequest,
+    year: u32,
+    archive: &[String],
+    ledger: &Ledger,
+) -> Result<String, YukiError> {
+    let held: Vec<String> = ledger.taken_numbers().map(str::to_string).collect();
     let number = match request {
         NumberRequest::Auto => {
-            let year = date[..4]
-                .parse()
-                .map_err(|_| YukiError::Config(format!("'{date}' has no year")))?;
-            next_number(&files, year)
+            let all: Vec<String> = archive.iter().chain(&held).cloned().collect();
+            next_number(&all, year)
         }
         NumberRequest::Given(number) => number.clone(),
     };
-    if taken(&files, &number) {
+    if taken(archive, &number) {
         return Err(YukiError::Config(format!(
             "invoice number {number} is already in the sales archive"
+        )));
+    }
+    if taken(&held, &number) {
+        let status = ledger.holder(&number).map_or("taken", |e| match e.status {
+            crate::cli::invoice_ledger::Status::Pending => {
+                "pending (outcome unknown: check Yuki, then `yuki sales invoice numbers --resolve`)"
+            }
+            _ => "booked",
+        });
+        return Err(YukiError::Config(format!(
+            "invoice number {number} was already given out: {status}"
         )));
     }
     Ok(number)
@@ -219,46 +265,83 @@ mod tests {
             "uren januari 2026.xlsx",
             "_bertv timesheet 2025 (1).xlsx",
             "Toggl_Track_summary_report_2026-01-01_2026-01-31.pdf",
-            "Toggl_Track_summary_report_2026-01-01_2026-01-31 (1).pdf",
+            "Toggl 2026-40.pdf",
+            "Invoice 2026-41.xlsx",
+            "Kopie Invoice 2026-42.pdf",
+            "Invoice 2026-43 (1).pdf",
         ]
         .map(String::from)
         .to_vec()
     }
 
     #[test]
-    fn numbers_are_read_from_invoice_file_names_only() {
-        let found: Vec<Option<YearNumber>> =
-            archive().iter().map(|f| number_in_file_name(f)).collect();
+    fn only_invoice_pdfs_carry_a_number() {
         assert_eq!(
-            found[0],
-            Some(YearNumber {
-                year: 2026,
-                seq: 19,
-                digits: 2
-            })
+            numbers_in_file_names(&archive()),
+            ["2026-19", "2026-9", "2026-18", "2025-24"]
         );
-        assert!(found[4..].iter().all(Option::is_none), "{found:?}");
+        assert!(number_in_file_name("FACTUUR 2026-007.PDF").is_some());
+        assert!(number_in_file_name("invoice 2026-19.pdf").is_some());
     }
 
     #[test]
     fn the_next_number_follows_the_highest_of_the_year() {
-        assert_eq!(next_number(&archive(), 2026), "2026-20");
-        assert_eq!(next_number(&archive(), 2025), "2025-25");
-        assert_eq!(next_number(&archive(), 2027), "2027-1");
-        let padded = ["F 2026-007.pdf", "F 2026-012.pdf"].map(String::from);
+        let numbers = numbers_in_file_names(&archive());
+        assert_eq!(next_number(&numbers, 2026), "2026-20");
+        assert_eq!(next_number(&numbers, 2025), "2025-25");
+        assert_eq!(next_number(&numbers, 2027), "2027-1");
+        let padded = ["2026-007", "2026-012"].map(String::from);
         assert_eq!(next_number(&padded, 2026), "2026-013");
     }
 
     #[test]
     fn a_number_in_the_archive_is_taken() {
-        let files = archive();
-        assert!(taken(&files, "2026-19"));
-        assert!(taken(&files, "2026-019"));
-        assert!(!taken(&files, "2026-20"));
-        assert!(!taken(&files, "2026-1"));
-        let other = ["Factuur INV-7.pdf"].map(String::from);
-        assert!(taken(&other, "INV-7"));
-        assert!(!taken(&other, "NV-7"));
+        let numbers = numbers_in_file_names(&archive());
+        assert!(taken(&numbers, "2026-19"));
+        assert!(taken(&numbers, "2026-019"));
+        assert!(!taken(&numbers, "2026-20"));
+        assert!(!taken(&numbers, "2026-40"), "not an invoice file");
+        assert!(taken(&["INV-7".to_string()], "INV-7"));
+    }
+
+    #[test]
+    fn the_ledger_holds_numbers_the_archive_does_not_show_yet() {
+        let archive = numbers_in_file_names(&archive());
+        let mut ledger = Ledger::default();
+        ledger
+            .reserve("2026-20", "2026-10-31", "Example BV", "121.00")
+            .unwrap();
+        // auto skips the pending number; giving it is refused.
+        assert_eq!(
+            choose(&NumberRequest::Auto, 2026, &archive, &ledger).unwrap(),
+            "2026-21"
+        );
+        let err = choose(
+            &NumberRequest::Given("2026-20".into()),
+            2026,
+            &archive,
+            &ledger,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already given out: pending"), "{err}");
+        let err = choose(
+            &NumberRequest::Given("2026-19".into()),
+            2026,
+            &archive,
+            &ledger,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already in the sales archive"), "{err}");
+        // A rejected number is free again.
+        ledger
+            .settle("2026-20", crate::cli::invoice_ledger::Status::Rejected)
+            .unwrap();
+        assert_eq!(
+            choose(&NumberRequest::Auto, 2026, &archive, &ledger).unwrap(),
+            "2026-20"
+        );
     }
 
     #[test]

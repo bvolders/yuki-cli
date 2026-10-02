@@ -255,8 +255,10 @@ yuki sales invoice create --template acme-hosting \
 yuki sales invoice create --file invoice.toml --dry-run # Preview and xmlDoc only; no API call
 yuki sales invoice create --template acme-hosting --book  # Book it now; you send it yourself
 yuki sales invoice prepare --template acme-hosting --number auto  # Resolved invoice as JSON
-yuki sales invoice create --template acme-hosting \
-  --number 2026-20 --pdf "Invoice 2026-20.pdf" --send email  # Book your own PDF and email it
+yuki sales invoice create --template acme-hosting --number 2026-20 \
+  --date 2026-10-31 --pdf rendered.pdf --send email     # Book your own PDF and email it
+yuki sales invoice numbers                              # Invoice numbers given out (local ledger)
+yuki sales invoice numbers --resolve 2026-20 booked     # Settle a number left pending
 yuki sales invoice templates                            # List saved templates, each validated
 ```
 
@@ -288,24 +290,42 @@ result has a `PDF` column naming the file sent.
 
 #### Your own PDF with your own number
 
-`--number <REF>` sets the invoice number (Yuki's `Reference`); `--number auto`
-reads the sales (`verkoop`) archive, where Yuki names each invoice PDF after its
-number (`Invoice 2026-19.pdf`), and takes one past the highest `<year>-<seq>`
-of the invoice date's year (`2026-20`), padded like the existing numbers. A
-number the archive already has is refused. Yuki's own counter does not learn
-about numbers given this way, so once you start, number every invoice here.
+`--number <REF>` sets the invoice number (Yuki's `Reference`) of a booked
+invoice: it needs `--send` or `--book`, since Yuki numbers a draft itself when
+it is booked. `--number auto` reads the sales (`verkoop`) archive for the
+invoice year, where Yuki names each invoice PDF after its number
+(`Invoice 2026-19.pdf`; only `.pdf` files named `Invoice <year>-<seq>` or
+`Factuur <year>-<seq>` count), adds the numbers the local ledger holds, and
+takes one past the highest of the invoice date's year (`2026-20`), padded like
+the existing numbers. A number either already has is refused. Yuki's own
+counter does not learn about numbers given this way, so once you start, number
+every invoice here.
+
+The ledger, `~/.config/yuki/invoice-numbers.json`, covers the time before the
+archive shows an invoice: a number is `pending` from just before Yuki is
+called, then `booked`, or `rejected` (free again) when Yuki refuses it. When no
+answer comes back it stays pending and taken: check "To be sent" or Sales in
+Yuki, then `yuki sales invoice numbers --resolve <number> booked` (or
+`rejected`). Even with `--quiet --yes`, a booking prints one line to stderr:
+`BOOKS IMMEDIATELY: <number> <customer> <gross>`.
 
 To send a PDF rendered elsewhere:
 
 1. `yuki sales invoice prepare --template acme-hosting --number auto` prints the
    fully resolved invoice as JSON and writes nothing: the number, the dates in
    ISO and Dutch (`30 september 2026`), the customer with address and VAT number,
-   the lines, the totals per VAT rate, and the Belgian structured payment
-   reference.
+   the lines with their remarks and unit, the totals per VAT rate, and the
+   Belgian structured payment reference. It ignores any `pdf`, which does not
+   exist yet. The totals are the CLI's computation (VAT per rate); Yuki books its
+   own, and `totals.vat_rounded_per_line` appears when rounding per line would
+   differ. The preview warns about the same.
 2. Render the PDF from that JSON.
-3. `yuki sales invoice create --template acme-hosting --number 2026-20 --pdf
-   invoice.pdf --send email` books the same figures, since it reads the same
-   inputs the same way.
+3. `yuki sales invoice create --template acme-hosting --number 2026-20 --date
+   2026-10-31 --pdf rendered.pdf --send email` sends the same number, dates and
+   lines. With `--pdf`, the number must be the one `prepare` printed (not `auto`)
+   and `--date` is required, so the PDF and the booking agree. Yuki stores the
+   PDF as `Invoice <number>.pdf`, whatever the local file is called, so the
+   archive keeps showing the number.
 
 The structured reference (`+++DDD/DDDD/DDDCC+++`) has ten base digits: the
 year, then the sequence padded to six digits, for a `<year>-<seq>` number
@@ -357,6 +377,8 @@ vat_type = 1                      # your administration's VAT type number
 gl_account = "700000"             # optional revenue account
 # vat_description = "BTW 21%"     # optional, to pick between VAT codes
 # product_code = "HOST"           # optional item number of a Yuki sales item
+# remarks = "waarvan overdracht auteursrecht van 25%"  # shown under the line
+# unit = "u"                      # unit of qty, for prepare's JSON (a rendered PDF) only
 ```
 
 Real Yuki contacts often have an empty `Code`, so match on name, address and VAT
