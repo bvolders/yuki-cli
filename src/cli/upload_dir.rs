@@ -1,5 +1,10 @@
 //! `yuki upload dir` and `yuki upload mark`: idempotent upload of a directory
 //! of receipts, tracked in `<root>/.yuki-sync.json` (see [`crate::sync`]).
+//!
+//! Every upload is written ahead as `pending` and only then sent; Yuki's answer
+//! turns it into `uploaded`, or into `failed` when the request provably never
+//! left. Anything else (a timeout, a server fault, a crash) leaves it pending,
+//! which is never retried automatically.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -15,9 +20,7 @@ use crate::config::Config;
 use crate::error::YukiError;
 use crate::folders::folder_id;
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
-use crate::sync::{
-    self, Entry, Excludes, Found, Lock, MAX_ATTEMPTS, STATE_FILE, State, Status, shell_quote,
-};
+use crate::sync::{self, Entry, Excludes, Found, Lock, STATE_FILE, State, Status, shell_quote};
 
 /// Options of `upload dir`.
 pub struct DirOptions<'a> {
@@ -49,8 +52,7 @@ pub enum Outcome {
     Aborted,
     /// Writes were needed but not confirmed; Yuki was not contacted.
     NeedsConfirmation(String),
-    /// The run finished, but some files need the user: failed or unknown
-    /// uploads, changed or unreadable files. The message says which.
+    /// Some files need the user (pending, failed, changed, unreadable).
     NeedsAttention(String),
 }
 
@@ -59,6 +61,9 @@ const SEED_PAGE_SIZE: usize = 500;
 
 /// Pages read from one folder at most when seeding.
 const SEED_MAX_PAGES: usize = 40;
+
+/// Uploads at the start of a run that all go wrong the same way stop it.
+const EARLY_STOP: usize = 3;
 
 /// One output row: what happened to one file.
 struct Row {
@@ -119,53 +124,6 @@ fn print_rows(rows: &[Row], format: Option<&str>) {
     }
 }
 
-/// Why a file is in the upload queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pending {
-    New,
-    /// Rejected before, this many times.
-    Retry(u32),
-}
-
-/// The synced tree, with the files under the scanned path sorted into a plan.
-struct Plan {
-    root: PathBuf,
-    base: PathBuf,
-    state: State,
-    /// Files to upload: new ones first, then retries, each in path order.
-    queue: Vec<(Found, Pending)>,
-    /// Files that are not uploaded until the user resolves them (unknown, or
-    /// failed too often); seeding may still find them in Yuki.
-    blocked: Vec<Found>,
-    /// Rows for files that are not queued.
-    rows: Vec<Row>,
-    synced: usize,
-    duplicates: usize,
-    excluded: usize,
-    unknown: usize,
-    gave_up: usize,
-    changed: usize,
-    unreadable: usize,
-    /// Files whose recorded path changed (renamed or moved): hash and new path.
-    moved: Vec<(String, String)>,
-}
-
-impl Plan {
-    fn attention(&self) -> Vec<String> {
-        let mut parts = Vec::new();
-        let mut add = |n: usize, what: &str| {
-            if n > 0 {
-                parts.push(format!("{n} {what}"));
-            }
-        };
-        add(self.unknown, "with an unknown upload result");
-        add(self.gave_up, "failed too often to retry");
-        add(self.changed, "changed since recorded");
-        add(self.unreadable, "unreadable");
-        parts
-    }
-}
-
 fn mark_hint(root: &Path, rel: &str) -> String {
     format!(
         "yuki upload mark {}",
@@ -173,211 +131,179 @@ fn mark_hint(root: &Path, rel: &str) -> String {
     )
 }
 
-fn plan(root: PathBuf, base: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
+fn pending_note(root: &Path, rel: &str) -> String {
+    let hint = mark_hint(root, rel);
+    format!(
+        "upload started, outcome unknown: it may be in Yuki; not retried. Check Yuki, then \
+         `{hint} --doc-id <id>`, or `{hint} --forget` to upload it again"
+    )
+}
+
+/// The directory, its state, and its files sorted into a plan.
+struct Plan {
+    root: PathBuf,
+    state: State,
+    /// Files to upload: new ones first, then earlier failures, in path order.
+    queue: Vec<Found>,
+    /// Pending files: not uploaded, but seeding may find them in Yuki.
+    pending: Vec<Found>,
+    /// Rows for files that are not queued.
+    rows: Vec<Row>,
+    synced: usize,
+    /// Changed and unreadable files.
+    trouble: usize,
+    /// Files whose recorded path changed (renamed or moved): hash and new path.
+    moved: Vec<(String, String)>,
+}
+
+impl Plan {
+    /// What needs the user, as phrases; empty when nothing does.
+    fn attention(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if !self.pending.is_empty() {
+            parts.push(format!("{} pending", self.pending.len()));
+        }
+        if self.trouble > 0 {
+            parts.push(format!("{} changed or unreadable", self.trouble));
+        }
+        parts
+    }
+
+    /// Record paths of files that moved since they were recorded.
+    fn refresh_moved(&mut self) {
+        for (hash, rel) in std::mem::take(&mut self.moved) {
+            if let Some(entry) = self.state.files.get_mut(&hash) {
+                entry.path = rel;
+            }
+        }
+    }
+}
+
+fn plan(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
     let excludes = Excludes::new(excludes)?;
     let state = State::load(&root)?;
-    let scan = sync::scan(&root, &base, &excludes)?;
+    let scan = sync::scan(&root, &excludes)?;
     if !scan.nested_states.is_empty() {
         return Err(YukiError::Config(format!(
-            "{} holds other sync states ({}); sync those directories separately, or merge \
+            "{} holds other sync states ({}); sync each directory on its own, or merge \
              their records into {} by hand",
-            base.display(),
+            root.display(),
             scan.nested_states.join(", "),
             root.join(STATE_FILE).display()
         )));
     }
 
     let scanned: HashSet<&str> = scan.files.iter().map(|f| f.hash.as_str()).collect();
-    let mut by_path: HashMap<&str, Vec<(&str, &Entry)>> = HashMap::new();
-    for (hash, entry) in &state.files {
-        by_path
-            .entry(entry.path.as_str())
-            .or_default()
-            .push((hash.as_str(), entry));
-    }
+    // Records whose content is no longer anywhere in the tree, by path: a new
+    // hash at such a path is a changed file, not a new one.
+    let gone: HashMap<&str, &Entry> = state
+        .files
+        .iter()
+        .filter(|(hash, e)| !scanned.contains(hash.as_str()) && e.status != Status::Failed)
+        .map(|(_, e)| (e.path.as_str(), e))
+        .collect();
 
-    let mut new = Vec::new();
-    let mut retries = Vec::new();
-    let mut blocked = Vec::new();
-    let mut rows = Vec::new();
-    let mut moved = Vec::new();
-    let (mut synced, mut duplicates, mut unknown, mut gave_up, mut changed) = (0, 0, 0, 0, 0);
-    let mut first_seen: HashMap<String, String> = HashMap::new();
+    let (mut new, mut retries, mut pending, mut rows, mut moved) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut synced, mut trouble) = (0, 0);
+    let mut first_seen: HashMap<&str, &str> = HashMap::new();
     for file in &scan.files {
-        if let Some(first) = first_seen.get(&file.hash) {
-            duplicates += 1;
+        if let Some(first) = first_seen.insert(&file.hash, &file.rel) {
             rows.push(Row::new(&file.rel, "duplicate").note(format!("same content as {first}")));
+            first_seen.insert(&file.hash, first);
             continue;
         }
-        first_seen.insert(file.hash.clone(), file.rel.clone());
-        let hint = mark_hint(&root, &file.rel);
-        match state.files.get(&file.hash) {
-            Some(entry) => {
-                if entry.path != file.rel {
-                    moved.push((file.hash.clone(), file.rel.clone()));
+        let Some(entry) = state.files.get(&file.hash) else {
+            match gone.get(file.rel.as_str()) {
+                Some(e) => {
+                    trouble += 1;
+                    let hint = mark_hint(&root, &file.rel);
+                    rows.push(
+                        Row::new(&file.rel, "changed")
+                            .doc(e.document_id.as_deref())
+                            .note(format!(
+                                "content changed since it was recorded as {}{}; not uploaded. \
+                                 Upload the new version: `{hint} --forget`; keep it out: \
+                                 `{hint} --skip`",
+                                e.status.as_str(),
+                                e.document_id
+                                    .as_deref()
+                                    .map(|d| format!(" (was doc {d})"))
+                                    .unwrap_or_default()
+                            )),
+                    );
                 }
-                let was = if entry.path == file.rel {
-                    String::new()
-                } else {
-                    format!("; was {}", entry.path)
-                };
-                match entry.status {
-                    s if s.is_settled() => {
-                        synced += 1;
-                        rows.push(
-                            Row::new(&file.rel, "synced")
-                                .doc(entry.document_id.as_deref())
-                                .note(format!("{}{was}", s.as_str())),
-                        );
-                    }
-                    Status::Unknown => {
-                        unknown += 1;
-                        blocked.push(file.clone());
-                        rows.push(
-                            Row::new(&file.rel, "unknown")
-                                .error(entry.error.clone().unwrap_or_default())
-                                .note(format!(
-                                    "the upload may have reached Yuki; not retried. Check Yuki, then \
-                                     `{hint} --doc-id <id>`, or `{hint} --forget` to upload it again{was}"
-                                )),
-                        );
-                    }
-                    _ if entry.attempts >= MAX_ATTEMPTS => {
-                        gave_up += 1;
-                        blocked.push(file.clone());
-                        rows.push(
-                            Row::new(&file.rel, "failed")
-                                .error(entry.error.clone().unwrap_or_default())
-                                .note(format!(
-                                    "rejected {} times; no longer retried. `{hint} --forget` \
-                                     to try again{was}",
-                                    entry.attempts
-                                )),
-                        );
-                    }
-                    _ => retries.push((file.clone(), Pending::Retry(entry.attempts))),
-                }
+                None => new.push(file.clone()),
             }
-            None => {
-                let earlier = by_path.get(file.rel.as_str()).and_then(|entries| {
-                    entries
-                        .iter()
-                        .find(|(hash, e)| e.status != Status::Failed && !scanned.contains(hash))
-                });
-                match earlier {
-                    Some((_, e)) => {
-                        changed += 1;
-                        rows.push(
-                            Row::new(&file.rel, "changed")
-                                .doc(e.document_id.as_deref())
-                                .note(format!(
-                                    "content changed since it was recorded as {}{}; not uploaded. \
-                                     To upload the new version: `{hint} --forget`; to keep it \
-                                     out: `{hint} --skip`",
-                                    e.status.as_str(),
-                                    e.document_id
-                                        .as_deref()
-                                        .map(|d| format!(" (was doc {d})"))
-                                        .unwrap_or_default()
-                                )),
-                        );
-                    }
-                    None => new.push((file.clone(), Pending::New)),
-                }
+            continue;
+        };
+        if entry.path != file.rel {
+            moved.push((file.hash.clone(), file.rel.clone()));
+        }
+        match entry.status {
+            s if s.is_settled() => {
+                synced += 1;
+                rows.push(
+                    Row::new(&file.rel, "synced")
+                        .doc(entry.document_id.as_deref())
+                        .note(s.as_str()),
+                );
             }
+            Status::Pending => {
+                pending.push(file.clone());
+                rows.push(
+                    Row::new(&file.rel, "pending")
+                        .error(entry.error.clone().unwrap_or_default())
+                        .note(pending_note(&root, &file.rel)),
+                );
+            }
+            _ => retries.push(file.clone()),
         }
     }
-    let excluded = scan.excluded.len();
     for (rel, reason) in &scan.excluded {
         rows.push(Row::new(rel, "excluded").note(reason.clone()));
     }
-    let unreadable = scan.unreadable.len();
     for (rel, error) in &scan.unreadable {
+        trouble += 1;
         rows.push(Row::new(rel, "error").error(error.clone()));
     }
     new.extend(retries);
     Ok(Plan {
         root,
-        base,
         state,
         queue: new,
-        blocked,
+        pending,
         rows,
         synced,
-        duplicates,
-        excluded,
-        unknown,
-        gave_up,
-        changed,
-        unreadable,
+        trouble,
         moved,
     })
 }
 
-fn kib(bytes: u64) -> String {
-    format!("{:.1} KB", bytes as f64 / 1024.0)
-}
-
 /// Print the plan to stderr: counts, then the files that would be uploaded.
 fn print_plan(plan: &Plan, opts: &DirOptions<'_>) {
-    let scope = if plan.base == plan.root {
-        String::new()
-    } else {
-        format!(", scanning {}", plan.base.display())
-    };
     eprintln!(
-        "Plan for {} (Yuki folder {}{scope}):",
+        "Plan for {} (Yuki folder {}):",
         plan.root.display(),
         opts.folder
     );
-    let retries = plan
-        .queue
-        .iter()
-        .filter(|(_, p)| matches!(p, Pending::Retry(_)))
-        .count();
     eprintln!(
-        "  {} to upload ({} new, {retries} to retry), {} already synced, {} excluded, {} duplicate content",
+        "  {} to upload, {} already synced, {} other",
         plan.queue.len(),
-        plan.queue.len() - retries,
         plan.synced,
-        plan.excluded,
-        plan.duplicates
+        plan.rows.len() - plan.synced
     );
     let attention = plan.attention();
     if !attention.is_empty() {
         eprintln!("  Needs attention (see the rows): {}", attention.join(", "));
     }
-    if plan.queue.is_empty() {
-        return;
-    }
-    eprintln!("  To upload:");
-    for (i, (f, pending)) in plan.queue.iter().enumerate() {
+    for (i, f) in plan.queue.iter().enumerate() {
         let over = if !opts.seed && i >= opts.max {
             "  (over --max, next run)"
         } else {
             ""
         };
-        let again = match pending {
-            Pending::New => String::new(),
-            Pending::Retry(n) => format!("  (retry, attempt {} of {MAX_ATTEMPTS})", n + 1),
-        };
-        eprintln!("    {}  {}{again}{over}", f.rel, kib(f.size));
-    }
-    if !opts.seed && plan.queue.len() > opts.max {
-        eprintln!(
-            "  Uploading at most {} this run (--max); {} wait for the next run.",
-            opts.max,
-            plan.queue.len() - opts.max
-        );
-    }
-}
-
-/// Record paths of files that moved since they were recorded.
-fn refresh_moved(plan: &mut Plan) {
-    for (hash, rel) in std::mem::take(&mut plan.moved) {
-        if let Some(entry) = plan.state.files.get_mut(&hash) {
-            entry.path = rel;
-        }
+        eprintln!("    {}  {:.1} KB{over}", f.rel, f.size as f64 / 1024.0);
     }
 }
 
@@ -391,8 +317,44 @@ fn ask(question: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Ask for, or check, the go-ahead to `what` (e.g. "upload 3 files").
+fn go_ahead(confirm: Confirm, what: &str, quiet: bool) -> Option<Outcome> {
+    match confirm {
+        Confirm::Yes => None,
+        Confirm::Refuse => Some(Outcome::NeedsConfirmation(format!(
+            "upload dir would {what}; pass --yes to confirm in non-interactive mode, \
+             or --dry-run to only see the plan"
+        ))),
+        Confirm::Prompt if ask(&format!("{}?", capitalise(what))) => None,
+        Confirm::Prompt => {
+            if !quiet {
+                eprintln!("Aborted; nothing changed.");
+            }
+            Some(Outcome::Aborted)
+        }
+    }
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
 fn bump(calls: &Cell<usize>) {
     calls.set(calls.get() + 1);
+}
+
+fn outcome(parts: Vec<String>) -> Outcome {
+    if parts.is_empty() {
+        Outcome::Done
+    } else {
+        Outcome::NeedsAttention(format!(
+            "files need attention: {}; see the rows",
+            parts.join(", ")
+        ))
+    }
 }
 
 /// `upload dir`: upload the files of a directory that are not in Yuki yet.
@@ -414,38 +376,6 @@ pub async fn dir(
     result
 }
 
-/// How sure it is that a failed upload did not store the file.
-enum Verdict {
-    /// Authentication or quota: stop the run, record nothing.
-    Stop,
-    /// Yuki rejected it, or the request never left: safe to retry.
-    Rejected,
-    /// The request may have been processed: never retry automatically.
-    Unknown,
-}
-
-fn verdict(e: &YukiError) -> Verdict {
-    match e {
-        YukiError::AuthFailed(_) | YukiError::RateLimited => Verdict::Stop,
-        YukiError::SoapFault { .. } => Verdict::Rejected,
-        YukiError::Request(r) if r.is_connect() || r.is_builder() => Verdict::Rejected,
-        YukiError::Http { status, .. } if *status < 500 => Verdict::Rejected,
-        YukiError::Request(_) | YukiError::Http { .. } | YukiError::Xml(_) => Verdict::Unknown,
-        _ => Verdict::Rejected,
-    }
-}
-
-fn attention_outcome(parts: Vec<String>) -> Outcome {
-    if parts.is_empty() {
-        Outcome::Done
-    } else {
-        Outcome::NeedsAttention(format!(
-            "files need attention: {}; see the rows",
-            parts.join(", ")
-        ))
-    }
-}
-
 async fn run_dir(
     load_config: impl FnOnce() -> Result<Config, YukiError>,
     admin: Option<&str>,
@@ -459,14 +389,10 @@ async fn run_dir(
     for f in opts.seed_folders {
         folder_id(f)?;
     }
-    let (root, base) = sync::resolve_root(Path::new(opts.path))?;
+    let root = sync::sync_root(Path::new(opts.path))?;
     // A dry run writes nothing, so it takes no lock.
-    let _lock = if opts.dry_run {
-        None
-    } else {
-        Some(Lock::acquire(&root)?)
-    };
-    let mut plan = plan(root, base, opts.excludes)?;
+    let _lock = (!opts.dry_run).then(|| Lock::acquire(&root)).transpose()?;
+    let mut plan = plan(root, opts.excludes)?;
     if !quiet {
         print_plan(&plan, opts);
     }
@@ -475,38 +401,32 @@ async fn run_dir(
         let mut rows: Vec<Row> = if opts.seed {
             plan.queue
                 .iter()
-                .map(|(f, _)| f)
-                .chain(&plan.blocked)
+                .chain(&plan.pending)
                 .map(|f| Row::new(&f.rel, "would-seed"))
                 .collect()
         } else {
             plan.queue
                 .iter()
                 .enumerate()
-                .map(|(i, (f, pending))| {
-                    let action = match (i < opts.max, pending) {
-                        (false, _) => "deferred",
-                        (true, Pending::New) => "would-upload",
-                        (true, Pending::Retry(_)) => "would-retry",
-                    };
-                    Row::new(&f.rel, action)
+                .map(|(i, f)| {
+                    Row::new(
+                        &f.rel,
+                        if i < opts.max {
+                            "would-upload"
+                        } else {
+                            "deferred"
+                        },
+                    )
                 })
                 .collect()
         };
         rows.append(&mut plan.rows);
         if !quiet {
-            if opts.seed {
-                eprintln!(
-                    "Dry run: --seed-from-yuki would look these files up in: {}.",
-                    seed_folders(opts).join(", ")
-                );
-            }
             eprintln!("Dry run: nothing uploaded, nothing written.");
             print_rows(&rows, format);
         }
         return Ok(Outcome::Done);
     }
-
     if opts.seed {
         return seed(
             load_config,
@@ -521,58 +441,31 @@ async fn run_dir(
         .await;
     }
 
-    let batch: Vec<(Found, Pending)> = plan.queue.iter().take(opts.max).cloned().collect();
-    let deferred: Vec<Found> = plan
+    let batch: Vec<Found> = plan.queue.iter().take(opts.max).cloned().collect();
+    let mut rows: Vec<Row> = plan
         .queue
         .iter()
         .skip(opts.max)
-        .map(|(f, _)| f.clone())
+        .map(|f| Row::new(&f.rel, "deferred").note("over --max"))
         .collect();
-    let deferred_rows = |rows: &mut Vec<Row>| {
-        rows.extend(
-            deferred
-                .iter()
-                .map(|f| Row::new(&f.rel, "deferred").note("over --max")),
-        );
-    };
     if batch.is_empty() {
         if !plan.moved.is_empty() {
-            refresh_moved(&mut plan);
+            plan.refresh_moved();
             plan.state.save(&plan.root)?;
         }
         if !quiet {
-            eprintln!("Nothing to upload.");
-            let mut rows = Vec::new();
-            deferred_rows(&mut rows);
             rows.append(&mut plan.rows);
             print_rows(&rows, format);
         }
-        return Ok(attention_outcome(plan.attention()));
+        return Ok(outcome(plan.attention()));
     }
-
-    match confirm {
-        Confirm::Yes => {}
-        Confirm::Refuse => {
-            return Ok(Outcome::NeedsConfirmation(format!(
-                "upload dir would upload {} files; pass --yes to confirm in non-interactive mode, \
-                 or --dry-run to only see the plan",
-                batch.len()
-            )));
-        }
-        Confirm::Prompt => {
-            let question = format!(
-                "Upload {} file{} to Yuki folder {}?",
-                batch.len(),
-                if batch.len() == 1 { "" } else { "s" },
-                opts.folder
-            );
-            if !ask(&question) {
-                if !quiet {
-                    eprintln!("Aborted; nothing uploaded.");
-                }
-                return Ok(Outcome::Aborted);
-            }
-        }
+    let what = format!(
+        "upload {} files to Yuki folder {}",
+        batch.len(),
+        opts.folder
+    );
+    if let Some(stop) = go_ahead(confirm, &what, quiet) {
+        return Ok(stop);
     }
 
     let config = load_config()?;
@@ -581,14 +474,12 @@ async fn run_dir(
     let mut client = ArchiveClient::new().with_api_root(target.api_root);
     bump(calls);
     client.authenticate(target.api_key).await?;
-    // Paths are refreshed with the first write.
-    refresh_moved(&mut plan);
+    plan.refresh_moved();
 
-    let mut rows = Vec::new();
-    let (mut rejected, mut unknown, mut errors) = (0, 0, 0);
+    let (mut failed, mut pending) = (0, 0);
+    let mut early: Vec<String> = Vec::new();
     let mut stop: Option<YukiError> = None;
-    let total = batch.len();
-    for (i, (file, _)) in batch.iter().enumerate() {
+    for (i, file) in batch.iter().enumerate() {
         if stop.is_some() {
             rows.push(Row::new(&file.rel, "not-attempted"));
             continue;
@@ -596,15 +487,12 @@ async fn run_dir(
         let bytes = match std::fs::read(&file.path) {
             Ok(b) if sync::sha256_hex(&b) == file.hash => b,
             Ok(_) => {
-                errors += 1;
-                rows.push(
-                    Row::new(&file.rel, "error")
-                        .error("file changed since the plan was made; run again"),
-                );
+                failed += 1;
+                rows.push(Row::new(&file.rel, "error").error("changed since the plan; run again"));
                 continue;
             }
             Err(e) => {
-                errors += 1;
+                failed += 1;
                 rows.push(Row::new(&file.rel, "error").error(e.to_string()));
                 continue;
             }
@@ -614,104 +502,98 @@ async fn run_dir(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&file.rel);
+        // Write ahead: from here until Yuki answers, the file may be in Yuki.
+        let before = plan.state.files.get(&file.hash).cloned();
+        let mut entry = Entry::update(
+            &plan.state,
+            &file.hash,
+            &file.rel,
+            file.size,
+            Status::Pending,
+        );
+        entry.folder = Some(opts.folder.to_string());
+        plan.state.files.insert(file.hash.clone(), entry.clone());
+        plan.state.save(&plan.root)?;
+
         if !quiet {
-            eprint!("[{}/{total}] {} ... ", i + 1, file.rel);
+            eprint!("[{}/{}] {} ... ", i + 1, batch.len(), file.rel);
         }
         bump(calls);
         let result = client
             .upload_document(target.admin_id, name, &BASE64.encode(&bytes), fid)
             .await;
-        let mut entry = plan
-            .state
-            .files
-            .get(&file.hash)
-            .cloned()
-            .unwrap_or_else(|| Entry::new(&file.rel, file.size, Status::Failed));
-        entry.path = file.rel.clone();
-        entry.size = file.size;
-        entry.folder = Some(opts.folder.to_string());
-        entry.recorded_at = sync::now_utc();
-        match result {
+        let row = match result {
             Ok(id) => {
                 if !quiet {
                     eprintln!("{id}");
                 }
                 entry.status = Status::Uploaded;
                 entry.document_id = Some(id.clone());
-                entry.uploaded_at = Some(entry.recorded_at.clone());
-                entry.error = None;
-                plan.state.files.insert(file.hash.clone(), entry);
-                if let Err(e) = plan.state.save(&plan.root) {
-                    // The upload happened but could not be recorded: stop before
-                    // anything else goes unrecorded.
-                    return Err(YukiError::Config(format!(
-                        "{} was uploaded as document {id}, but the state could not be saved: {e}. \
-                         Record it with `{} --doc-id {id}` once the problem is fixed",
-                        file.rel,
-                        mark_hint(&plan.root, &file.rel)
-                    )));
-                }
-                rows.push(Row::new(&file.rel, "uploaded").doc(Some(&id)));
+                entry.uploaded_at = Some(sync::now_utc());
+                Row::new(&file.rel, "uploaded").doc(Some(&id))
             }
             Err(e) => {
-                match verdict(&e) {
-                    Verdict::Stop => {
-                        if !quiet {
-                            eprintln!("stopped: {e}");
-                        }
+                if !quiet {
+                    eprintln!("{e}");
+                }
+                entry.error = Some(e.to_string());
+                match &e {
+                    // Refused before anything was stored: undo the write-ahead
+                    // and stop, as every further call would be refused too.
+                    YukiError::AuthFailed(_) | YukiError::RateLimited => {
+                        match before {
+                            Some(b) => plan.state.files.insert(file.hash.clone(), b),
+                            None => plan.state.files.remove(&file.hash),
+                        };
+                        plan.state.save(&plan.root)?;
                         rows.push(Row::new(&file.rel, "not-attempted").error(e.to_string()));
                         stop = Some(e);
+                        continue;
                     }
-                    Verdict::Rejected => {
-                        if !quiet {
-                            eprintln!("rejected: {e}");
-                        }
-                        rejected += 1;
+                    YukiError::Request(r) if r.is_connect() || r.is_builder() => {
+                        failed += 1;
                         entry.status = Status::Failed;
-                        entry.attempts += 1;
-                        entry.error = Some(e.to_string());
-                        let note = if entry.attempts >= MAX_ATTEMPTS {
-                            format!(
-                                "attempt {} of {MAX_ATTEMPTS}; no longer retried",
-                                entry.attempts
-                            )
-                        } else {
-                            format!(
-                                "attempt {} of {MAX_ATTEMPTS}; retried next run",
-                                entry.attempts
-                            )
-                        };
-                        plan.state.files.insert(file.hash.clone(), entry);
-                        plan.state.save(&plan.root)?;
-                        rows.push(
-                            Row::new(&file.rel, "failed")
-                                .error(e.to_string())
-                                .note(note),
-                        );
+                        Row::new(&file.rel, "failed")
+                            .error(e.to_string())
+                            .note("never reached Yuki; retried next run")
                     }
-                    Verdict::Unknown => {
-                        if !quiet {
-                            eprintln!("unknown: {e}");
-                        }
-                        unknown += 1;
-                        entry.status = Status::Unknown;
-                        entry.attempts += 1;
-                        entry.error = Some(e.to_string());
-                        plan.state.files.insert(file.hash.clone(), entry);
-                        plan.state.save(&plan.root)?;
-                        let hint = mark_hint(&plan.root, &file.rel);
-                        rows.push(Row::new(&file.rel, "unknown").error(e.to_string()).note(
-                            format!(
-                                "may have reached Yuki; not retried. Check Yuki, then \
-                                 `{hint} --doc-id <id>`, or `{hint} --forget` to upload it again"
-                            ),
-                        ));
+                    _ => {
+                        pending += 1;
+                        Row::new(&file.rel, "pending")
+                            .error(e.to_string())
+                            .note(pending_note(&plan.root, &file.rel))
                     }
                 }
+            }
+        };
+        let ok = row.action == "uploaded";
+        let error = row.error.clone();
+        plan.state.files.insert(file.hash.clone(), entry);
+        if let Err(e) = plan.state.save(&plan.root) {
+            // The entry stays pending on disk, which is the safe reading.
+            return Err(YukiError::Config(format!(
+                "{} could not record the result for {} ({}): {e}; it stays pending",
+                STATE_FILE, file.rel, row.action
+            )));
+        }
+        rows.push(row);
+        // A run whose first uploads all go wrong the same way is systemic.
+        if i < EARLY_STOP && !ok && early.len() == i {
+            early.push(error);
+            if early.len() == EARLY_STOP && early.iter().all(|e| *e == early[0]) {
+                if !quiet {
+                    eprintln!(
+                        "stopping: the first {EARLY_STOP} uploads all failed with: {}",
+                        early[0]
+                    );
+                }
+                stop = Some(YukiError::Config(format!(
+                    "stopped after the first {EARLY_STOP} uploads all failed with: {}",
+                    early[0]
+                )));
             }
         }
     }
-    deferred_rows(&mut rows);
     rows.append(&mut plan.rows);
     if !quiet {
         print_rows(&rows, format);
@@ -720,17 +602,14 @@ async fn run_dir(
         return Err(e);
     }
     let mut parts = Vec::new();
-    if rejected > 0 {
-        parts.push(format!("{rejected} of {total} uploads failed"));
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
     }
-    if unknown > 0 {
-        parts.push(format!("{unknown} with an unknown upload result"));
-    }
-    if errors > 0 {
-        parts.push(format!("{errors} could not be read"));
+    if pending > 0 {
+        parts.push(format!("{pending} newly pending"));
     }
     parts.extend(plan.attention());
-    Ok(attention_outcome(parts))
+    Ok(outcome(parts))
 }
 
 /// The folders `--seed-from-yuki` searches: the given ones, else the upload
@@ -746,61 +625,39 @@ fn seed_folders(opts: &DirOptions<'_>) -> Vec<String> {
     folders
 }
 
-/// Parts of a `YYYY-MM-DD_vendor_reference.ext` name, used only to suggest
-/// possible matches for review.
-struct NameParts<'a> {
-    date: &'a str,
-    vendor: &'a str,
-    reference: &'a str,
-}
-
-fn name_parts(file_name: &str) -> Option<NameParts<'_>> {
-    let stem = file_name.rsplit_once('.').map_or(file_name, |(s, _)| s);
-    let mut parts = stem.splitn(3, '_');
-    let date = parts.next()?;
-    let vendor = parts.next()?;
-    let reference = parts.next()?;
-    (crate::period::epoch_days(date).is_some() && date.len() == 10).then_some(NameParts {
-        date,
-        vendor,
-        reference,
-    })
-}
-
-/// Why `doc` might be the Yuki copy of local `name`, or `None`.
+/// Why `doc` might be the Yuki copy of local `name` (`YYYY-MM-DD_vendor_ref.ext`),
+/// or `None`. Used only to suggest matches for review.
 fn possible_match(name: &str, doc: &ArchiveDocument) -> Option<&'static str> {
-    let parts = name_parts(name)?;
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    let mut parts = stem.splitn(3, '_');
+    let (date, vendor, reference) = (parts.next()?, parts.next()?, parts.next()?);
+    crate::period::epoch_days(date).filter(|_| date.len() == 10)?;
     let file = doc.file_name.to_lowercase();
-    let reference = parts.reference.to_lowercase();
+    let reference = reference.to_lowercase();
     if reference.len() >= 5
-        && (file.contains(&reference)
-            || doc.subject.to_lowercase().contains(&reference)
-            || doc.reference.to_lowercase().contains(&reference))
+        && [
+            &file,
+            &doc.subject.to_lowercase(),
+            &doc.reference.to_lowercase(),
+        ]
+        .iter()
+        .any(|s| s.contains(&reference))
     {
         return Some("reference in the Yuki document");
     }
-    let vendor = parts
-        .vendor
-        .split('-')
-        .next()
-        .unwrap_or_default()
-        .to_lowercase();
-    if vendor.len() >= 3
-        && doc.document_date.get(..10) == Some(parts.date)
-        && (doc.contact_name.to_lowercase().contains(&vendor) || file.contains(&vendor))
-    {
-        return Some("same date and vendor");
-    }
-    None
+    let vendor = vendor.split('-').next().unwrap_or_default().to_lowercase();
+    (vendor.len() >= 3
+        && doc.document_date.get(..10) == Some(date)
+        && (doc.contact_name.to_lowercase().contains(&vendor) || file.contains(&vendor)))
+    .then_some("same date and vendor")
 }
 
-/// Every document in `folder`, paged, with guards against an API that
-/// ignores the page offset.
+/// Every document in `folder`. Any paging anomaly is an error: a listing that
+/// may be incomplete must not decide what is already in Yuki.
 async fn fetch_folder(
     client: &ArchiveClient,
     folder: &str,
     calls: &Cell<usize>,
-    quiet: bool,
 ) -> Result<Vec<ArchiveDocument>, YukiError> {
     let fid = folder_id(folder)?;
     let mut docs = Vec::new();
@@ -816,35 +673,32 @@ async fn fetch_folder(
                 page_no * SEED_PAGE_SIZE,
             )
             .await?;
-        let received = page.len();
-        if page.iter().any(|d| seen.contains(&d.id)) {
-            if !quiet {
-                eprintln!(
-                    "warning: page {} of folder {folder} repeats documents already read; \
-                     stopped paging, so the listing may be incomplete",
-                    page_no + 1
-                );
+        let full = page.len() == SEED_PAGE_SIZE;
+        for doc in page {
+            if !seen.insert(doc.id.clone()) {
+                return Err(YukiError::Config(format!(
+                    "Yuki listed document {} twice while paging folder {folder}, so the listing \
+                     cannot be trusted; nothing recorded",
+                    doc.id
+                )));
             }
-            return Ok(docs);
+            docs.push(doc);
         }
-        seen.extend(page.iter().map(|d| d.id.clone()));
-        docs.extend(page);
-        if received < SEED_PAGE_SIZE {
+        if !full {
             return Ok(docs);
         }
     }
     Err(YukiError::Config(format!(
-        "folder {folder} holds more than {} documents; stopped seeding without recording anything",
+        "folder {folder} holds more than {} documents, more than seeding reads; nothing recorded",
         SEED_MAX_PAGES * SEED_PAGE_SIZE
     )))
 }
 
-fn name_of(f: &Found) -> String {
+fn name_of(f: &Found) -> &str {
     f.path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(&f.rel)
-        .to_string()
 }
 
 fn short_date(doc: &ArchiveDocument) -> &str {
@@ -863,25 +717,15 @@ async fn seed(
     quiet: bool,
     calls: &Cell<usize>,
 ) -> Result<Outcome, YukiError> {
-    let candidates: Vec<Found> = plan
-        .queue
-        .iter()
-        .map(|(f, _)| f.clone())
-        .chain(plan.blocked.iter().cloned())
-        .collect();
+    let candidates: Vec<&Found> = plan.queue.iter().chain(&plan.pending).collect();
     if candidates.is_empty() {
         if !quiet {
-            eprintln!("Nothing to seed: every file is recorded.");
             print_rows(&plan.rows, format);
         }
-        return Ok(attention_outcome(plan.attention()));
+        return Ok(outcome(plan.attention()));
     }
     if confirm == Confirm::Refuse {
-        return Ok(Outcome::NeedsConfirmation(
-            "--seed-from-yuki records matches in .yuki-sync.json; pass --yes to confirm in \
-             non-interactive mode, or --dry-run to only see the plan"
-                .into(),
-        ));
+        return Ok(go_ahead(confirm, "record seeding matches", quiet).expect("refused"));
     }
 
     let config = load_config()?;
@@ -893,26 +737,14 @@ async fn seed(
     accounting.authenticate(target.api_key).await?;
     bump(calls);
     accounting.set_current_domain(target.domain_id).await?;
-    let session = accounting
-        .session_id()
-        .ok_or_else(|| YukiError::AuthFailed("no session after authenticate".into()))?;
+    let session = accounting.session_id().unwrap_or_default();
     let client = ArchiveClient::new()
         .with_api_root(target.api_root)
         .with_session(session);
-
-    let folders = seed_folders(opts);
     let mut docs: Vec<(String, ArchiveDocument)> = Vec::new();
-    for folder in &folders {
-        let found = fetch_folder(&client, folder, calls, quiet).await?;
+    for folder in seed_folders(opts) {
+        let found = fetch_folder(&client, &folder, calls).await?;
         docs.extend(found.into_iter().map(|d| (folder.clone(), d)));
-    }
-    if !quiet {
-        eprintln!(
-            "Fetched {} documents from Yuki folder{} {}.",
-            docs.len(),
-            if folders.len() == 1 { "" } else { "s" },
-            folders.join(", ")
-        );
     }
 
     let mut by_name: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -922,38 +754,32 @@ async fn seed(
             .or_default()
             .push(i);
     }
-    // A document is claimed at most once: by the existing state, or by one
-    // local file in this run.
-    let recorded: HashMap<String, String> = plan
+    // A document is claimed at most once: by the state, or by one file now.
+    let recorded: HashMap<&str, &str> = plan
         .state
         .files
         .values()
-        .filter_map(|e| e.document_id.clone().map(|d| (d, e.path.clone())))
+        .filter_map(|e| Some((e.document_id.as_deref()?, e.path.as_str())))
         .collect();
-    let mut taken: HashSet<String> = recorded.keys().cloned().collect();
+    let mut taken: HashSet<&str> = recorded.keys().copied().collect();
     let mut claims: BTreeMap<usize, Vec<&Found>> = BTreeMap::new();
     let mut rows = Vec::new();
     let mut unmatched = Vec::new();
-    for file in &candidates {
+    for &file in &candidates {
         match by_name
-            .get(&sync::name_key(&name_of(file)))
+            .get(&sync::name_key(name_of(file)))
             .map(Vec::as_slice)
         {
-            Some([only]) => {
-                let doc = &docs[*only].1;
-                match recorded.get(&doc.id) {
-                    Some(other) => rows.push(
-                        Row::new(&file.rel, "ambiguous")
-                            .doc(Some(&doc.id))
-                            .note(format!(
-                                "the Yuki document with this name is already recorded for {other}; not recorded"
-                            )),
-                    ),
-                    None => claims.entry(*only).or_default().push(file),
-                }
-            }
+            None => unmatched.push(file),
+            Some([only]) => match recorded.get(docs[*only].1.id.as_str()) {
+                Some(other) => rows.push(Row::new(&file.rel, "ambiguous").note(format!(
+                    "its Yuki document {} is already recorded for {other}; not recorded",
+                    docs[*only].1.id
+                ))),
+                None => claims.entry(*only).or_default().push(file),
+            },
             Some(several) => {
-                taken.extend(several.iter().map(|&i| docs[i].1.id.clone()));
+                taken.extend(several.iter().map(|&i| docs[i].1.id.as_str()));
                 let ids: Vec<String> = several
                     .iter()
                     .map(|&i| format!("{} ({})", docs[i].1.id, docs[i].0))
@@ -964,27 +790,22 @@ async fn seed(
                     ids.join(", ")
                 )));
             }
-            None => unmatched.push(file),
         }
     }
-    let mut records: Vec<(String, Entry)> = Vec::new();
-    for (i, files) in &claims {
-        let (folder, doc) = &docs[*i];
-        taken.insert(doc.id.clone());
+    let mut records = Vec::new();
+    for (&i, files) in &claims {
+        let (folder, doc) = &docs[i];
+        taken.insert(&doc.id);
         if let [file] = files.as_slice() {
-            let mut entry = plan
-                .state
-                .files
-                .get(&file.hash)
-                .cloned()
-                .unwrap_or_else(|| Entry::new(&file.rel, file.size, Status::AlreadyInYuki));
-            entry.path = file.rel.clone();
-            entry.size = file.size;
-            entry.status = Status::AlreadyInYuki;
+            let mut entry = Entry::update(
+                &plan.state,
+                &file.hash,
+                &file.rel,
+                file.size,
+                Status::AlreadyInYuki,
+            );
             entry.document_id = Some(doc.id.clone());
             entry.folder = Some(folder.clone());
-            entry.recorded_at = sync::now_utc();
-            entry.error = None;
             entry.note = Some(format!("seeded: same file name in {folder}"));
             records.push((file.hash.clone(), entry));
             rows.push(
@@ -1011,110 +832,54 @@ async fn seed(
         }
     }
     for file in unmatched {
-        let name = name_of(file);
-        let candidates: Vec<String> = docs
+        let maybe: Vec<String> = docs
             .iter()
-            .filter(|(_, d)| !taken.contains(&d.id))
+            .filter(|(_, d)| !taken.contains(d.id.as_str()))
             .filter_map(|(folder, d)| {
-                possible_match(&name, d).map(|why| {
-                    format!(
-                        "{} {:?} in {folder}, {} ({why})",
-                        d.id,
-                        d.file_name,
-                        short_date(d)
-                    )
-                })
+                let why = possible_match(name_of(file), d)?;
+                Some(format!(
+                    "{} {:?} in {folder}, {} ({why})",
+                    d.id,
+                    d.file_name,
+                    short_date(d)
+                ))
             })
             .collect();
-        if candidates.is_empty() {
-            rows.push(
-                Row::new(&file.rel, "not-in-yuki")
-                    .note("no Yuki document with this file name; it will be uploaded"),
-            );
+        rows.push(if maybe.is_empty() {
+            Row::new(&file.rel, "not-in-yuki").note("no Yuki document with this file name")
         } else {
-            rows.push(Row::new(&file.rel, "possible-match").note(format!(
-                "not recorded; maybe {}. If it is the same file, run: {} --doc-id <id>",
-                candidates.join("; "),
+            Row::new(&file.rel, "possible-match").note(format!(
+                "not recorded; maybe {}. If it is the same file: {} --doc-id <id>",
+                maybe.join("; "),
                 mark_hint(&plan.root, &file.rel)
-            )));
-        }
+            ))
+        });
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path));
-
+    // Pending files were candidates and have a seeding row of their own.
+    plan.rows.retain(|r| r.action != "pending");
     if !quiet {
-        let count = |a: &str| rows.iter().filter(|r| r.action == a).count();
         eprintln!(
-            "Matches: {} already in Yuki; {} ambiguous, {} possible matches to review, {} not in Yuki.",
-            count("already-in-yuki"),
-            count("ambiguous"),
-            count("possible-match"),
-            count("not-in-yuki")
-        );
-        eprintln!(
-            "Matching is by file name only (Yuki reports no size or hash): a different file uploaded \
-             under the same name is recorded as in Yuki, and a copy uploaded under another name is not \
-             found and would be uploaded again. Review the rows; undo a match with \
-             `yuki upload mark <file> --forget`."
+            "Matching is by file name only (Yuki reports no size or hash): a different file \
+             uploaded under the same name is recorded as in Yuki, and a copy uploaded under \
+             another name is not found. Undo a match with `yuki upload mark <file> --forget`."
         );
         rows.append(&mut plan.rows);
         print_rows(&rows, format);
     }
-    if records.is_empty() {
-        if !quiet {
-            eprintln!("Nothing recorded.");
+    if !records.is_empty() {
+        let what = format!("record {} files as already in Yuki", records.len());
+        if let Some(stop) = go_ahead(confirm, &what, quiet) {
+            return Ok(stop);
         }
-        return Ok(attention_outcome(plan.attention()));
-    }
-    if confirm == Confirm::Prompt {
-        let question = format!(
-            "Record {} file{} as already in Yuki?",
-            records.len(),
-            if records.len() == 1 { "" } else { "s" }
-        );
-        if !ask(&question) {
-            if !quiet {
-                eprintln!("Aborted; nothing recorded.");
-            }
-            return Ok(Outcome::Aborted);
+        plan.refresh_moved();
+        for (hash, entry) in records {
+            plan.pending.retain(|f| f.hash != hash);
+            plan.state.files.insert(hash, entry);
         }
+        plan.state.save(&plan.root)?;
     }
-    refresh_moved(&mut plan);
-    let recorded_now = records.len();
-    let mut seeded_hashes = HashSet::new();
-    for (hash, entry) in records {
-        seeded_hashes.insert(hash.clone());
-        plan.state.files.insert(hash, entry);
-    }
-    plan.state.save(&plan.root)?;
-    if !quiet {
-        eprintln!("Recorded {recorded_now} as already-in-yuki.");
-    }
-    // Unknown files that were found are resolved now; the rest still count.
-    plan.unknown = plan
-        .blocked
-        .iter()
-        .filter(|f| {
-            !seeded_hashes.contains(&f.hash)
-                && plan
-                    .state
-                    .files
-                    .get(&f.hash)
-                    .is_some_and(|e| e.status == Status::Unknown)
-        })
-        .count();
-    plan.gave_up = plan
-        .blocked
-        .iter()
-        .filter(|f| {
-            !seeded_hashes.contains(&f.hash)
-                && plan
-                    .state
-                    .files
-                    .get(&f.hash)
-                    .is_some_and(|e| e.status == Status::Failed)
-        })
-        .count();
-    Ok(attention_outcome(plan.attention()))
+    Ok(outcome(plan.attention()))
 }
 
 /// What `upload mark` records.
@@ -1139,26 +904,24 @@ pub struct MarkOptions<'a> {
 
 /// `upload mark`: record one file by hand, without contacting Yuki.
 ///
-/// The root is found as for `upload dir`: the nearest directory at or above
-/// `--dir` (else the file's directory) that holds a state file. Without
-/// `--dir`, one must exist.
+/// The root is `--dir` (which must be a valid sync root), else the nearest
+/// directory above the file holding a state file.
 pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<(), YukiError> {
     if let Some(folder) = opts.folder {
         folder_id(folder)?;
     }
     let file = std::fs::canonicalize(opts.file)
         .map_err(|e| YukiError::Config(format!("{}: {e}", opts.file)))?;
-    let start = match opts.dir {
-        Some(dir) => PathBuf::from(dir),
-        None => file.parent().map(Path::to_path_buf).unwrap_or_default(),
+    let parent = file.parent().unwrap_or(Path::new("/"));
+    let root = match opts.dir {
+        Some(dir) => sync::sync_root(Path::new(dir))?,
+        None => sync::find_root(parent)?.ok_or_else(|| {
+            YukiError::Config(format!(
+                "no {STATE_FILE} found in any directory above {}; pass --dir <synced directory>",
+                file.display()
+            ))
+        })?,
     };
-    let (root, _) = sync::resolve_root(&start)?;
-    if opts.dir.is_none() && !root.join(STATE_FILE).is_file() {
-        return Err(YukiError::Config(format!(
-            "no {STATE_FILE} found in any directory above {}; pass --dir <synced directory>",
-            file.display()
-        )));
-    }
     let rel = sync::relative_to(&root, &file).ok_or_else(|| {
         YukiError::Config(format!(
             "{} is not inside {}",
@@ -1175,16 +938,13 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
 
     let row = match opts.mark {
         Mark::Forget => {
-            if let Some(old) = state.files.remove(&hash) {
-                state.save(&root)?;
-                Row::new(&rel, "forgotten")
-                    .doc(old.document_id.as_deref())
-                    .note("the next upload dir run treats it as new")
+            // The file's own record, else (a changed file) the record of the
+            // earlier content at its path.
+            let before = state.files.len();
+            let mut doc = existing.as_ref().and_then(|e| e.document_id.clone());
+            if existing.is_some() {
+                state.files.remove(&hash);
             } else {
-                // A changed file: forget the record of the earlier content at
-                // this path, so the new version can be uploaded.
-                let before = state.files.len();
-                let mut doc = None;
                 state.files.retain(|_, e| {
                     let keep = e.path != rel;
                     if !keep {
@@ -1192,14 +952,14 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
                     }
                     keep
                 });
-                if state.files.len() == before {
-                    Row::new(&rel, "unchanged").note("no record to forget")
-                } else {
-                    state.save(&root)?;
-                    Row::new(&rel, "forgotten")
-                        .doc(doc.as_deref())
-                        .note("removed the record of earlier content at this path; the next run uploads this version")
-                }
+            }
+            if state.files.len() == before {
+                Row::new(&rel, "unchanged").note("no record to forget")
+            } else {
+                state.save(&root)?;
+                Row::new(&rel, "forgotten")
+                    .doc(doc.as_deref())
+                    .note("the next upload dir run uploads it")
             }
         }
         Mark::Document(_) | Mark::Skip => {
@@ -1210,6 +970,13 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
             if doc_id.as_deref() == Some("") {
                 return Err(YukiError::Config("--doc-id is empty".into()));
             }
+            let claimed_by = doc_id.as_deref().and_then(|id| {
+                state
+                    .files
+                    .iter()
+                    .find(|(h, e)| **h != hash && e.document_id.as_deref() == Some(id))
+                    .map(|(_, e)| e.path.clone())
+            });
             match &existing {
                 // The same document, whether uploaded here or found in Yuki.
                 Some(e)
@@ -1230,20 +997,18 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
                             .unwrap_or_default()
                     )));
                 }
+                _ if claimed_by.is_some() && !opts.force => {
+                    return Err(YukiError::Config(format!(
+                        "document {} is already recorded for {}; pass --force to record it for {rel} too",
+                        doc_id.unwrap_or_default(),
+                        claimed_by.unwrap_or_default()
+                    )));
+                }
                 _ => {
-                    let mut entry =
-                        existing.unwrap_or_else(|| Entry::new(&rel, bytes.len() as u64, status));
-                    entry.path = rel.clone();
-                    entry.size = bytes.len() as u64;
-                    entry.status = status;
+                    let mut entry = Entry::update(&state, &hash, &rel, bytes.len() as u64, status);
                     entry.document_id = doc_id.clone();
                     entry.folder = opts.folder.map(str::to_string).or(entry.folder);
-                    entry.recorded_at = sync::now_utc();
-                    entry.error = None;
-                    entry.note = Some(
-                        opts.note
-                            .map_or_else(|| "marked by hand".to_string(), str::to_string),
-                    );
+                    entry.note = Some(opts.note.unwrap_or("marked by hand").to_string());
                     state.files.insert(hash, entry);
                     state.save(&root)?;
                     Row::new(&rel, "recorded")
@@ -1285,52 +1050,15 @@ mod tests {
             Some("reference in the Yuki document")
         );
         let gh = "2026-08-17_github_INV151037734.pdf";
-        let by_day = doc(
-            "2",
-            "2026-08-17",
-            "Github B.V.",
-            "github-receipt-2026-08-17.pdf",
-        );
+        let by_day = doc("2", "2026-08-17", "Github B.V.", "github-receipt.pdf");
         assert_eq!(possible_match(gh, &by_day), Some("same date and vendor"));
         // Another vendor that day, or the vendor another day, is no candidate.
-        assert_eq!(
-            possible_match(gh, &doc("3", "2026-08-17", "Telenet", "t.pdf")),
-            None
-        );
-        assert_eq!(
-            possible_match(gh, &doc("4", "2026-08-18", "Github B.V.", "g.pdf")),
-            None
-        );
+        let telenet = doc("3", "2026-08-17", "Telenet", "t.pdf");
+        assert_eq!(possible_match(gh, &telenet), None);
+        let later = doc("4", "2026-08-18", "Github B.V.", "g.pdf");
+        assert_eq!(possible_match(gh, &later), None);
         // Names not in the date_vendor_reference shape get no suggestions.
         assert_eq!(possible_match("scan.pdf", &by_ref), None);
-    }
-
-    #[test]
-    fn only_a_clean_rejection_is_retried() {
-        let fault = YukiError::SoapFault {
-            code: "soap:Server".into(),
-            message: "bad file".into(),
-        };
-        assert!(matches!(verdict(&fault), Verdict::Rejected));
-        let server = YukiError::Http {
-            status: 502,
-            body: String::new(),
-        };
-        assert!(matches!(verdict(&server), Verdict::Unknown));
-        let client = YukiError::Http {
-            status: 400,
-            body: String::new(),
-        };
-        assert!(matches!(verdict(&client), Verdict::Rejected));
-        assert!(matches!(
-            verdict(&YukiError::Xml("missing".into())),
-            Verdict::Unknown
-        ));
-        assert!(matches!(
-            verdict(&YukiError::AuthFailed("x".into())),
-            Verdict::Stop
-        ));
-        assert!(matches!(verdict(&YukiError::RateLimited), Verdict::Stop));
     }
 
     #[test]

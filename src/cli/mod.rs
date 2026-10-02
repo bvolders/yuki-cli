@@ -658,21 +658,20 @@ pub enum UploadCommands {
 
     /// Upload the receipts in a directory that are not in Yuki yet, once each.
     ///
-    /// Scans PATH recursively for pdf, jpg, jpeg and png files. What it did
-    /// is kept in .yuki-sync.json, keyed by content hash, so a renamed or
-    /// moved file is not uploaded again. The state lives in the nearest
-    /// directory at or above PATH that has one (else in PATH), so a
-    /// subdirectory can be synced on its own; a state file below PATH is an
-    /// error. Prints the plan first, then asks before uploading (--yes skips
-    /// the question; without a terminal --yes is required). Uploads one file
-    /// at a time and records each result as soon as it is known. A file Yuki
-    /// rejects is retried on later runs, after new files, up to 3 attempts. A
-    /// file whose upload result is uncertain (a timeout, a server error
-    /// without a SOAP fault) is recorded as unknown and never retried
-    /// automatically: check Yuki, then `upload mark`. A file whose content
-    /// changed since it was recorded is not uploaded until resolved with
-    /// `upload mark`. An authentication error stops the run. Exits 1 when any
-    /// file needs attention.
+    /// Scans PATH recursively for pdf, jpg, jpeg and png files and keeps what
+    /// it did in PATH/.yuki-sync.json, keyed by content hash, so a renamed or
+    /// moved file is not uploaded again. PATH must be the root of its tree: a
+    /// state file above or below it is refused. Prints the plan, then asks
+    /// (--yes skips the question; without a terminal --yes is required).
+    ///
+    /// Each upload is recorded as pending before it is sent, and as uploaded
+    /// once Yuki returns a document ID. Any other outcome (a timeout, a SOAP
+    /// fault, a server error, a crash) leaves it pending: it may be in Yuki,
+    /// so it is never retried automatically; check Yuki, then `upload mark`.
+    /// Only a request that never reached Yuki is failed and retried. A file
+    /// whose content changed since it was recorded waits for `upload mark`.
+    /// An authentication error, or the first 3 uploads failing alike, stops
+    /// the run. Exits 1 when any file needs attention.
     ///
     /// Run once with --seed-from-yuki first to record the files Yuki already
     /// has, so they are not uploaded again.
@@ -716,10 +715,9 @@ pub enum UploadCommands {
     /// Record by hand that a file is in Yuki, should be skipped, or is to be forgotten.
     ///
     /// Updates the .yuki-sync.json of the synced directory without contacting
-    /// Yuki: the nearest directory at or above --dir, else above FILE, that
-    /// has one. Resolves files `upload dir` reports as unknown, failed or
-    /// changed: --doc-id when Yuki has the file, --forget to upload it (again),
-    /// --skip to keep it out.
+    /// Yuki: --dir, else the nearest directory above FILE that has one.
+    /// Resolves files `upload dir` reports as pending or changed: --doc-id when
+    /// Yuki has the file, --forget to upload it (again), --skip to keep it out.
     #[command(group(ArgGroup::new("record").required(true).args(["doc_id", "skip", "forget"])))]
     Mark {
         /// The file to record.
@@ -746,12 +744,13 @@ pub enum UploadCommands {
         #[arg(long)]
         note: Option<String>,
 
-        /// Where to look for the synced directory; it becomes the root when no
-        /// .yuki-sync.json exists at or above it yet.
+        /// The synced directory (its root), needed when it has no
+        /// .yuki-sync.json yet.
         #[arg(long)]
         dir: Option<String>,
 
-        /// Replace an existing record.
+        /// Replace an existing record, or record a document ID already
+        /// recorded for another file.
         #[arg(long)]
         force: bool,
     },

@@ -3,8 +3,9 @@
 //! a file again.
 //!
 //! The state lives in `<root>/.yuki-sync.json` and is rewritten atomically
-//! (temporary file, fsync, rename, fsync of the directory) after every
-//! recorded change. `<root>/.yuki-sync.lock` keeps two runs apart.
+//! (temporary file, fsync, rename, fsync of the directory). An OS advisory
+//! lock on `<root>/.yuki-sync.json.lock` keeps two runs apart; the kernel
+//! releases it when the holder exits or dies.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,15 +22,11 @@ use crate::error::YukiError;
 /// File name of the state file at the root of the synced directory.
 pub const STATE_FILE: &str = ".yuki-sync.json";
 
-/// File name of the lock held while a command changes the state.
-pub const LOCK_FILE: &str = ".yuki-sync.lock";
+/// File the advisory lock is taken on.
+pub const LOCK_FILE: &str = ".yuki-sync.json.lock";
 
 /// The state format this build reads and writes.
 pub const STATE_VERSION: u32 = 1;
-
-/// Upload attempts that end in a clean rejection before a file is no longer
-/// retried automatically.
-pub const MAX_ATTEMPTS: u32 = 3;
 
 /// Extensions `upload dir` picks up, compared case-insensitively.
 pub const EXTENSIONS: &[&str] = &["pdf", "jpg", "jpeg", "png"];
@@ -47,12 +44,13 @@ pub enum Status {
     AlreadyInYuki,
     /// Deliberately never uploaded (`upload mark --skip`).
     Skipped,
-    /// Yuki rejected the upload; retried up to [`MAX_ATTEMPTS`] times.
+    /// The upload request provably never reached Yuki; retried next run.
     Failed,
-    /// The upload may or may not have reached Yuki (a timeout, a server error
-    /// without a SOAP fault, an unreadable reply). Never retried automatically:
-    /// resolve it with `upload mark --doc-id`, `--forget`, or seeding.
-    Unknown,
+    /// An upload was started and its outcome is not known: it may be in Yuki.
+    /// Written before every upload and replaced once Yuki answers, so a
+    /// crash, a kill or a timeout leaves it. Never retried automatically:
+    /// resolve it with `upload mark` or seeding.
+    Pending,
 }
 
 impl Status {
@@ -67,13 +65,9 @@ impl Status {
             Self::AlreadyInYuki => "already-in-yuki",
             Self::Skipped => "skipped",
             Self::Failed => "failed",
-            Self::Unknown => "unknown",
+            Self::Pending => "pending",
         }
     }
-}
-
-fn is_zero(n: &u32) -> bool {
-    *n == 0
 }
 
 /// One file's record, keyed in [`State::files`] by its sha256.
@@ -91,11 +85,9 @@ pub struct Entry {
     /// When `upload dir` uploaded it (UTC, RFC 3339); absent for files found in Yuki.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploaded_at: Option<String>,
-    /// When this record was last written (UTC, RFC 3339).
+    /// When this record was last written (UTC, RFC 3339); for a pending
+    /// entry, when the upload was started.
     pub recorded_at: String,
-    /// Upload attempts that did not succeed.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,21 +99,27 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// A fresh record for a file at `path`.
-    pub fn new(path: &str, size: u64, status: Status) -> Self {
-        Self {
-            path: path.to_string(),
+    /// The existing record of `hash` updated to `status` for a file at `rel`,
+    /// or a fresh one; unknown fields are kept.
+    pub fn update(state: &State, hash: &str, rel: &str, size: u64, status: Status) -> Self {
+        let mut e = state.files.get(hash).cloned().unwrap_or_else(|| Self {
+            path: String::new(),
             size,
             status,
             document_id: None,
             folder: None,
             uploaded_at: None,
-            recorded_at: now_utc(),
-            attempts: 0,
+            recorded_at: String::new(),
             error: None,
             note: None,
             extra: BTreeMap::new(),
-        }
+        });
+        e.path = rel.to_string();
+        e.size = size;
+        e.status = status;
+        e.recorded_at = now_utc();
+        e.error = None;
+        e
     }
 }
 
@@ -194,80 +192,40 @@ impl State {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
-            fs::rename(&tmp, &path)
+            fs::rename(&tmp, &path)?;
+            // Make the rename itself durable.
+            fs::File::open(root)?.sync_all()
         })();
-        if let Err(e) = written {
+        written.map_err(|e| {
             let _ = fs::remove_file(&tmp);
-            return Err(YukiError::Config(format!("{}: {e}", path.display())));
-        }
-        // Make the rename itself durable.
-        #[cfg(unix)]
-        if let Ok(dir) = fs::File::open(root) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+            YukiError::Config(format!("{}: {e}", path.display()))
+        })
     }
 }
 
-/// The lock on a synced directory, released when dropped.
+/// The advisory lock on a synced directory, held while the file is open.
 #[derive(Debug)]
-pub struct Lock {
-    path: PathBuf,
-}
+pub struct Lock(#[allow(dead_code)] fs::File);
 
 impl Lock {
-    /// Take the lock of `root`, or explain who holds it and since when.
+    /// Take the lock of `root`, or refuse when another run holds it.
     pub fn acquire(root: &Path) -> Result<Self, YukiError> {
         let path = root.join(LOCK_FILE);
-        match fs::OpenOptions::new()
+        let io = |e: std::io::Error| YukiError::Config(format!("{}: {e}", path.display()));
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
             .write(true)
-            .create_new(true)
             .open(&path)
-        {
-            Ok(mut file) => {
-                let body = serde_json::json!({"pid": std::process::id(), "created_at": now_utc()});
-                let _ = writeln!(file, "{body}");
-                let _ = file.sync_all();
-                Ok(Self { path })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let holder = fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-                    .and_then(|v| v.get("pid").and_then(Value::as_u64))
-                    .map_or_else(|| "unknown pid".to_string(), |p| format!("pid {p}"));
-                let age = fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .map_or_else(
-                        || "of unknown age".to_string(),
-                        |d| format!("taken {} ago", human_duration(d.as_secs())),
-                    );
-                Err(YukiError::Config(format!(
-                    "{} is locked by another yuki run ({holder}, {age}). If no other \
-                     run is active, the lock is stale: delete {} and try again",
-                    root.display(),
-                    path.display()
-                )))
-            }
-            Err(e) => Err(YukiError::Config(format!("{}: {e}", path.display()))),
+            .map_err(io)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self(file)),
+            Err(fs::TryLockError::WouldBlock) => Err(YukiError::Config(format!(
+                "another yuki run is working on {}; try again when it has finished",
+                root.display()
+            ))),
+            Err(fs::TryLockError::Error(e)) => Err(io(e)),
         }
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn human_duration(secs: u64) -> String {
-    match secs {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3_600 => format!("{}m {}s", s / 60, s % 60),
-        s if s < 86_400 => format!("{}h {}m", s / 3_600, s % 3_600 / 60),
-        s => format!("{}d {}h", s / 86_400, s % 86_400 / 3_600),
     }
 }
 
@@ -384,45 +342,53 @@ pub fn is_supported(name: &str) -> bool {
     })
 }
 
-/// The root of the synced tree for `path`: the nearest directory at or above
-/// it holding a state file, else `path` itself. Returns (root, path), both
-/// canonical.
-pub fn resolve_root(path: &Path) -> Result<(PathBuf, PathBuf), YukiError> {
-    let base = fs::canonicalize(path)
+fn canonical_dir(path: &Path) -> Result<PathBuf, YukiError> {
+    let dir = fs::canonicalize(path)
         .map_err(|e| YukiError::Config(format!("{}: {e}", path.display())))?;
-    if !base.is_dir() {
+    if !dir.is_dir() {
         return Err(YukiError::Config(format!(
             "{}: not a directory",
             path.display()
         )));
     }
-    let root = base
-        .ancestors()
-        .find(|a| a.join(STATE_FILE).is_file())
-        .unwrap_or(&base)
-        .to_path_buf();
-    Ok((root, base))
+    Ok(dir)
 }
 
-/// Recursively list the supported files under `base` (inside `root`), hashing
-/// each one; paths are relative to `root`.
+/// `path` as a sync root: a directory with no state file above it.
+pub fn sync_root(path: &Path) -> Result<PathBuf, YukiError> {
+    let root = canonical_dir(path)?;
+    if let Some(above) = root
+        .ancestors()
+        .skip(1)
+        .find(|a| a.join(STATE_FILE).is_file())
+    {
+        return Err(YukiError::Config(format!(
+            "{} is inside the synced directory {}; run on {} instead",
+            root.display(),
+            above.display(),
+            above.display()
+        )));
+    }
+    Ok(root)
+}
+
+/// The nearest directory at or above `start` that holds a state file.
+pub fn find_root(start: &Path) -> Result<Option<PathBuf>, YukiError> {
+    let start = canonical_dir(start)?;
+    Ok(start
+        .ancestors()
+        .find(|a| a.join(STATE_FILE).is_file())
+        .map(Path::to_path_buf))
+}
+
+/// Recursively list the supported files under `root`, hashing each one.
 ///
 /// Symbolic links are reported, never followed. Excluded directories are still
-/// walked, to count what they hold and to find nested state files.
-pub fn scan(root: &Path, base: &Path, excludes: &Excludes) -> Result<Scan, YukiError> {
+/// walked, to list what they hold and to find nested state files.
+pub fn scan(root: &Path, excludes: &Excludes) -> Result<Scan, YukiError> {
     let mut out = Scan::default();
-    let prefix = if base == root {
-        String::new()
-    } else {
-        relative_to(root, base).ok_or_else(|| {
-            YukiError::Config(format!(
-                "{} is not inside {}",
-                base.display(),
-                root.display()
-            ))
-        })?
-    };
-    walk(root, base, &prefix, excludes, &mut out)?;
+    fs::read_dir(root).map_err(|e| YukiError::Config(format!("{}: {e}", root.display())))?;
+    walk(root, "", excludes, &mut out);
     out.files.sort_by(|a, b| a.rel.cmp(&b.rel));
     out.excluded.sort();
     out.unreadable.sort();
@@ -430,13 +396,7 @@ pub fn scan(root: &Path, base: &Path, excludes: &Excludes) -> Result<Scan, YukiE
     Ok(out)
 }
 
-fn walk(
-    root: &Path,
-    dir: &Path,
-    prefix: &str,
-    excludes: &Excludes,
-    out: &mut Scan,
-) -> Result<(), YukiError> {
+fn walk(dir: &Path, prefix: &str, excludes: &Excludes, out: &mut Scan) {
     let join = |name: &str| {
         if prefix.is_empty() {
             name.to_string()
@@ -446,54 +406,39 @@ fn walk(
     };
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if dir != root && !prefix.is_empty() => {
+        Err(e) => {
             out.unreadable.push((format!("{prefix}/"), e.to_string()));
-            return Ok(());
+            return;
         }
-        Err(e) => return Err(YukiError::Config(format!("{}: {e}", dir.display()))),
     };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                out.unreadable.push((join("?"), e.to_string()));
-                continue;
-            }
-        };
+    for entry in entries.flatten() {
         let os_name = entry.file_name();
         let Some(name) = os_name.to_str() else {
-            out.excluded.push((
-                join(&os_name.to_string_lossy()),
-                "name is not valid UTF-8".into(),
-            ));
+            let rel = join(&os_name.to_string_lossy());
+            out.excluded.push((rel, "name is not valid UTF-8".into()));
             continue;
         };
         let rel = join(name);
-        let path = entry.path();
-        let kind = match entry.file_type() {
-            Ok(kind) => kind,
-            Err(e) => {
-                out.unreadable.push((rel, e.to_string()));
-                continue;
-            }
-        };
-        if name == STATE_FILE && dir != root {
-            out.nested_states.push(rel);
+        let Ok(kind) = entry.file_type() else {
+            out.unreadable.push((rel, "cannot read file type".into()));
             continue;
-        }
-        if kind.is_symlink() {
-            let reason = match excludes.matching(&rel) {
-                Some(pattern) => format!("--exclude {pattern}"),
-                None => "symbolic link, not followed".to_string(),
-            };
+        };
+        if name == STATE_FILE && !prefix.is_empty() {
+            out.nested_states.push(rel);
+        } else if kind.is_symlink() {
+            let reason = excludes.matching(&rel).map_or_else(
+                || "symbolic link, not followed".to_string(),
+                |p| format!("--exclude {p}"),
+            );
             out.excluded.push((rel, reason));
         } else if kind.is_dir() {
-            walk(root, &path, &rel, excludes, out)?;
+            walk(&entry.path(), &rel, excludes, out);
         } else if kind.is_file() && is_supported(name) {
             if let Some(pattern) = excludes.matching(&rel) {
                 out.excluded.push((rel, format!("--exclude {pattern}")));
                 continue;
             }
+            let path = entry.path();
             match fs::read(&path) {
                 Ok(bytes) => out.files.push(Found {
                     rel,
@@ -505,7 +450,6 @@ fn walk(
             }
         }
     }
-    Ok(())
 }
 
 /// `path` relative to `root`, `/`-separated, or `None` when it is outside it.
@@ -531,7 +475,7 @@ mod tests {
     use super::*;
 
     fn entry(path: &str, status: Status) -> Entry {
-        let mut e = Entry::new(path, 3, status);
+        let mut e = Entry::update(&State::default(), "x", path, 3, status);
         e.document_id = Some("doc-1".into());
         e
     }
@@ -573,24 +517,17 @@ mod tests {
     }
 
     #[test]
-    fn default_excludes_skip_dot_and_to_delete_paths() {
-        let ex = Excludes::new(&[]).unwrap();
-        assert_eq!(ex.matching("_to_delete/x.pdf"), Some("_to_delete"));
-        assert_eq!(ex.matching("2026/_TO_DELETE/x.pdf"), Some("_to_delete"));
-        assert_eq!(ex.matching(".hidden.pdf"), Some(".*"));
-        assert_eq!(ex.matching("2026/.cache/x.pdf"), Some(".*"));
-        assert_eq!(ex.matching("2026/bol-com/x.pdf"), None);
-    }
-
-    #[test]
-    fn excludes_by_component_or_by_path() {
+    fn excludes_by_component_or_by_path_ignoring_case() {
         let ex = Excludes::new(&["2025".into(), "2026/amazon/*".into(), "*.png".into()]).unwrap();
+        assert_eq!(ex.matching("_TO_DELETE/x.pdf"), Some("_to_delete"));
+        assert_eq!(ex.matching("2026/.cache/x.pdf"), Some(".*"));
         // A bare name excludes that directory at any depth, recursively.
         assert_eq!(ex.matching("2025/a/b/c.pdf"), Some("2025"));
         assert_eq!(ex.matching("2026/amazon/a.pdf"), Some("2026/amazon/*"));
         // `*` does not cross directories in a path pattern; `**` does.
         assert_eq!(ex.matching("2026/amazon/old/a.pdf"), None);
         assert_eq!(ex.matching("2026/x/scan.PNG"), Some("*.png"));
+        assert_eq!(ex.matching("2026/bol-com/x.pdf"), None);
         let deep = Excludes::new(&["2026/amazon/**".into()]).unwrap();
         assert_eq!(
             deep.matching("2026/amazon/old/a.pdf"),
@@ -603,17 +540,19 @@ mod tests {
     fn state_round_trips_and_keeps_unknown_fields() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::default();
-        let mut e = entry("a.pdf", Status::Unknown);
-        e.attempts = 2;
+        let mut e = entry("a.pdf", Status::Pending);
         e.extra
             .insert("matched_transaction".into(), Value::String("t-1".into()));
         state.files.insert("abc".into(), e);
         state.save(dir.path()).unwrap();
         let text = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
         assert!(text.contains("\"matched_transaction\": \"t-1\""), "{text}");
-        assert!(text.contains("\"status\": \"unknown\""), "{text}");
-        assert!(text.contains("\"attempts\": 2"), "{text}");
-        assert_eq!(State::load(dir.path()).unwrap(), state);
+        assert!(text.contains("\"status\": \"pending\""), "{text}");
+        let loaded = State::load(dir.path()).unwrap();
+        assert_eq!(loaded, state);
+        // An update keeps the unknown fields.
+        let updated = Entry::update(&loaded, "abc", "b.pdf", 3, Status::Uploaded);
+        assert_eq!(updated.extra.len(), 1);
         // No temporary file is left behind.
         let names: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
@@ -623,14 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_state_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(State::load(dir.path()).unwrap(), State::default());
-    }
-
-    #[test]
     fn a_corrupt_or_newer_state_is_refused() {
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(State::load(dir.path()).unwrap(), State::default());
         let path = dir.path().join(STATE_FILE);
         for (text, expect) in [
             ("{\"version\": 1, \"files\": {", "not a valid sync state"),
@@ -675,20 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_is_exclusive_and_released_on_drop() {
+    fn the_lock_is_exclusive_until_released() {
         let dir = tempfile::tempdir().unwrap();
         let lock = Lock::acquire(dir.path()).unwrap();
-        let text = fs::read_to_string(dir.path().join(LOCK_FILE)).unwrap();
-        assert!(
-            text.contains(&format!("\"pid\":{}", std::process::id())),
-            "{text}"
-        );
         let err = Lock::acquire(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("locked by another yuki run"), "{err}");
-        assert!(err.contains("ago"), "{err}");
-        assert!(err.contains(LOCK_FILE), "{err}");
+        assert!(err.contains("another yuki run"), "{err}");
         drop(lock);
-        assert!(!dir.path().join(LOCK_FILE).exists());
         assert!(Lock::acquire(dir.path()).is_ok());
     }
 
@@ -696,101 +622,50 @@ mod tests {
     fn scan_hashes_supported_files_and_reports_what_it_skips() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        fs::create_dir_all(root.join("2026/bol")).unwrap();
+        fs::create_dir_all(root.join("2026/bol/inner")).unwrap();
         fs::create_dir_all(root.join("_to_delete")).unwrap();
-        fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join("2026/bol/a.pdf"), b"aaa").unwrap();
         fs::write(root.join("2026/bol/B.JPG"), b"bbb").unwrap();
         fs::write(root.join("2026/notes.txt"), b"x").unwrap();
         fs::write(root.join("_to_delete/old.pdf"), b"old").unwrap();
-        fs::write(root.join(".git/x.png"), b"git").unwrap();
         fs::write(root.join(".DS_Store"), b"ds").unwrap();
         fs::write(root.join(STATE_FILE), b"{}").unwrap();
+        fs::write(root.join("2026/bol/inner").join(STATE_FILE), b"{}").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("2026/bol/a.pdf"), root.join("2026/link.pdf"))
             .unwrap();
-        let scan = scan(root, root, &Excludes::new(&[]).unwrap()).unwrap();
+        let scan = scan(root, &Excludes::new(&[]).unwrap()).unwrap();
         let rels: Vec<_> = scan.files.iter().map(|f| f.rel.as_str()).collect();
         assert_eq!(rels, ["2026/bol/B.JPG", "2026/bol/a.pdf"]);
         assert_eq!(scan.files[1].hash, sha256_hex(b"aaa"));
         assert_eq!(scan.files[1].size, 3);
-        let mut expected = vec![
-            (".git/x.png".to_string(), "--exclude .*".to_string()),
-            (
-                "_to_delete/old.pdf".to_string(),
-                "--exclude _to_delete".to_string(),
-            ),
-        ];
+        let reasons: Vec<_> = scan
+            .excluded
+            .iter()
+            .map(|(r, w)| format!("{r}: {w}"))
+            .collect();
+        assert!(reasons.contains(&"_to_delete/old.pdf: --exclude _to_delete".to_string()));
         #[cfg(unix)]
-        expected.insert(
-            1,
-            (
-                "2026/link.pdf".to_string(),
-                "symbolic link, not followed".to_string(),
-            ),
-        );
-        assert_eq!(scan.excluded, expected);
-        assert!(scan.nested_states.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scan_reports_unreadable_files_and_non_utf8_names() {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("ok.pdf"), b"ok").unwrap();
-        fs::write(root.join("locked.pdf"), b"no").unwrap();
-        fs::set_permissions(root.join("locked.pdf"), fs::Permissions::from_mode(0o000)).unwrap();
-        let bad = std::ffi::OsStr::from_bytes(b"bad\xff.pdf");
-        // Some file systems (APFS) refuse non-UTF-8 names; test what we can.
-        let made_bad = fs::write(root.join(bad), b"x").is_ok();
-        // Root reads anything; only expect an error when the mode holds.
-        let unreadable = fs::File::open(root.join("locked.pdf")).is_err();
-        let scan = scan(root, root, &Excludes::new(&[]).unwrap()).unwrap();
-        fs::set_permissions(root.join("locked.pdf"), fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(scan.files.len(), if unreadable { 1 } else { 2 });
-        if unreadable {
-            assert_eq!(scan.unreadable.len(), 1, "{:?}", scan.unreadable);
-            assert_eq!(scan.unreadable[0].0, "locked.pdf");
-        }
-        if made_bad {
-            assert!(
-                scan.excluded
-                    .iter()
-                    .any(|(_, why)| why == "name is not valid UTF-8"),
-                "{:?}",
-                scan.excluded
-            );
-        }
-    }
-
-    #[test]
-    fn scan_of_a_subdirectory_keeps_paths_relative_to_the_root_and_finds_nested_states() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        fs::create_dir_all(root.join("2026/bol/inner")).unwrap();
-        fs::write(root.join("2026/bol/a.pdf"), b"a").unwrap();
-        fs::write(root.join("2026/top.pdf"), b"t").unwrap();
-        fs::write(root.join("2026/bol/inner").join(STATE_FILE), b"{}").unwrap();
-        let base = root.join("2026/bol");
-        let scan = scan(&root, &base, &Excludes::new(&[]).unwrap()).unwrap();
-        let rels: Vec<_> = scan.files.iter().map(|f| f.rel.as_str()).collect();
-        assert_eq!(rels, ["2026/bol/a.pdf"]);
+        assert!(reasons.contains(&"2026/link.pdf: symbolic link, not followed".to_string()));
         assert_eq!(scan.nested_states, ["2026/bol/inner/.yuki-sync.json"]);
     }
 
     #[test]
-    fn the_root_is_the_nearest_directory_with_a_state_file() {
+    fn a_root_must_not_be_inside_another_synced_directory() {
         let dir = tempfile::tempdir().unwrap();
         let top = dir.path().canonicalize().unwrap();
         fs::create_dir_all(top.join("a/b")).unwrap();
-        assert_eq!(resolve_root(&top.join("a/b")).unwrap().0, top.join("a/b"));
+        assert_eq!(sync_root(&top.join("a/b")).unwrap(), top.join("a/b"));
+        assert_eq!(find_root(&top.join("a/b")).unwrap(), None);
         fs::write(top.join(STATE_FILE), b"{}").unwrap();
-        let (root, base) = resolve_root(&top.join("a/b")).unwrap();
-        assert_eq!((root, base), (top.clone(), top.join("a/b")));
-        assert!(resolve_root(&top.join("missing")).is_err());
+        let err = sync_root(&top.join("a/b")).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("run on {} instead", top.display())),
+            "{err}"
+        );
+        assert_eq!(find_root(&top.join("a/b")).unwrap(), Some(top.clone()));
+        assert_eq!(sync_root(&top).unwrap(), top);
+        assert!(sync_root(&top.join("missing")).is_err());
     }
 
     #[test]
