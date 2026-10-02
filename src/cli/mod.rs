@@ -442,14 +442,15 @@ pub enum SalesCommands {
 pub enum SalesInvoiceCommands {
     /// Create a sales invoice in Yuki: a draft, unless --send or --book books it.
     ///
-    /// The invoice comes from a TOML file (--file), a saved template
-    /// (--template, read from ~/.config/yuki/invoices/<name>.toml), or a
-    /// prepared invoice (--prepared, written by `prepare --out`), which is
-    /// booked exactly as prepared. A preview of the customer, lines and totals
-    /// is printed first, then confirmed on a terminal; --yes skips the prompt
-    /// and is required when not on a terminal. --dry-run prints the preview
-    /// and the exact xmlDoc without contacting Yuki. Booking is immediate:
-    /// there is no draft to review.
+    /// A prepared invoice (--prepared, written by `prepare --out`) is booked
+    /// exactly as prepared, under the number reserved for it. A TOML file
+    /// (--file) or a saved template (--template, read from
+    /// ~/.config/yuki/invoices/<name>.toml) becomes a draft, or a booking
+    /// Yuki numbers itself, confirmed at the prompt. A preview of the
+    /// customer, lines and totals is printed first, then confirmed on a
+    /// terminal; --yes skips the prompt and is required when not on a
+    /// terminal. --dry-run prints the preview and the exact xmlDoc without
+    /// contacting Yuki. Booking is immediate: there is no draft to review.
     #[command(group(
         clap::ArgGroup::new("source").required(true).args(["file", "template", "prepared"])
     ))]
@@ -460,7 +461,7 @@ pub enum SalesInvoiceCommands {
         /// A prepared invoice (`prepare --out`) to book exactly: its number
         /// must still be reserved for this content. Takes no other invoice
         /// inputs; needs --send or --book.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["qty", "price", "date", "subject", "number"])]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["qty", "price", "date", "subject"])]
         prepared: Option<String>,
 
         /// Custom invoice PDF (max 3 MB) rendered from the --prepared file.
@@ -503,6 +504,14 @@ pub enum SalesInvoiceCommands {
     Prepare {
         #[command(flatten)]
         inputs: InvoiceInputs,
+
+        /// Invoice number (Yuki's Reference), or `auto`: the lowest
+        /// <year>-<seq> of the invoice date's year above the sales archive's
+        /// highest that the local ledger does not hold. Refused when either
+        /// has it. Yuki's own counter does not learn numbers given here, so
+        /// once you start, number every invoice this way.
+        #[arg(long, value_name = "REF|auto", value_parser = invoice_number::parse_number_request)]
+        number: Option<invoice_number::NumberRequest>,
 
         /// Write the prepared invoice here (never over an existing file) and
         /// reserve its number in the ledger. Needs --number and [seller].
@@ -558,16 +567,6 @@ pub struct InvoiceInputs {
     /// Subject (title) of the invoice, replacing the file's.
     #[arg(long)]
     pub subject: Option<String>,
-
-    /// Invoice number (Yuki's Reference) for a booked invoice (--send or
-    /// --book), or `auto`: one past the highest <year>-<seq> among the
-    /// sales archive's `Invoice <n>.pdf` files of the invoice date's year and
-    /// the numbers the local ledger holds. Refused when either has it.
-    /// Yuki's own counter does not learn numbers given here, so once you
-    /// start, number every invoice this way. Without it, Yuki numbers the
-    /// invoice. With --pdf, give the number `prepare` printed, not auto.
-    #[arg(long, value_name = "REF|auto", value_parser = invoice_number::parse_number_request)]
-    pub number: Option<invoice_number::NumberRequest>,
 }
 
 impl InvoiceInputs {
@@ -585,8 +584,6 @@ impl InvoiceInputs {
             price: self.price,
             date: self.date.as_deref(),
             subject: self.subject.as_deref(),
-            number: self.number.as_ref(),
-            preparing: false,
         }
     }
 }

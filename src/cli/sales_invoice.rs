@@ -17,7 +17,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 
 use crate::cli::invoice_ledger::{Claim, InvoiceLedger};
-use crate::cli::invoice_number::{NumberRequest, dutch_date, structured_reference};
+use crate::cli::invoice_number::{dutch_date, structured_reference};
 use crate::client::escape_text;
 use crate::client::sales::{SalesClient, SalesInvoicesImport};
 use crate::config::{Config, Seller};
@@ -135,11 +135,6 @@ pub struct Overrides<'a> {
     pub price: Option<Cents>,
     pub date: Option<&'a str>,
     pub subject: Option<&'a str>,
-    /// `--number`: given here, or resolved later for `auto`.
-    pub number: Option<&'a NumberRequest>,
-    /// For `prepare`: no PDF is read (it does not exist yet), and a number
-    /// needs no booking mode.
-    pub preparing: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,16 +1091,6 @@ fn validate(
         p.push("--send email needs contact.email for a contact without a code");
     }
 
-    if overrides.number.is_some() && send.is_none() && !overrides.preparing {
-        p.push(
-            "--number numbers a booked invoice: add --send or --book (Yuki numbers a draft itself when it is booked)",
-        );
-    }
-    let number = match overrides.number {
-        Some(NumberRequest::Given(number)) => Some(number.clone()),
-        _ => None,
-    };
-
     if !p.0.is_empty() {
         return Err(p.0);
     }
@@ -1121,7 +1106,7 @@ fn validate(
         notes,
         vat_mention,
         pdf: None,
-        number,
+        number: None,
         contact,
         lines,
         send,
@@ -1583,7 +1568,7 @@ pub fn check_confirm(number: Option<&str>, confirm: Option<&str>, yes: bool) -> 
             "booking without a prompt needs --confirm <number>: pass --confirm {number} to book invoice {number}; nothing was sent to Yuki"
         )),
         (None, _) => Err(
-            "booking without a prompt needs --confirm <number>, so the invoice needs a number: give --number (or book a --prepared invoice); one Yuki numbers itself can only be booked at the prompt. Nothing was sent to Yuki"
+            "booking without a prompt needs --confirm <number>, so the invoice needs a number: book a --prepared invoice (`sales invoice prepare --number auto --out <file>`); one Yuki numbers itself can only be booked at the prompt. Nothing was sent to Yuki"
                 .into(),
         ),
     }
@@ -1652,13 +1637,13 @@ pub async fn submit(
     Ok(import)
 }
 
-/// [`submit`], with a number the CLI gave recorded as pending in the ledger
-/// first and settled by Yuki's [`Verdict`]: booked when the invoice was
-/// booked as asked, rejected (the number free again) when Yuki refused it
-/// or nothing was sent, and left pending, with a note when there is one,
-/// when the outcome is unknown, partial, or booked under another reference.
-/// A prepared invoice (`prepared`: its content hash) moves its reservation
-/// to pending, refused unless the reservation is for exactly that content.
+/// [`submit`]; for a prepared invoice (`prepared`: its content hash), with
+/// its reservation turned pending first, refused unless it is for exactly
+/// that content, and settled by Yuki's [`Verdict`]: booked when the invoice
+/// was booked as asked; reserved again when nothing reached Yuki, to retry
+/// the same file; rejected (free again) when Yuki provably did not create
+/// it; and left pending, with a note when there is one, when the outcome is
+/// unknown, partial, or booked under another reference.
 pub async fn submit_numbered(
     config: &Config,
     admin: Option<&str>,
@@ -1667,24 +1652,13 @@ pub async fn submit_numbered(
     format: Option<&str>,
     quiet: bool,
 ) -> Result<Verdict, SubmitError> {
-    let Some(number) = &invoice.number else {
+    let (Some(number), Some(hash)) = (&invoice.number, prepared) else {
         let import = submit(config, admin, invoice, format, quiet).await?;
         return Ok(verdict(&import, invoice));
     };
     let admin_id = config.target(admin)?.admin_id;
-    let mut ledger = InvoiceLedger::open()?;
-    match prepared {
-        Some(hash) => ledger.send_reserved(admin_id, number, hash)?,
-        None => ledger.reserve(&Claim {
-            admin: admin_id,
-            number,
-            date: &invoice.date,
-            customer: &invoice.contact.label(),
-            gross: &invoice.gross().to_string(),
-        })?,
-    }
-    // The lock is not held while Yuki is called.
-    drop(ledger);
+    // The lock is held only for the write, never while Yuki is called.
+    InvoiceLedger::open()?.send_reserved(admin_id, number, hash)?;
     let result = submit(config, admin, invoice, format, quiet)
         .await
         .map(|import| verdict(&import, invoice));
@@ -1695,17 +1669,15 @@ pub async fn submit_numbered(
             .note(admin_id, number, message)
             .and_then(|()| ledger.commit(admin_id, number))
             .map(|()| true),
-        // Nothing reached Yuki: a prepared invoice keeps its number, to retry.
-        Err(SubmitError::Yuki(_)) if prepared.is_some() => {
+        // Nothing reached Yuki: the prepared invoice keeps its number, to retry.
+        Err(SubmitError::Yuki(_)) => {
             ledger.unsend(admin_id, number)?;
             eprintln!(
                 "invoice number {number} is reserved again for this prepared invoice: nothing reached Yuki, so run the same create --prepared again"
             );
             Ok(true)
         }
-        Ok(Verdict::Rejected { freed: true, .. }) | Err(SubmitError::Yuki(_)) => {
-            ledger.reject(admin_id, number).map(|()| true)
-        }
+        Ok(Verdict::Rejected { freed: true, .. }) => ledger.reject(admin_id, number).map(|()| true),
         Ok(Verdict::ReferenceMismatch(message)) => {
             ledger.note(admin_id, number, message).map(|()| false)
         }

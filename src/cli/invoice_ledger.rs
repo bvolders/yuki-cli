@@ -6,8 +6,7 @@
 //! number as `reserved`, with the hash of the prepared invoice it was given
 //! to; `create --prepared` turns that reservation, and only for that exact
 //! content, into `pending` ([`InvoiceLedger::send_reserved`]) just before
-//! `ProcessSalesInvoices` is called. A number `create` picks itself goes
-//! straight to `pending` ([`InvoiceLedger::reserve`]). Then
+//! `ProcessSalesInvoices` is called. Then
 //! [`commit`](InvoiceLedger::commit) or [`reject`](InvoiceLedger::reject)
 //! settles it by Yuki's answer. A pending number whose outcome is unknown
 //! stays taken until `sales invoice numbers --resolve` settles it; a
@@ -164,11 +163,6 @@ impl Numbers {
         self.entries.iter().filter(move |e| e.of(admin))
     }
 
-    /// Record the claim as pending; refused while an entry holds the number.
-    pub fn reserve(&mut self, claim: &Claim<'_>) -> Result<(), YukiError> {
-        self.claim(claim, Status::Pending, None)
-    }
-
     /// Record the claim as reserved for the prepared invoice whose content
     /// hash is `hash`; refused while an entry holds the number.
     pub fn reserve_prepared(&mut self, claim: &Claim<'_>, hash: &str) -> Result<(), YukiError> {
@@ -232,18 +226,20 @@ impl Numbers {
         }
     }
 
-    /// Settle the latest pending entry of `admin` for `number` as `status`.
-    pub(crate) fn settle(
+    /// Move the latest entry of `admin` for `number` from `from` to `to`;
+    /// refused when there is none in `from`.
+    pub(crate) fn transition(
         &mut self,
         admin: &str,
         number: &str,
-        status: Status,
+        from: Status,
+        to: Status,
     ) -> Result<(), YukiError> {
-        let entry = self
-            .latest(admin, number, &[Status::Pending])
-            .ok_or_else(|| YukiError::NotFound(format!("no pending invoice number {number}")))?;
-        entry.status = status;
-        if status == Status::Booked {
+        let entry = self.latest(admin, number, &[from]).ok_or_else(|| {
+            YukiError::NotFound(format!("no {} invoice number {number}", from.label()))
+        })?;
+        entry.status = to;
+        if to == Status::Booked {
             entry.booked_at = Some(now_utc());
         }
         Ok(())
@@ -274,12 +270,6 @@ impl InvoiceLedger {
         self.0.state()
     }
 
-    /// Write-ahead: record the claimed number as pending before it is sent.
-    pub fn reserve(&mut self, claim: &Claim<'_>) -> Result<(), YukiError> {
-        self.0.state_mut().reserve(claim)?;
-        self.0.save()
-    }
-
     /// Reserve the claimed number for the prepared invoice with content
     /// hash `hash` (`prepare --out`).
     pub fn reserve_prepared(&mut self, claim: &Claim<'_>, hash: &str) -> Result<(), YukiError> {
@@ -306,35 +296,33 @@ impl InvoiceLedger {
     /// Undo [`send_reserved`](Self::send_reserved) when nothing reached Yuki:
     /// the number is reserved again for the same content, to retry.
     pub fn unsend(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
-        let entry = self
-            .0
+        self.0
             .state_mut()
-            .latest(admin, number, &[Status::Pending])
-            .ok_or_else(|| YukiError::NotFound(format!("no pending invoice number {number}")))?;
-        entry.status = Status::Reserved;
+            .transition(admin, number, Status::Pending, Status::Reserved)?;
         self.0.save()
     }
 
     /// Release a reservation that will not be sent: the number is free again.
     pub fn release(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
-        let entry = self
-            .0
+        self.0
             .state_mut()
-            .latest(admin, number, &[Status::Reserved])
-            .ok_or_else(|| YukiError::NotFound(format!("no reserved invoice number {number}")))?;
-        entry.status = Status::Rejected;
+            .transition(admin, number, Status::Reserved, Status::Rejected)?;
         self.0.save()
     }
 
     /// Yuki booked `number`.
     pub fn commit(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
-        self.0.state_mut().settle(admin, number, Status::Booked)?;
+        self.0
+            .state_mut()
+            .transition(admin, number, Status::Pending, Status::Booked)?;
         self.0.save()
     }
 
     /// Yuki did not create `number`: free it again.
     pub fn reject(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
-        self.0.state_mut().settle(admin, number, Status::Rejected)?;
+        self.0
+            .state_mut()
+            .transition(admin, number, Status::Pending, Status::Rejected)?;
         self.0.save()
     }
 
@@ -470,25 +458,28 @@ mod tests {
         }
     }
 
+    /// Reserve `number` for `admin` and send it: pending.
+    fn pend(ledger: &mut InvoiceLedger, admin: &str, number: &str) -> Result<(), YukiError> {
+        ledger.reserve_prepared(&claim(admin, number), "h")?;
+        ledger.send_reserved(admin, number, "h")
+    }
+
     #[test]
     fn a_number_stays_taken_until_rejected_and_survives_a_reopen() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("invoice-numbers.json");
-        InvoiceLedger::open_at(&path)
-            .unwrap()
-            .reserve(&claim("a1", "2026-20"))
-            .unwrap();
+        pend(&mut InvoiceLedger::open_at(&path).unwrap(), "a1", "2026-20").unwrap();
         let mut ledger = InvoiceLedger::open_at(&path).unwrap();
         assert_eq!(
             ledger.list().holder("a1", "2026-20").unwrap().status,
             Status::Pending
         );
-        let err = ledger.reserve(&claim("a1", "2026-20")).unwrap_err();
+        let err = pend(&mut ledger, "a1", "2026-20").unwrap_err();
         assert!(err.to_string().contains("already given out: pending"));
         ledger.reject("a1", "2026-20").unwrap();
         assert!(ledger.list().holder("a1", "2026-20").is_none());
         // A rejected number can be given out again, and booked.
-        ledger.reserve(&claim("a1", "2026-20")).unwrap();
+        pend(&mut ledger, "a1", "2026-20").unwrap();
         ledger.commit("a1", "2026-20").unwrap();
         let booked = ledger.list().holder("a1", "2026-20").unwrap();
         assert_eq!(booked.status, Status::Booked);
@@ -517,22 +508,20 @@ mod tests {
     #[test]
     fn numbers_belong_to_an_administration_and_compare_by_value() {
         let mut numbers = Numbers::default();
-        numbers.reserve(&claim("a1", "2026-01")).unwrap();
+        numbers
+            .reserve_prepared(&claim("a1", "2026-01"), "h")
+            .unwrap();
         // 2026-1 is 2026-01, in the same administration only.
-        let err = numbers.reserve(&claim("a1", "2026-1")).unwrap_err();
+        let err = numbers
+            .reserve_prepared(&claim("a1", "2026-1"), "h")
+            .unwrap_err();
         assert!(err.to_string().contains("already given out"), "{err}");
         assert!(numbers.holder("a1", "2026-001").is_some());
-        numbers.reserve(&claim("a2", "2026-1")).unwrap();
+        numbers
+            .reserve_prepared(&claim("a2", "2026-1"), "h")
+            .unwrap();
         assert_eq!(numbers.taken_numbers("a2").collect::<Vec<_>>(), ["2026-1"]);
-        numbers.settle("a2", "2026-01", Status::Booked).unwrap();
-        assert_eq!(
-            numbers.holder("a1", "2026-1").unwrap().status,
-            Status::Pending
-        );
-        assert_eq!(
-            numbers.holder("a2", "2026-1").unwrap().status,
-            Status::Booked
-        );
+        assert!(numbers.holder("a3", "2026-1").is_none());
     }
 
     #[test]
@@ -559,7 +548,11 @@ mod tests {
             .reserve_prepared(&claim("a1", "2026-20"), "hash-a")
             .unwrap();
         // Reserved numbers are taken, like pending ones.
-        assert!(ledger.reserve(&claim("a1", "2026-20")).is_err());
+        assert!(
+            ledger
+                .reserve_prepared(&claim("a1", "2026-20"), "x")
+                .is_err()
+        );
         let err = ledger.send_reserved("a1", "2026-20", "hash-b").unwrap_err();
         assert!(err.to_string().contains("changed since"), "{err}");
         assert!(ledger.send_reserved("a2", "2026-20", "hash-a").is_err());

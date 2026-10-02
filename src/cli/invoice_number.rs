@@ -349,13 +349,16 @@ mod tests {
         let archive = numbers_in_file_names(&archive());
         let mut ledger = Numbers::default();
         ledger
-            .reserve(&crate::cli::invoice_ledger::Claim {
-                admin: "a1",
-                number: "2026-20",
-                date: "2026-10-31",
-                customer: "Example BV",
-                gross: "121.00",
-            })
+            .reserve_prepared(
+                &crate::cli::invoice_ledger::Claim {
+                    admin: "a1",
+                    number: "2026-20",
+                    date: "2026-10-31",
+                    customer: "Example BV",
+                    gross: "121.00",
+                },
+                "h",
+            )
             .unwrap();
         // auto skips the pending number; giving it is refused.
         assert_eq!(
@@ -371,7 +374,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("already given out: pending"), "{err}");
+        assert!(err.contains("already given out: reserved"), "{err}");
         let err = choose(
             &NumberRequest::Given("2026-19".into()),
             2026,
@@ -383,26 +386,28 @@ mod tests {
         .to_string();
         assert!(err.contains("already in the sales archive"), "{err}");
         // A rejected number is free again.
-        ledger
-            .settle(
-                "a1",
-                "2026-20",
-                crate::cli::invoice_ledger::Status::Rejected,
-            )
-            .unwrap();
+        {
+            use crate::cli::invoice_ledger::Status;
+            ledger
+                .transition("a1", "2026-20", Status::Reserved, Status::Rejected)
+                .unwrap();
+        }
         assert_eq!(
             choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a1").unwrap(),
             "2026-20"
         );
         // Another administration's numbers do not count.
         ledger
-            .reserve(&crate::cli::invoice_ledger::Claim {
-                admin: "a2",
-                number: "2026-20",
-                date: "2026-10-31",
-                customer: "Other BV",
-                gross: "1.00",
-            })
+            .reserve_prepared(
+                &crate::cli::invoice_ledger::Claim {
+                    admin: "a2",
+                    number: "2026-20",
+                    date: "2026-10-31",
+                    customer: "Other BV",
+                    gross: "1.00",
+                },
+                "h",
+            )
             .unwrap();
         assert_eq!(
             choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a1").unwrap(),

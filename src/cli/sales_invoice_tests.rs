@@ -60,6 +60,13 @@ fn bookable() -> String {
     format!("due_days = 30\n{MINIMAL}")
 }
 
+/// `text` numbered 2026-20, as a prepared invoice is, to be booked as `send`.
+fn numbered(text: &str, send: Option<SendMode>) -> Invoice {
+    let mut inv = invoice(text, send);
+    inv.number = Some("2026-20".into());
+    inv
+}
+
 fn invoice(text: &str, send: Option<SendMode>) -> Invoice {
     parse(text, "test.toml", &Overrides::default(), send).expect("valid invoice")
 }
@@ -268,8 +275,6 @@ fn command_line_overrides_replace_the_file_values() {
         price: Some(parse_price("80").unwrap()),
         date: Some("2026-11-01"),
         subject: Some("November"),
-        number: None,
-        preparing: false,
     };
     let text = format!("subject = \"October\"\ndue_days = 14\n{MINIMAL}");
     let inv = parse(&text, "t", &overrides, None).unwrap();
@@ -556,13 +561,7 @@ iban = "BE00000000000000"
 /// `text` prepared as 2026-20 in administration `a1`: the file's JSON and
 /// the invoice it was prepared from, to be booked as `send`.
 fn prepared(text: &str, send: SendMode) -> (serde_json::Value, Invoice) {
-    let number = NumberRequest::Given("2026-20".into());
-    let overrides = Overrides {
-        number: Some(&number),
-        preparing: true,
-        ..Default::default()
-    };
-    let mut inv = parse(text, "t", &overrides, None).unwrap();
+    let mut inv = numbered(text, None);
     let json = inv.prepared_file(&seller(), "a1");
     inv.send = Some(send);
     (json, inv)
@@ -682,12 +681,7 @@ fn a_pdf_that_is_missing_not_a_pdf_or_too_large_is_rejected() {
 
 #[test]
 fn book_books_without_sending_and_the_number_is_the_reference() {
-    let number = NumberRequest::Given("2026-20".into());
-    let overrides = Overrides {
-        number: Some(&number),
-        ..Default::default()
-    };
-    let inv = parse(&bookable(), "t", &overrides, Some(SendMode::Book)).unwrap();
+    let inv = numbered(&bookable(), Some(SendMode::Book));
     let xml = inv.to_xml();
     for fragment in [
         "<Process>true</Process>",
@@ -715,13 +709,7 @@ fn book_books_without_sending_and_the_number_is_the_reference() {
 
 #[test]
 fn prepared_json_carries_the_figures_create_sends() {
-    let number = NumberRequest::Given("2026-20".into());
-    let overrides = Overrides {
-        number: Some(&number),
-        preparing: true,
-        ..Default::default()
-    };
-    let inv = parse(FULL, "t", &overrides, None).unwrap();
+    let inv = numbered(FULL, None);
     let json = inv.prepared();
     assert_eq!(json["number"], "2026-20");
     assert_eq!(json["date"]["iso"], "2026-10-01");
@@ -741,29 +729,6 @@ fn prepared_json_carries_the_figures_create_sends() {
     // Without a number there is no reference either.
     let unnumbered = invoice(FULL, None).prepared();
     assert!(unnumbered["number"].is_null() && unnumbered["payment_reference"].is_null());
-}
-
-#[test]
-fn a_numbered_draft_is_refused() {
-    for number in [NumberRequest::Auto, NumberRequest::Given("2026-20".into())] {
-        let overrides = Overrides {
-            number: Some(&number),
-            ..Default::default()
-        };
-        let err = parse(MINIMAL, "t", &overrides, None)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("--number numbers a booked invoice: add --send or --book"),
-            "{err}"
-        );
-        // prepare takes it: it only shows the number.
-        let preparing = Overrides {
-            preparing: true,
-            ..overrides
-        };
-        assert!(parse(MINIMAL, "t", &preparing, None).is_ok());
-    }
 }
 
 #[test]
@@ -832,12 +797,7 @@ fn per_line_rounding_that_differs_is_flagged() {
 
 #[test]
 fn a_booking_announces_itself_in_one_line() {
-    let number = NumberRequest::Given("2026-20".into());
-    let overrides = Overrides {
-        number: Some(&number),
-        ..Default::default()
-    };
-    let inv = parse(&bookable(), "t", &overrides, Some(SendMode::Book)).unwrap();
+    let inv = numbered(&bookable(), Some(SendMode::Book));
     assert_eq!(
         inv.booking_line().unwrap(),
         "BOOKS IMMEDIATELY: 2026-20 code C0042 1512.50 EUR"
@@ -1004,12 +964,7 @@ fn import_of(reference: &str, processed: bool, email_sent: bool) -> SalesInvoice
 
 #[test]
 fn the_reference_yuki_booked_must_be_the_number_sent() {
-    let number = NumberRequest::Given("2026-20".into());
-    let overrides = Overrides {
-        number: Some(&number),
-        ..Default::default()
-    };
-    let inv = parse(&bookable(), "t", &overrides, Some(SendMode::Book)).unwrap();
+    let inv = numbered(&bookable(), Some(SendMode::Book));
     assert_eq!(
         verdict(&import_of("2026-20", true, false), &inv),
         Verdict::Done
@@ -1058,12 +1013,7 @@ fn a_booking_without_the_prompt_names_its_number() {
     assert!(check_confirm(None, Some("2026-20"), true).is_err());
     assert!(check_confirm(None, None, true).is_err());
     // The prompt itself names the number.
-    let number = NumberRequest::Given("2026-20".into());
-    let overrides = Overrides {
-        number: Some(&number),
-        ..Default::default()
-    };
-    let inv = parse(&bookable(), "t", &overrides, Some(SendMode::Email)).unwrap();
+    let inv = numbered(&bookable(), Some(SendMode::Email));
     assert_eq!(
         inv.question(),
         "Book invoice 2026-20 in Yuki and send it by email?"

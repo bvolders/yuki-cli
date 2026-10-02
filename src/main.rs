@@ -474,7 +474,6 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         confirm,
                     } => {
                         use yuki_cli::cli::invoice_ledger::InvoiceLedger;
-                        use yuki_cli::cli::invoice_number::{self, NumberRequest};
                         use yuki_cli::cli::sales_invoice::{self, Invoice, SendMode};
                         let send = if book { Some(SendMode::Book) } else { send };
                         if pdf.is_some() && prepared.is_none() {
@@ -485,7 +484,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         // A prepared invoice: exactly that content, its number
                         // still reserved for it in this administration.
                         let mut binding: Option<String> = None;
-                        let mut invoice = match &prepared {
+                        let invoice = match &prepared {
                             Some(file) => {
                                 let send = send.ok_or_else(|| {
                                     AppError::InvalidInput(
@@ -529,18 +528,8 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         // A dry run makes no API call (and, unprepared, needs no
                         // configuration).
                         if dry_run {
-                            if inputs.number == Some(NumberRequest::Auto) {
-                                return Err(AppError::InvalidInput(
-                                    "--number auto reads the sales archive, which a dry run does not: run `sales invoice prepare --number auto` for the number, then pass it".into(),
-                                ));
-                            }
                             if !cli.quiet {
                                 eprintln!("{}\n", invoice.preview(None));
-                                if let (Some(number), None) = (&invoice.number, &binding) {
-                                    eprintln!(
-                                        "Dry run: number {number} was not checked against the sales archive."
-                                    );
-                                }
                                 eprintln!("Dry run: nothing was sent to Yuki. xmlDoc:");
                             }
                             println!("{}", invoice.to_display_xml());
@@ -552,13 +541,6 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             &InvoiceLedger::peek()?,
                             target.admin_id,
                         );
-                        if let Some(request) = &inputs.number {
-                            invoice.number = Some(
-                                invoice_number::resolve(&config, admin, request, &invoice.date)
-                                    .await
-                                    .map_err(invalid_input)?,
-                            );
-                        }
                         // A booking without a prompt names the number it books.
                         if invoice.send.is_some() {
                             sales_invoice::check_confirm(
@@ -614,16 +596,17 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             }
                         }
                     }
-                    SalesInvoiceCommands::Prepare { inputs, out } => {
+                    SalesInvoiceCommands::Prepare {
+                        inputs,
+                        number,
+                        out,
+                    } => {
                         use yuki_cli::cli::{invoice_number, sales_invoice};
-                        let overrides = sales_invoice::Overrides {
-                            preparing: true,
-                            ..inputs.overrides()
-                        };
-                        let mut invoice = sales_invoice::load(&inputs.source(), &overrides, None)
-                            .map_err(invalid_input)?;
+                        let mut invoice =
+                            sales_invoice::load(&inputs.source(), &inputs.overrides(), None)
+                                .map_err(invalid_input)?;
                         // The config, when there is one, gives the issuing firm.
-                        let config = match &inputs.number {
+                        let config = match &number {
                             Some(_) => Some(load()?),
                             None => load().ok(),
                         };
@@ -637,7 +620,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             use yuki_cli::cli::invoice_ledger::{InvoiceLedger, warn};
                             warn(&InvoiceLedger::peek()?, target.admin_id);
                         }
-                        if let (Some(request), Some(config)) = (&inputs.number, &config) {
+                        if let (Some(request), Some(config)) = (&number, &config) {
                             config.target(admin)?;
                             invoice.number = Some(
                                 invoice_number::resolve(config, admin, request, &invoice.date)

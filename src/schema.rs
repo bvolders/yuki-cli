@@ -278,7 +278,6 @@ pub fn generate() -> Value {
                     {"name": "--pdf", "type": "path", "required": false, "description": "Custom invoice PDF (max 3 MB) rendered from the --prepared file, which it requires; stored in Yuki as Invoice <number>.pdf instead of the generated invoice."},
                     {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it (or --book), the invoice is a draft."},
                     {"name": "--book", "type": "boolean", "required": false, "description": "Book the invoice without sending it."},
-                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number (Reference) of a booked invoice (needs --send or --book), or auto: one past the highest <year>-<seq> in the sales archive (Invoice/Factuur <year>-<seq>.pdf) and the local ledger for the invoice date's year. Refused when either has it."},
                     {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."},
                     {"name": "--confirm", "type": "string", "required": false, "description": "The invoice number being booked, repeated: required with --yes when booking (--send or --book), and must equal the number. A booking Yuki numbers itself can only be confirmed at the prompt."}
                 ],
@@ -304,7 +303,7 @@ pub fn generate() -> Value {
                     {"name": "--price", "type": "number", "required": false, "description": "Unit price excluding VAT of the invoice's only line."},
                     {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD."},
                     {"name": "--subject", "type": "string", "required": false, "description": "Subject of the invoice."},
-                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number, or auto."},
+                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number (Reference), or auto: the lowest <year>-<seq> of the invoice date's year above the sales archive's highest (Invoice/Factuur <year>-<seq>.pdf) that the local ledger does not hold. Refused when either has it."},
                     {"name": "--out", "type": "path", "required": false, "description": "Write the prepared invoice here (never over an existing file) and reserve its number. Needs --number and [seller] in the config."}
                 ],
                 "output_kind": "data",

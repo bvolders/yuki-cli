@@ -299,7 +299,6 @@ yuki sales invoice create --template acme-hosting       # From ~/.config/yuki/in
 yuki sales invoice create --template acme-consulting \
   --qty 7.5 --subject "Consultancy October 2026"        # Monthly run: this month's hours
 yuki sales invoice create --file invoice.toml --dry-run # Preview and xmlDoc only; no API call
-yuki sales invoice create --template acme-hosting --number auto --book  # Book it in Yuki's layout
 yuki sales invoice prepare --template acme-hosting --number auto \
   --date 2026-10-31 --out 2026-10-acme.json             # Reserve the number for this content
 yuki sales invoice create --prepared 2026-10-acme.json \
@@ -340,9 +339,8 @@ not report delivery)`; check delivery in Yuki.
 
 #### Your own PDF with your own number
 
-`--number <REF>` sets the invoice number (Yuki's `Reference`) of a booked
-invoice: it needs `--send` or `--book`, since Yuki numbers a draft itself when
-it is booked. `--number auto` reads the sales (`verkoop`) archive for the
+Only a prepared invoice carries a CLI-given number: `prepare --number <REF>`
+sets the invoice number (Yuki's `Reference`), and `--number auto` reads the sales (`verkoop`) archive for the
 invoice year, where Yuki names each invoice PDF after its number
 (`Invoice 2026-19.pdf`; only `.pdf` files named `Invoice <year>-<seq>` or
 `Factuur <year>-<seq>` count) and takes the lowest number above the archive's
