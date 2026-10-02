@@ -1024,12 +1024,28 @@ fn validate(
             ));
         }
     }
-    let lines: Vec<Line> = spec
+    let mut lines: Vec<Line> = spec
         .lines
         .into_iter()
         .enumerate()
         .filter_map(|(i, line)| validate_line(line, i + 1, overrides, &mut p))
         .collect();
+    // The text of a monthly template, for this invoice's date and amounts.
+    let subject = subject.and_then(|s| {
+        fill(&s, &date, None)
+            .map_err(|e| p.push(format!("subject: {e}")))
+            .ok()
+    });
+    for (i, line) in lines.iter_mut().enumerate() {
+        let net = Some(line.net());
+        let mut filled = |field: &str, text: &str| {
+            fill(text, &date, net)
+                .map_err(|e| p.push(format!("lines[{}].{field}: {e}", i + 1)))
+                .unwrap_or_default()
+        };
+        line.description = filled("description", &line.description);
+        line.remarks = line.remarks.as_deref().map(|r| filled("remarks", r));
+    }
 
     let net: i128 = lines.iter().map(|l| i128::from(l.net().0)).sum();
     if !lines.is_empty() && net <= 0 {
@@ -1105,6 +1121,54 @@ fn validate(
         lines,
         send,
     })
+}
+
+/// Resolve the placeholders of `text` for an invoice dated `date` (ISO):
+/// `{month}` (the Dutch month name), `{year}`, `{month_num}` (two digits)
+/// and, in a line whose net is `net`, `{pct_of_net:P}`: P percent (up to
+/// two decimals) of the net, rounded to the cent, in Belgian notation
+/// (`4.312,50`). Anything else between braces is an error.
+pub fn fill(text: &str, date: &str, net: Option<Cents>) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after
+            .find('}')
+            .ok_or_else(|| format!("'{{' without '}}' in {text:?}"))?;
+        let name = &after[..close];
+        let month: usize = date[5..7].parse().unwrap_or(1);
+        match name {
+            "month" => out.push_str(crate::cli::invoice_number::MONTHS[month - 1]),
+            "year" => out.push_str(&date[..4]),
+            "month_num" => out.push_str(&date[5..7]),
+            _ => match name.strip_prefix("pct_of_net:") {
+                Some(pct) => {
+                    let net = net.ok_or("{pct_of_net:…} only works in a line")?;
+                    let pct = parse_scaled(pct.trim(), PCT_DECIMALS)
+                        .ok()
+                        .filter(|p| (0..=100 * 10_i64.pow(PCT_DECIMALS)).contains(p))
+                        .ok_or_else(|| {
+                            format!("{{{name}}}: the percentage must be 0 to 100, e.g. 25")
+                        })?;
+                    let part = div_round(
+                        i128::from(net.0) * i128::from(pct),
+                        100 * 10_i128.pow(PCT_DECIMALS),
+                    );
+                    out.push_str(&Cents(part as i64).belgian());
+                }
+                None => {
+                    return Err(format!(
+                        "unknown placeholder {{{name}}} (known: {{month}}, {{year}}, {{month_num}}, {{pct_of_net:25}})"
+                    ));
+                }
+            },
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 fn validate_contact(spec: ContactSpec, p: &mut Problems) -> Contact {

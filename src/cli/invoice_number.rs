@@ -229,22 +229,24 @@ pub fn structured_reference(number: &str) -> Result<String, String> {
     Ok(format!("+++{}/{}/{}+++", &d[..3], &d[3..7], &d[7..]))
 }
 
+/// The Dutch month names, January first.
+pub const MONTHS: [&str; 12] = [
+    "januari",
+    "februari",
+    "maart",
+    "april",
+    "mei",
+    "juni",
+    "juli",
+    "augustus",
+    "september",
+    "oktober",
+    "november",
+    "december",
+];
+
 /// An ISO date as Dutch text: `2026-09-30` → `30 september 2026`.
 pub fn dutch_date(iso: &str) -> String {
-    const MONTHS: [&str; 12] = [
-        "januari",
-        "februari",
-        "maart",
-        "april",
-        "mei",
-        "juni",
-        "juli",
-        "augustus",
-        "september",
-        "oktober",
-        "november",
-        "december",
-    ];
     let parts: Vec<u32> = iso.split('-').filter_map(|p| p.parse().ok()).collect();
     match parts.as_slice() {
         [year, month @ 1..=12, day] => {

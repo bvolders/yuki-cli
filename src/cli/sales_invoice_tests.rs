@@ -865,3 +865,82 @@ fn a_booking_announces_itself_in_one_line() {
     );
     assert!(invoice(MINIMAL, None).booking_line().is_none());
 }
+
+#[test]
+fn placeholders_fill_in_the_month_and_a_share_of_the_line() {
+    let text = r#"
+subject = "Consultancy {month} {year} ({month_num})"
+date = 2026-03-31
+
+[contact]
+code = "C0042"
+
+[[lines]]
+description = "Development {month}"
+qty = 172.5
+price = 100
+vat_percentage = 21
+vat_type = 1
+remarks = "waarvan overdracht auteursrecht op ontwikkelde software van 25% of €{pct_of_net:25}"
+"#;
+    let invoice = invoice(text, None);
+    assert_eq!(
+        invoice.subject.as_deref(),
+        Some("Consultancy maart 2026 (03)")
+    );
+    assert_eq!(invoice.lines[0].description, "Development maart");
+    assert_eq!(
+        invoice.lines[0].remarks.as_deref(),
+        Some("waarvan overdracht auteursrecht op ontwikkelde software van 25% of €4.312,50")
+    );
+    // The filled text is what prepare shows and create sends.
+    assert!(invoice.to_xml().contains("€4.312,50"));
+    assert_eq!(invoice.prepared()["subject"], "Consultancy maart 2026 (03)");
+}
+
+#[test]
+fn a_share_of_the_net_rounds_half_away_from_zero() {
+    let net = Some(Cents(1_001)); // 10.01
+    assert_eq!(fill("{pct_of_net:25}", "2026-10-31", net).unwrap(), "2,50"); // 2.5025
+    assert_eq!(fill("{pct_of_net:50}", "2026-10-31", net).unwrap(), "5,01"); // 5.005
+    assert_eq!(
+        fill("{pct_of_net:12.5}", "2026-10-31", Some(Cents(100_000))).unwrap(),
+        "125,00"
+    );
+    assert_eq!(
+        fill("{pct_of_net:100}", "2026-10-31", Some(Cents(123_456_789))).unwrap(),
+        "1.234.567,89"
+    );
+}
+
+#[test]
+fn unknown_or_misplaced_placeholders_are_errors() {
+    for (text, expect) in [
+        ("{maand}", "unknown placeholder {maand}"),
+        ("{month", "without"),
+        ("{pct_of_net:x}", "0 to 100"),
+        ("{pct_of_net:101}", "0 to 100"),
+    ] {
+        let err = fill(text, "2026-10-31", Some(Cents(100))).unwrap_err();
+        assert!(err.contains(expect), "{text}: {err}");
+    }
+    let err = fill("{pct_of_net:25}", "2026-10-31", None).unwrap_err();
+    assert!(err.contains("only works in a line"), "{err}");
+    let week = MINIMAL.replace(
+        "description = \"Consultancy\"",
+        "description = \"Consultancy {week}\"",
+    );
+    let err = problems(&week, &Overrides::default());
+    assert!(
+        err.contains("lines[1].description: unknown placeholder {week}"),
+        "{err}"
+    );
+    let err = problems(
+        &format!("subject = \"{{pct_of_net:25}}\"\n{MINIMAL}"),
+        &Overrides::default(),
+    );
+    assert!(
+        err.contains("subject: {pct_of_net:…} only works in a line"),
+        "{err}"
+    );
+}

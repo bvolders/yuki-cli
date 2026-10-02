@@ -55,6 +55,24 @@ impl std::iter::Sum for Cents {
     }
 }
 
+impl Cents {
+    /// Belgian notation: a dot between thousands, a comma before the cents,
+    /// as an invoice text writes amounts: `4.312,50`.
+    pub fn belgian(self) -> String {
+        let sign = if self.0 < 0 { "-" } else { "" };
+        let abs = self.0.unsigned_abs();
+        let digits = (abs / 100).to_string();
+        let mut grouped = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                grouped.push('.');
+            }
+            grouped.push(c);
+        }
+        format!("{sign}{grouped},{:02}", abs % 100)
+    }
+}
+
 impl std::fmt::Display for Cents {
     /// Two decimals with a dot, as the API writes amounts: `-7.30`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,6 +135,14 @@ pub fn div_round(numerator: i128, denominator: i128) -> i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn belgian_notation_groups_thousands_with_dots() {
+        assert_eq!(Cents(431_250).belgian(), "4.312,50");
+        assert_eq!(Cents(123_456_789).belgian(), "1.234.567,89");
+        assert_eq!(Cents(5).belgian(), "0,05");
+        assert_eq!(Cents(-100_000).belgian(), "-1.000,00");
+    }
 
     #[test]
     fn cents_parse_and_print_like_the_api() {

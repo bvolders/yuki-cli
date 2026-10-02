@@ -429,9 +429,16 @@ vat_type = 1                      # your administration's VAT type number
 gl_account = "700000"             # optional revenue account
 # vat_description = "BTW 21%"     # optional, to pick between VAT codes
 # product_code = "HOST"           # optional item number of a Yuki sales item
-# remarks = "waarvan overdracht auteursrecht van 25%"  # shown under the line
+# remarks = "waarvan overdracht auteursrecht van 25% of €{pct_of_net:25}"  # shown under the line
 # unit = "u"                      # unit of qty, for prepare's JSON (a rendered PDF) only
 ```
+
+The subject and each line's description and remarks may hold placeholders,
+filled in for the invoice date when the invoice is read (so `prepare` already
+shows the final text): `{month}` (the Dutch month name, `oktober`), `{year}`
+(`2026`), `{month_num}` (`10`) and, in a line, `{pct_of_net:25}`: 25% of that
+line's net, rounded to the cent, in Belgian notation (`4.312,50`). Any other
+text between braces is an error.
 
 Real Yuki contacts often have an empty `Code`, so match on name, address and VAT
 number. `yuki contacts search <name>` shows each contact's HID, city and VAT
