@@ -201,6 +201,30 @@ fn parses_contacts() {
     assert!(!contacts[1].is_supplier);
 }
 
+/// The fields an invoice template needs; a real contact's `Code` is often empty.
+#[test]
+fn parses_contact_code_hid_city_and_vat_number() {
+    let xml = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>
+<SearchContactsResponse xmlns="http://www.theyukicompany.com/"><SearchContactsResult><Contacts xmlns="">
+  <Contact ID="c-1"><HID>42</HID><Code /><Name>Example &amp; Co BV</Name><Type>Customer</Type>
+    <City>Gent</City><Country>BE</Country><VATNumber>BE0123456789</VATNumber>
+    <IsSupplier>false</IsSupplier><IsCustomer>true</IsCustomer></Contact>
+  <Contact ID="c-2"><HID>43</HID><Code>C0043</Code><Name>Other</Name></Contact>
+</Contacts></SearchContactsResult></SearchContactsResponse></soap:Body></soap:Envelope>"#;
+    let contacts = parse_contacts(xml).unwrap();
+    assert_eq!(contacts.len(), 2);
+    let c = &contacts[0];
+    assert_eq!(
+        (c.hid.as_str(), c.code.as_str(), c.name.as_str()),
+        ("42", "", "Example & Co BV")
+    );
+    assert_eq!(
+        (c.city.as_str(), c.vat_number.as_str()),
+        ("Gent", "BE0123456789")
+    );
+    assert_eq!(contacts[1].code, "C0043");
+}
+
 #[test]
 fn parses_cost_categories() {
     let xml = r#"<?xml version="1.0" encoding="utf-8"?>

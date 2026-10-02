@@ -99,15 +99,23 @@ pub fn generate() -> Value {
             },
             {
                 "name": "contacts search",
-                "description": "Search contacts by name or other criteria.",
+                "description": "Search contacts, active or not, by any field (default) or by the one --by names.",
                 "mutating": false,
                 "args": [
-                    {"name": "query", "type": "string", "required": true, "description": "Search query."}
+                    {"name": "query", "type": "string", "required": true, "description": "Search value."},
+                    {"name": "--by", "type": "string", "required": false, "enum": crate::client::contact::SEARCH_OPTIONS, "default": "All", "description": "Field to search (case-insensitive)."}
                 ],
                 "output_fields": [
-                    {"name": "id", "type": "string"},
-                    {"name": "name", "type": "string"},
-                    {"name": "type", "type": "string"}
+                    {"name": "ID", "type": "string"},
+                    {"name": "HID", "type": "string"},
+                    {"name": "Code", "type": "string"},
+                    {"name": "Name", "type": "string"},
+                    {"name": "Type", "type": "string"},
+                    {"name": "City", "type": "string"},
+                    {"name": "Country", "type": "string"},
+                    {"name": "VAT Number", "type": "string"},
+                    {"name": "Supplier", "type": "string"},
+                    {"name": "Customer", "type": "string"}
                 ]
             },
             {

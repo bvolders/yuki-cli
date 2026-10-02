@@ -1,9 +1,13 @@
-use crate::client::contact::{Contact, ContactClient};
+use crate::client::contact::{Contact, ContactClient, SEARCH_OPTIONS};
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::output::{
     ListOptions, OutputFormat, apply_pagination, format_json, format_table, is_tty, select_fields,
 };
+
+fn yes_no(value: bool) -> String {
+    if value { "Yes" } else { "No" }.to_string()
+}
 
 fn contacts_to_rows(contacts: &[Contact]) -> Vec<Vec<String>> {
     contacts
@@ -14,33 +18,69 @@ fn contacts_to_rows(contacts: &[Contact]) -> Vec<Vec<String>> {
                 c.name.clone(),
                 c.contact_type.clone(),
                 c.country.clone(),
-                if c.is_supplier { "Yes" } else { "No" }.to_string(),
-                if c.is_customer { "Yes" } else { "No" }.to_string(),
+                yes_no(c.is_supplier),
+                yes_no(c.is_customer),
             ]
         })
         .collect()
 }
 
+/// Search contacts by `by` (one of Yuki's search options, any casing).
+///
+/// Shows the fields an invoice template takes: code (often empty in Yuki),
+/// HID, city and VAT number next to name and country.
 pub async fn search(
     config: &Config,
     admin: Option<&str>,
     query: &str,
+    by: &str,
     format: Option<&str>,
 ) -> Result<(), YukiError> {
+    let option = SEARCH_OPTIONS
+        .iter()
+        .find(|o| o.eq_ignore_ascii_case(by))
+        .ok_or_else(|| {
+            YukiError::Config(format!(
+                "unknown search field: {by} (expected one of: {})",
+                SEARCH_OPTIONS.join(", ")
+            ))
+        })?;
     let target = config.target(admin)?;
     let mut client = ContactClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
-    let contacts = client.search_contacts(query).await?;
+    let contacts = client.search_contacts(option, query).await?;
 
-    let headers = vec![
-        "ID".into(),
-        "Name".into(),
-        "Type".into(),
-        "Country".into(),
-        "Supplier".into(),
-        "Customer".into(),
-    ];
-    let rows = contacts_to_rows(&contacts);
+    let headers: Vec<String> = [
+        "ID",
+        "HID",
+        "Code",
+        "Name",
+        "Type",
+        "City",
+        "Country",
+        "VAT Number",
+        "Supplier",
+        "Customer",
+    ]
+    .map(String::from)
+    .to_vec();
+    let rows: Vec<Vec<String>> = contacts
+        .iter()
+        .map(|c| {
+            vec![
+                c.id.clone(),
+                c.hid.clone(),
+                c.code.clone(),
+                c.name.clone(),
+                c.contact_type.clone(),
+                c.city.clone(),
+                c.country.clone(),
+                c.vat_number.clone(),
+                yes_no(c.is_supplier),
+                yes_no(c.is_customer),
+            ]
+        })
+        .collect();
 
     let fmt = OutputFormat::from_flag(format, is_tty());
     match fmt {

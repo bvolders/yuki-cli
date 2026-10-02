@@ -526,10 +526,20 @@ pub enum DocumentCommands {
 
 #[derive(Subcommand)]
 pub enum ContactCommands {
-    /// Search contacts by name or other criteria.
+    /// Search contacts, active or not, by any field or by one (--by).
     Search {
-        /// Search query.
+        /// Search value.
         query: String,
+
+        /// Field to search: All (default) or one of Yuki's search options,
+        /// e.g. Name, City, VATNumber, Code, HID. Case-insensitive.
+        #[arg(
+            long,
+            default_value = "All",
+            ignore_case = true,
+            value_parser = PossibleValuesParser::new(crate::client::contact::SEARCH_OPTIONS),
+        )]
+        by: String,
     },
 
     /// List contacts filtered by type.

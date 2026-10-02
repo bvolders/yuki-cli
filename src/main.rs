@@ -264,8 +264,8 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
             let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
-                ContactCommands::Search { query } => {
-                    yuki_cli::cli::contacts::search(&config, admin, &query, format).await?;
+                ContactCommands::Search { query, by } => {
+                    yuki_cli::cli::contacts::search(&config, admin, &query, &by, format).await?;
                 }
                 ContactCommands::List {
                     contact_type,

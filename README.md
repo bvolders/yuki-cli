@@ -168,7 +168,8 @@ yuki invoices show <transaction-id> --account 400000 --period 2025-Q1  # One tra
 yuki invoices document <transaction-id>   # Document linked to a transaction
 yuki sales items                          # Sales item catalogue (products/services)
 
-yuki contacts search "Hetzner"            # Search contacts
+yuki contacts search "Hetzner"            # Search contacts on every field
+yuki contacts search BE0123456789 --by VATNumber  # One field: Name, City, Code, HID, ...
 yuki contacts list                        # List all suppliers and customers
 
 yuki accounts balance --account 11001 --period 2025-Q1  # Balance on 2025-03-31 (or today, if earlier)

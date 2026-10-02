@@ -8,12 +8,14 @@ use super::{ElementText, local_name, service_url};
 
 const YUKI_NS: &str = "http://www.theyukicompany.com/";
 const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 /// Builder for SOAP XML request envelopes.
 pub struct SoapEnvelope {
     operation: String,
     session_id: Option<String>,
-    params: Vec<(String, String)>,
+    /// Name and value of each parameter; `None` is an explicit `xsi:nil`.
+    params: Vec<(String, Option<String>)>,
 }
 
 impl SoapEnvelope {
@@ -31,7 +33,16 @@ impl SoapEnvelope {
     }
 
     pub fn param(mut self, name: &str, value: &str) -> Self {
-        self.params.push((name.to_string(), value.to_string()));
+        self.params
+            .push((name.to_string(), Some(value.to_string())));
+        self
+    }
+
+    /// Add a nillable parameter sent as `xsi:nil="true"`: for elements the
+    /// schema requires (`minOccurs="1"`) but that may carry no value, such as
+    /// `modifiedAfter` of `SearchContacts`.
+    pub fn nil_param(mut self, name: &str) -> Self {
+        self.params.push((name.to_string(), None));
         self
     }
 
@@ -40,7 +51,7 @@ impl SoapEnvelope {
     /// `ProcessSalesInvoices`, which take a document rather than text. The
     /// caller guarantees the fragment is well-formed and escaped inside.
     pub fn param_xml(mut self, name: &str, xml: &str) -> Self {
-        self.params.push((name.to_string(), xml.to_string()));
+        self.params.push((name.to_string(), Some(xml.to_string())));
         self
     }
 
@@ -52,7 +63,14 @@ impl SoapEnvelope {
         }
 
         for (name, value) in &self.params {
-            body.push_str(&format!("      <yuki:{name}>{value}</yuki:{name}>\n"));
+            match value {
+                Some(value) => {
+                    body.push_str(&format!("      <yuki:{name}>{value}</yuki:{name}>\n"));
+                }
+                None => body.push_str(&format!(
+                    "      <yuki:{name} xsi:nil=\"true\" xmlns:xsi=\"{XSI_NS}\" />\n"
+                )),
+            }
         }
 
         format!(
