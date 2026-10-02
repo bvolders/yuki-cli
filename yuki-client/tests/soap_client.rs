@@ -17,6 +17,49 @@ fn builds_soap_envelope_with_session() {
 }
 
 #[test]
+fn param_values_are_escaped_and_survive_a_parse() {
+    let name = r#"Tom & Jerry <x> "q" 'a'.pdf"#;
+    let envelope = SoapEnvelope::new("UploadDocument")
+        .session("s-1")
+        .param("fileName", name)
+        .param("folder", "7")
+        .build();
+    assert!(
+        envelope.contains("Tom &amp; Jerry &lt;x&gt; &quot;q&quot; &apos;a&apos;.pdf"),
+        "{envelope}"
+    );
+    // A real XML parser reads the envelope and gets the name back unchanged.
+    assert_eq!(
+        SoapClient::parse_single_result(&envelope, "fileName").unwrap(),
+        name
+    );
+    assert_eq!(
+        SoapClient::parse_single_result(&envelope, "folder").unwrap(),
+        "7"
+    );
+}
+
+#[test]
+fn param_xml_inserts_a_well_formed_child_as_is() {
+    let envelope = SoapEnvelope::new("ProcessSalesInvoices")
+        .param_xml(
+            "xmlDoc",
+            "<SalesInvoices><Reference>A&amp;B</Reference></SalesInvoices>",
+        )
+        .build();
+    assert!(
+        envelope.contains(
+            "<yuki:xmlDoc><SalesInvoices><Reference>A&amp;B</Reference></SalesInvoices></yuki:xmlDoc>"
+        ),
+        "{envelope}"
+    );
+    assert_eq!(
+        SoapClient::parse_single_result(&envelope, "Reference").unwrap(),
+        "A&B"
+    );
+}
+
+#[test]
 fn builds_soap_envelope_without_session() {
     let envelope = SoapEnvelope::new("Authenticate")
         .param("accessKey", "my-api-key")

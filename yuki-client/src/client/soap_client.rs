@@ -30,8 +30,18 @@ impl SoapEnvelope {
         self
     }
 
+    /// Add a text parameter. `value` is XML-escaped, so a file name such as
+    /// `Tom & Jerry <x>.pdf` reaches Yuki unchanged.
     pub fn param(mut self, name: &str, value: &str) -> Self {
-        self.params.push((name.to_string(), value.to_string()));
+        self.params.push((name.to_string(), escape_xml(value)));
+        self
+    }
+
+    /// Add a parameter whose content is inserted as is, for operations that
+    /// take an XML document as a child element. The caller guarantees that
+    /// `xml` is well-formed XML; nothing is escaped.
+    pub fn param_xml(mut self, name: &str, xml: &str) -> Self {
+        self.params.push((name.to_string(), xml.to_string()));
         self
     }
 
@@ -39,6 +49,7 @@ impl SoapEnvelope {
         let mut body = String::new();
 
         if let Some(sid) = &self.session_id {
+            let sid = escape_xml(sid);
             body.push_str(&format!("      <yuki:sessionID>{sid}</yuki:sessionID>\n"));
         }
 
@@ -60,6 +71,25 @@ impl SoapEnvelope {
     }
 }
 
+/// Escape the five XML special characters for use in element text.
+fn escape_xml(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// How long one SOAP request may take before it is abandoned.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// HTTP transport client for the Yuki SOAP API.
 pub struct SoapClient {
     http: Client,
@@ -70,8 +100,13 @@ pub struct SoapClient {
 impl SoapClient {
     /// Create a transport with its own default HTTP client. Convenient for
     /// short-lived consumers such as the CLI, where each invocation is fresh.
+    /// Requests time out after [`REQUEST_TIMEOUT`].
     pub fn new(base_url: &str) -> Self {
-        Self::with_client(base_url, Client::new())
+        let http = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self::with_client(base_url, http)
     }
 
     /// Create a transport over a caller-provided HTTP client. Long-running
