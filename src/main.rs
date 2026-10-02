@@ -548,9 +548,80 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
         }
 
         Commands::Upload { command } => {
-            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
+                UploadCommands::Dir {
+                    path,
+                    folder,
+                    exclude,
+                    max,
+                    dry_run,
+                    seed_from_yuki,
+                    seed_folder,
+                } => {
+                    use yuki_cli::cli::upload_dir::{Confirm, DirOptions, Outcome};
+                    let confirm = if cli.yes {
+                        Confirm::Yes
+                    } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                        Confirm::Prompt
+                    } else {
+                        Confirm::Refuse
+                    };
+                    let options = DirOptions {
+                        path: &path,
+                        folder: &folder,
+                        excludes: &exclude,
+                        max,
+                        dry_run,
+                        seed: seed_from_yuki,
+                        seed_folders: &seed_folder,
+                    };
+                    match yuki_cli::cli::upload_dir::dir(
+                        load, admin, options, confirm, format, cli.quiet,
+                    )
+                    .await?
+                    {
+                        Outcome::Done | Outcome::Aborted => {}
+                        Outcome::NeedsConfirmation(message) => {
+                            return Err(AppError::ConfirmationRequired(message));
+                        }
+                        Outcome::Failed { failed, attempted } => {
+                            return Err(AppError::Other(anyhow::anyhow!(
+                                "{failed} of {attempted} uploads failed; they are recorded as failed in {} and retried on the next run",
+                                yuki_cli::sync::STATE_FILE
+                            )));
+                        }
+                    }
+                }
+                UploadCommands::Mark {
+                    file,
+                    doc_id,
+                    skip,
+                    forget,
+                    folder,
+                    note,
+                    dir,
+                    force,
+                } => {
+                    use yuki_cli::cli::upload_dir::{Mark, MarkOptions};
+                    let mark = match (doc_id.as_deref(), skip, forget) {
+                        (Some(id), _, _) => Mark::Document(id),
+                        (None, true, _) => Mark::Skip,
+                        _ => Mark::Forget,
+                    };
+                    yuki_cli::cli::upload_dir::mark(
+                        MarkOptions {
+                            file: &file,
+                            mark,
+                            folder: folder.as_deref(),
+                            note: note.as_deref(),
+                            dir: dir.as_deref(),
+                            force,
+                        },
+                        format,
+                        cli.quiet,
+                    )?;
+                }
                 UploadCommands::File {
                     file,
                     folder,
@@ -567,6 +638,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             "upload file is a mutating operation; pass --yes to confirm in non-interactive mode".into(),
                         ));
                     }
+                    let config = load()?;
                     let options = yuki_cli::cli::upload::UploadOptions {
                         folder: &folder,
                         amount,
@@ -580,9 +652,11 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         .await?;
                 }
                 UploadCommands::Categories => {
+                    let config = load()?;
                     yuki_cli::cli::upload::categories(&config, admin, format).await?;
                 }
                 UploadCommands::PaymentMethods => {
+                    let config = load()?;
                     yuki_cli::cli::upload::payment_methods(&config, admin, format).await?;
                 }
             }

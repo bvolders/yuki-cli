@@ -241,6 +241,39 @@ yuki upload categories                                  # List cost category IDs
 yuki upload payment-methods                             # List payment method IDs
 ```
 
+#### A folder of receipts, uploaded once
+
+`upload dir` uploads the pdf, jpg, jpeg and png files under a directory that
+are not in Yuki yet. It records every file in `<dir>/.yuki-sync.json`, keyed by
+the file's sha256, so a file is never uploaded twice, even after a rename or a
+move. Dotfiles, dot-directories and `_to_delete` are always skipped.
+
+```sh
+yuki upload dir ~/Receipts --dry-run                    # The plan: no API calls, nothing written
+yuki upload dir ~/Receipts --seed-from-yuki             # Record files Yuki already has (by file name)
+yuki upload mark <file> --doc-id <id>                   # Record one file by hand
+yuki upload mark <file> --skip                          # Never upload this file
+yuki upload dir ~/Receipts                              # Show the plan, ask, then upload
+yuki upload dir ~/Receipts --yes --max 10 \
+  --exclude "2025/*"                                     # Unattended, at most 10 files
+```
+
+It prints the plan first and asks before uploading; without a terminal it
+needs `--yes`. Files go up one at a time, each recorded as soon as Yuki
+returns its document ID, so an interrupted run loses nothing. A file that
+fails is recorded as `failed` and retried on the next run; an authentication
+error stops the run. The exit code is 1 when any upload failed. `--max`
+(default 25) caps the uploads of one run.
+
+Seeding matches by file name only, because Yuki reports no size or hash for a
+document: a different file uploaded under the same name is recorded as in
+Yuki, and a copy uploaded under another name is not found. Seeding lists the
+matches it recorded, names shared by several Yuki documents (`ambiguous`), and
+near matches by reference or by date and vendor (`possible-match`), which it
+never records; check those and use `upload mark`. `upload mark <file> --forget`
+undoes a record. The state file is versioned, and a state file that does not
+parse is refused rather than overwritten.
+
 ### Global flags
 
 | Flag | Description |

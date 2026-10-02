@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **upload**: `upload dir <path>` uploads the receipts in a directory that are not in Yuki yet, once each. State is kept in `<path>/.yuki-sync.json`, keyed by content hash, written atomically after every upload. It prints a plan and asks first (`--yes` for unattended runs, `--dry-run` for the plan alone), caps a run with `--max` (default 25), skips `_to_delete`, dotfiles and `--exclude` globs, and retries failed files on the next run. `--seed-from-yuki` records files whose name matches a Yuki document; `upload mark <file> --doc-id <id>|--skip|--forget` records one by hand.
+
 ### Breaking Changes
 
 - **accounts**: `accounts balance` now reports the balance at the end of `--period` (or today, if the period is still running) instead of at its start, and adds an `As Of` column with that date. Scripts reading the old start-of-period figure, or indexing columns, must adjust.
