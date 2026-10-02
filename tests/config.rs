@@ -865,3 +865,34 @@ fn a_rediscovered_administration_takes_the_endpoint_it_was_found_on() {
         (None, Some("https://api.yukiworks.example/ws"))
     );
 }
+
+#[test]
+fn a_seller_round_trips_without_writing_its_unset_fields() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = config_with(
+        "test-key",
+        "my_company",
+        [("my_company", AdminEntry::new("uuid-123", "admin-123"))],
+    );
+    config.seller = Some(
+        toml::from_str(
+            "name = \"F\"\naddress = \"A\"\nzipcode = \"1\"\ncity = \"C\"\ncountry = \"BE\"\n\
+             phone = \"0\"\nenterprise_number = \"E\"\nvat_number = \"V\"\niban = \"I\"\n\
+             bic = \"B\"\n",
+        )
+        .unwrap(),
+    );
+    config.save_to(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("[seller]") && text.contains("bic = \"B\""),
+        "{text}"
+    );
+    assert!(
+        !text.contains("rpr =") && !text.contains("legal_form"),
+        "{text}"
+    );
+    let loaded = Config::load_from(&path).unwrap();
+    assert_eq!(loaded.seller, config.seller);
+}
