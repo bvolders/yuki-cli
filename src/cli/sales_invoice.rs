@@ -18,9 +18,10 @@ use serde::Deserialize;
 
 use crate::cli::invoice_ledger::InvoiceLedger;
 use crate::cli::invoice_number::{NumberRequest, dutch_date, structured_reference};
+use crate::client::escape_text;
 use crate::client::sales::{SalesClient, SalesInvoicesImport};
 use crate::config::Config;
-use crate::error::YukiError;
+use crate::error::{Delivery, YukiError};
 use crate::money::{Cents, div_round, format_scaled, parse_scaled};
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
 use crate::period::{date_from_epoch_days, epoch_days, today};
@@ -753,22 +754,6 @@ fn bool_text(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
-/// Escape text for an XML element.
-pub fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            ch => out.push(ch),
-        }
-    }
-    out
-}
-
 /// An indented XML writer for the few element shapes the document needs.
 #[derive(Default)]
 struct XmlWriter {
@@ -795,7 +780,7 @@ impl XmlWriter {
 
     fn leaf(&mut self, name: &str, value: &str) {
         self.indent();
-        let _ = writeln!(self.out, "<{name}>{}</{name}>", escape(value));
+        let _ = writeln!(self.out, "<{name}>{}</{name}>", escape_text(value));
     }
 
     fn opt(&mut self, name: &str, value: &Option<String>) {
@@ -1319,14 +1304,11 @@ pub async fn submit(
     let import = client
         .process_sales_invoices(target.admin_id, &invoice.to_xml())
         .await
-        .map_err(|e| {
-            if may_have_been_created(&e) {
-                SubmitError::OutcomeUnknown(format!(
-                    "{e}: the invoice may already have been created in Yuki — check 'To be sent'/'Sales' before retrying"
-                ))
-            } else {
-                SubmitError::Yuki(e)
-            }
+        .map_err(|e| match e.delivery() {
+            Delivery::Unknown => SubmitError::OutcomeUnknown(format!(
+                "{e}: the invoice may already have been created in Yuki — check 'To be sent'/'Sales' before retrying"
+            )),
+            Delivery::NotSent | Delivery::Refused => SubmitError::Yuki(e),
         })?;
 
     if !quiet {
@@ -1387,27 +1369,17 @@ pub async fn submit_numbered(
 /// Why [`submit`] failed.
 #[derive(Debug)]
 pub enum SubmitError {
-    /// Nothing reached Yuki, or Yuki refused it outright.
+    /// Nothing reached Yuki, or Yuki refused it unprocessed
+    /// ([`Delivery::NotSent`], [`Delivery::Refused`]).
     Yuki(YukiError),
-    /// The request went out but no usable answer came back.
+    /// The request may have been processed, without an answer saying how
+    /// ([`Delivery::Unknown`]): a timeout, a dropped connection, a fault.
     OutcomeUnknown(String),
 }
 
 impl From<YukiError> for SubmitError {
     fn from(e: YukiError) -> Self {
         Self::Yuki(e)
-    }
-}
-
-/// Whether a failed `ProcessSalesInvoices` may still have created the
-/// invoice: the request may have reached Yuki (anything but a failure to
-/// connect) and no SOAP answer said otherwise.
-fn may_have_been_created(error: &YukiError) -> bool {
-    match error {
-        YukiError::Request(e) => !e.is_connect() && !e.is_builder(),
-        YukiError::Http { status, .. } => *status >= 500,
-        YukiError::Xml(_) => true,
-        _ => false,
     }
 }
 

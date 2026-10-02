@@ -108,6 +108,13 @@ pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// How long one SOAP request may take in total, unless the call says otherwise.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long sending `payload` may take: [`REQUEST_TIMEOUT`] plus 30 seconds
+/// per megabyte, at most 10 minutes. For requests that carry a file.
+pub fn payload_timeout(payload: &str) -> std::time::Duration {
+    let mb = payload.len() as u64 / 1_000_000;
+    std::time::Duration::from_secs((REQUEST_TIMEOUT.as_secs() + 30 * mb).min(600))
+}
+
 /// Requests sent by every transport in this process, counted by [`SoapClient::calls`].
 fn process_calls() -> Arc<AtomicUsize> {
     static CALLS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();

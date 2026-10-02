@@ -3,7 +3,7 @@ use quick_xml::events::Event;
 
 use crate::error::YukiError;
 
-use super::soap_client::{SoapClient, SoapEnvelope};
+use super::soap_client::{SoapClient, SoapEnvelope, payload_timeout};
 use super::{ElementText, Region, local_name, service_url};
 
 const SERVICE: &str = "Sales.asmx";
@@ -139,7 +139,12 @@ impl SalesClient {
     ) -> Result<SalesInvoicesImport, YukiError> {
         let session = self.require_session()?;
         let envelope = Self::process_sales_invoices_envelope(session, administration_id, xml_doc);
-        let body = self.soap.call("ProcessSalesInvoices", envelope).await?;
+        // The document may carry a PDF: allow for its size, like an upload.
+        let timeout = Some(payload_timeout(xml_doc));
+        let body = self
+            .soap
+            .call_with_timeout("ProcessSalesInvoices", envelope, timeout)
+            .await?;
         Self::parse_process_sales_invoices(&body)
     }
 

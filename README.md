@@ -381,9 +381,12 @@ year, then the sequence padded to six digits, for a `<year>-<seq>` number
 zeros. `CC` is the base modulo 97, or 97 when that is 0: `2026-20` gives
 `+++202/6000/02014+++`.
 
-If the request goes out but no answer comes back (a timeout or a dropped
-connection), the command exits 1 with kind `outcome_unknown`: the invoice may
-already exist, so check "To be sent" or Sales in Yuki before running it again.
+If the request goes out but no usable answer comes back (a timeout, a dropped
+connection, a SOAP fault or a server error), the command exits 1 with kind
+`outcome_unknown`: the invoice may already exist, so check "To be sent" or Sales
+in Yuki before running it again. Only a request that never left, or that Yuki
+refused unprocessed (HTTP 401, 403 or 429), frees its number. The request may
+take 60 seconds plus 30 per megabyte of PDF.
 
 Recurring invoices are templates you run yourself: one file per customer in
 `~/.config/yuki/invoices/<name>.toml`, created each month with `--template`

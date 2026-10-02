@@ -337,6 +337,15 @@ mod envelope_tests {
     }
 
     #[test]
+    fn a_search_value_is_escaped_once() {
+        let xml = search_envelope("sess", "dom", "All", "Smith & <Jones>", 1);
+        assert!(
+            xml.contains("<yuki:searchValue>Smith &amp; &lt;Jones&gt;</yuki:searchValue>"),
+            "{xml}"
+        );
+    }
+
+    #[test]
     fn sends_the_requested_page_number() {
         // Regression: pageNumber was never sent, so only the first 100 contacts
         // were ever returned and larger address books were silently truncated.

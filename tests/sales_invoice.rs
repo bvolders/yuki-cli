@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{RequestLog, actions, bodies, json, response, stderr, yuki};
+use common::{RequestLog, actions, bodies, fault, json, response, stderr, yuki};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -755,6 +755,33 @@ fn a_clean_rejection_frees_the_number() {
     );
     let json = json(&prepare);
     assert_eq!(json["number"], "2026-20");
+}
+
+/// A mock whose ProcessSalesInvoices fails with `status` and `reply`.
+fn failing(status: u16, reply: String) -> (String, RequestLog) {
+    common::mock(move |r| match r.action.as_str() {
+        "Authenticate" => (200, response("Authenticate", "session-1")),
+        "ProcessSalesInvoices" => (status, reply.clone()),
+        "DocumentsInFolder" => (200, response("DocumentsInFolder", SALES_ARCHIVE)),
+        other => (200, response(other, "")),
+    })
+}
+
+#[test]
+fn whether_the_call_may_have_been_processed_decides_the_number() {
+    // A SOAP fault may come after processing: the number stays pending.
+    let (root, _log) = failing(500, fault("Server was unable to process request."));
+    let faulted = home(&root);
+    let err = stderr(&book_number(&faulted, "2026-20"));
+    assert!(err.contains("\"kind\":\"outcome_unknown\""), "{err}");
+    assert_eq!(ledger_rows(&faulted)[0]["Status"], "pending");
+
+    // HTTP 401 is refused unprocessed: the number is free again.
+    let (root, _log) = failing(401, "Unauthorized".into());
+    let refused = home(&root);
+    let err = stderr(&book_number(&refused, "2026-20"));
+    assert!(err.contains("\"kind\":\"auth_failed\""), "{err}");
+    assert_eq!(ledger_rows(&refused)[0]["Status"], "rejected");
 }
 
 #[test]

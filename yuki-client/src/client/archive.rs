@@ -3,7 +3,7 @@ use quick_xml::events::Event;
 
 use crate::error::YukiError;
 
-use super::soap_client::{SoapClient, SoapEnvelope};
+use super::soap_client::{SoapClient, SoapEnvelope, payload_timeout};
 use super::{ElementText, Region, local_name, service_url};
 
 const SERVICE: &str = "Archive.asmx";
@@ -321,7 +321,7 @@ impl ArchiveClient {
             .call_with_timeout(
                 "UploadDocument",
                 envelope,
-                Some(upload_timeout(data_base64)),
+                Some(payload_timeout(data_base64)),
             )
             .await?;
         SoapClient::parse_single_result(&body, "UploadDocumentResult")
@@ -359,7 +359,14 @@ impl ArchiveClient {
             .param("project", project.unwrap_or(""))
             .param("remarks", remarks.unwrap_or(""))
             .build();
-        let body = self.soap.call("UploadDocumentWithData", envelope).await?;
+        let body = self
+            .soap
+            .call_with_timeout(
+                "UploadDocumentWithData",
+                envelope,
+                Some(payload_timeout(data_base64)),
+            )
+            .await?;
         SoapClient::parse_single_result(&body, "UploadDocumentWithDataResult")
     }
 
@@ -610,13 +617,6 @@ impl Default for ArchiveClient {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// The time an upload of `data_base64` may take: 60 seconds plus 30 per
-/// megabyte, at most 10 minutes.
-fn upload_timeout(data_base64: &str) -> std::time::Duration {
-    let mb = data_base64.len() as u64 / 1_000_000;
-    std::time::Duration::from_secs((60 + 30 * mb).min(600))
 }
 
 /// How many records to request next, or `None` when the caller's limit is satisfied.

@@ -153,3 +153,18 @@ fn parses_outstanding_debtor_items() {
     assert_eq!(items[0].amount, "1000.00");
     assert_eq!(items[0].open_amount, "500.00");
 }
+
+#[test]
+fn a_payload_buys_time_up_to_ten_minutes() {
+    use std::time::Duration;
+    use yuki_client::client::soap_client::{REQUEST_TIMEOUT, payload_timeout};
+    assert_eq!(payload_timeout(""), REQUEST_TIMEOUT);
+    assert_eq!(
+        payload_timeout(&"a".repeat(4_000_000)),
+        Duration::from_secs(180)
+    );
+    assert_eq!(
+        payload_timeout(&"a".repeat(100_000_000)),
+        Duration::from_secs(600)
+    );
+}
