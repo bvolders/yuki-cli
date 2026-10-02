@@ -26,6 +26,8 @@ enum AppError {
     OutcomeUnknown(String),
     /// Yuki booked an invoice under another reference than the number sent.
     ReferenceMismatch(String),
+    /// Yuki booked an invoice but did not email it as asked.
+    SendIncomplete(String),
 }
 
 impl fmt::Display for AppError {
@@ -37,7 +39,8 @@ impl fmt::Display for AppError {
             | Self::InvoiceRejected(message)
             | Self::InvalidInput(message)
             | Self::OutcomeUnknown(message)
-            | Self::ReferenceMismatch(message) => {
+            | Self::ReferenceMismatch(message)
+            | Self::SendIncomplete(message) => {
                 write!(f, "{message}")
             }
         }
@@ -65,7 +68,8 @@ impl AppError {
             | Self::InvoiceRejected(_)
             | Self::InvalidInput(_)
             | Self::OutcomeUnknown(_)
-            | Self::ReferenceMismatch(_) => 1,
+            | Self::ReferenceMismatch(_)
+            | Self::SendIncomplete(_) => 1,
         }
     }
 
@@ -84,6 +88,7 @@ impl AppError {
             Self::InvalidInput(_) => "invalid_input",
             Self::OutcomeUnknown(_) => "outcome_unknown",
             Self::ReferenceMismatch(_) => "reference_mismatch",
+            Self::SendIncomplete(_) => "send_incomplete",
         }
     }
 }
@@ -589,6 +594,9 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             }
                             sales_invoice::Verdict::ReferenceMismatch(message) => {
                                 return Err(AppError::ReferenceMismatch(message));
+                            }
+                            sales_invoice::Verdict::SendIncomplete(message) => {
+                                return Err(AppError::SendIncomplete(message));
                             }
                         }
                     }

@@ -322,9 +322,15 @@ for confirmation, which declines unless you answer `y`. `--yes` skips the prompt
 and is required when stdin or stderr is not a terminal. `--dry-run` prints the
 preview, then the exact `xmlDoc` on stdout, and makes no API call. The command
 exits 1 with kind `invoice_rejected` when Yuki fails or skips the invoice, or
-does not book it as `--send` asked, after printing Yuki's answer;
-`invalid_input` lists every problem in the file; `confirmation_required` means
-nothing was sent. Totals must be positive: credit notes are not supported.
+does not book it as `--send` asked, after printing Yuki's answer, and with
+`send_incomplete` when it booked the invoice but did not email it (the number
+is booked; send it from Yuki or yourself); `invalid_input` lists every problem
+in the file; `confirmation_required` means nothing was sent. Totals must be
+positive: credit notes are not supported.
+
+Yuki's answer says nothing about Peppol delivery. With `--send peppol` or
+`both`, the preview and the result's `Peppol` column say `requested (Yuki does
+not report delivery)`; check delivery in Yuki.
 
 #### Your own PDF with your own number
 

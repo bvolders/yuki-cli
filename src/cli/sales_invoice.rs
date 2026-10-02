@@ -388,6 +388,15 @@ impl Invoice {
         }
     }
 
+    /// What is known of Peppol delivery: only whether it was asked for.
+    pub fn peppol_label(&self) -> &'static str {
+        if self.send.is_some_and(SendMode::peppol) {
+            "requested (Yuki does not report delivery)"
+        } else {
+            "not requested"
+        }
+    }
+
     /// The number shown for the invoice: given, or Yuki's to assign.
     fn number_label(&self) -> String {
         match (&self.number, self.send) {
@@ -495,6 +504,9 @@ impl Invoice {
             ),
         };
         row("Mode", &mode);
+        if self.send.is_some_and(SendMode::peppol) {
+            row("Peppol", self.peppol_label());
+        }
         if self.send.is_some() {
             row(
                 "!!",
@@ -1639,6 +1651,11 @@ pub async fn submit_numbered(
         .map(|import| verdict(&import, invoice));
     let outcome = InvoiceLedger::open().and_then(|mut ledger| match &result {
         Ok(Verdict::Done) => ledger.commit(admin_id, number).map(|()| true),
+        // Booked under this number, only not sent as asked.
+        Ok(Verdict::SendIncomplete(message)) => ledger
+            .note(admin_id, number, message)
+            .and_then(|()| ledger.commit(admin_id, number))
+            .map(|()| true),
         Ok(Verdict::Rejected { freed: true, .. }) | Err(SubmitError::Yuki(_)) => {
             ledger.reject(admin_id, number).map(|()| true)
         }
@@ -1671,6 +1688,9 @@ pub enum Verdict {
     Rejected { message: String, freed: bool },
     /// Booked, but under another reference than the number sent.
     ReferenceMismatch(String),
+    /// Booked as asked, but not emailed. (Peppol delivery is not reported
+    /// back, so it is never known to be incomplete.)
+    SendIncomplete(String),
 }
 
 /// Judge Yuki's `import` of `invoice`.
@@ -1710,10 +1730,9 @@ pub fn verdict(import: &SalesInvoicesImport, invoice: &Invoice) -> Verdict {
             ));
         }
         if mode.email() && !booked.email_sent {
-            return Verdict::Rejected {
-                message: format!("Yuki booked invoice {name} but did not email it"),
-                freed: false,
-            };
+            return Verdict::SendIncomplete(format!(
+                "Yuki booked invoice {name} but did not email it: send it from Yuki (\"To be sent\") or yourself"
+            ));
         }
     }
     Verdict::Done
@@ -1745,11 +1764,13 @@ fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<
         "Reference",
         "Subject",
         "PDF",
+        "Peppol",
         "Message",
     ]
     .map(String::from)
     .to_vec();
     let pdf_name = invoice.document_file_name().unwrap_or_default();
+    let peppol = invoice.peppol_label();
     let rows: Vec<Vec<String>> = import
         .invoices
         .iter()
@@ -1761,6 +1782,7 @@ fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<
                 i.reference.clone(),
                 i.subject.clone(),
                 pdf_name.clone(),
+                peppol.to_string(),
                 i.message.clone(),
             ]
         })

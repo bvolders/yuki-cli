@@ -205,9 +205,9 @@ fn send_email_books_and_emails_the_invoice() {
 
 #[test]
 fn a_send_yuki_did_not_carry_out_fails_even_when_quiet() {
-    for (processed, email_sent, expected) in [
-        (false, false, "did not book it"),
-        (true, false, "did not email it"),
+    for (processed, email_sent, kind, expected) in [
+        (false, false, "invoice_rejected", "did not book it"),
+        (true, false, "send_incomplete", "did not email it"),
     ] {
         let (root, _log) = mock(import_response(true, processed, email_sent, "2026-0043"));
         let home = home(&root);
@@ -227,7 +227,7 @@ fn a_send_yuki_did_not_carry_out_fails_even_when_quiet() {
         );
         assert_eq!(output.status.code(), Some(1), "{expected}");
         let err = stderr(&output);
-        assert!(err.contains("\"kind\":\"invoice_rejected\""), "{err}");
+        assert!(err.contains(&format!("\"kind\":\"{kind}\"")), "{err}");
         assert!(err.contains(expected), "{err}");
     }
 }
@@ -1058,4 +1058,62 @@ fn a_booking_under_another_reference_is_loud_and_stays_pending() {
         note.contains("2026-99") && note.contains("2026-20"),
         "{note}"
     );
+}
+
+#[test]
+fn a_booked_invoice_that_was_not_emailed_is_booked_but_incomplete() {
+    let (root, _log) = mock(import_response(true, true, false, "2026-20"));
+    let home = home(&root);
+    let output = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "hosting",
+            "--number",
+            "2026-20",
+            "--send",
+            "email",
+            "--yes",
+            "--quiet",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("\"kind\":\"send_incomplete\""), "{err}");
+    let row = &ledger_rows(&home)[0];
+    assert_eq!(row["Status"], "booked");
+    assert!(row["Note"].as_str().unwrap().contains("did not email it"));
+}
+
+#[test]
+fn peppol_is_reported_as_requested_never_as_delivered() {
+    let (root, _log) = mock(import_response(true, true, false, "2026-20"));
+    let home = home(&root);
+    let output = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "hosting",
+            "--number",
+            "2026-20",
+            "--send",
+            "peppol",
+            "--yes",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        json(&output)["items"][0]["Peppol"],
+        "requested (Yuki does not report delivery)"
+    );
+    assert!(stderr(&output).contains("Peppol         requested (Yuki does not report delivery)"));
+    assert_eq!(ledger_rows(&home)[0]["Status"], "booked");
 }
