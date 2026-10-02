@@ -135,8 +135,6 @@ pub struct Overrides<'a> {
     pub price: Option<Cents>,
     pub date: Option<&'a str>,
     pub subject: Option<&'a str>,
-    /// A custom PDF, replacing the file's `pdf`.
-    pub pdf: Option<&'a Path>,
     /// `--number`: given here, or resolved later for `auto`.
     pub number: Option<&'a NumberRequest>,
     /// For `prepare`: no PDF is read (it does not exist yet), and a number
@@ -417,6 +415,8 @@ impl Invoice {
             "currency": self.currency.as_deref().unwrap_or("EUR"),
             "payment_method": self.payment_method,
             "notes": self.notes,
+            "remarks": self.remarks,
+            "layout": self.layout,
             "vat_mention": self.vat_mention,
             "customer": {
                 "code": c.code,
@@ -439,7 +439,9 @@ impl Invoice {
                 "net": l.net().to_string(),
                 "vat_percentage": format_scaled(l.vat_percentage, PCT_DECIMALS),
                 "vat_type": l.vat_type,
+                "vat_description": l.vat_description,
                 "gl_account": l.gl_account,
+                "product_code": l.product_code,
             })).collect::<Vec<_>>(),
             "totals": {
                 "net": self.net().to_string(),
@@ -859,36 +861,19 @@ pub fn load(
         };
         YukiError::Config(format!("{}: {e}{hint}", path.display()))
     })?;
-    let base = path.parent().unwrap_or(Path::new("."));
-    // A template is reused every month; a PDF belongs to one invoice.
-    let allow_pdf = matches!(source, Source::File(_));
-    parse_at(&text, &origin, base, allow_pdf, overrides, send)
+    parse(&text, &origin, overrides, send)
 }
 
-/// Parse and validate invoice TOML; `origin` names it in errors, and a
-/// relative `pdf` is read from the working directory.
+/// Parse and validate invoice TOML; `origin` names it in errors.
 pub fn parse(
     text: &str,
     origin: &str,
     overrides: &Overrides<'_>,
     send: Option<SendMode>,
 ) -> Result<Invoice, YukiError> {
-    parse_at(text, origin, Path::new("."), true, overrides, send)
-}
-
-/// [`parse`], with a relative `pdf` resolved against `base`, the directory
-/// of the invoice file.
-fn parse_at(
-    text: &str,
-    origin: &str,
-    base: &Path,
-    allow_pdf: bool,
-    overrides: &Overrides<'_>,
-    send: Option<SendMode>,
-) -> Result<Invoice, YukiError> {
     let spec: InvoiceSpec = toml::from_str(text)
         .map_err(|e| YukiError::Config(format!("invalid invoice {origin}: {e}")))?;
-    validate(spec, origin, base, allow_pdf, overrides, send).map_err(|problems| {
+    validate(spec, origin, overrides, send).map_err(|problems| {
         YukiError::Config(format!(
             "invalid invoice {origin}:\n  - {}",
             problems.join("\n  - ")
@@ -957,8 +942,6 @@ impl Problems {
 fn validate(
     spec: InvoiceSpec,
     origin: &str,
-    base: &Path,
-    allow_pdf: bool,
     overrides: &Overrides<'_>,
     send: Option<SendMode>,
 ) -> Result<Invoice, Vec<String>> {
@@ -1087,39 +1070,12 @@ fn validate(
         p.push("--send email needs contact.email for a contact without a code");
     }
 
-    // `prepare` runs before the PDF exists, so it reads none.
-    let file_pdf = p.text("pdf", spec.pdf).filter(|_| !overrides.preparing);
-    if file_pdf.is_some() && !allow_pdf {
-        p.push("a template can't carry a PDF; pass --pdf per invoice");
-    }
-    let pdf_path = match overrides.pdf.filter(|_| !overrides.preparing) {
-        Some(path) => Some(path.to_path_buf()),
-        None if allow_pdf => file_pdf.map(|pdf| base.join(pdf)),
-        None => None,
-    };
-    let pdf = pdf_path.and_then(|path| {
-        Pdf::read(&path)
-            .map_err(|e| p.push(format!("pdf: {e}")))
-            .ok()
-    });
-    if pdf.is_some() {
-        if send.is_none() {
-            p.push(
-                "Yuki only accepts a custom PDF on a booked invoice: add --send email|peppol|both (or --book)",
-            );
-        }
-        match overrides.number {
-            None => p.push("a custom PDF needs --number: the number printed on it"),
-            Some(NumberRequest::Auto) => p.push(
-                "with --pdf, give the number printed on it (from `sales invoice prepare`), not auto",
-            ),
-            Some(NumberRequest::Given(_)) => {}
-        }
-        if overrides.date.is_none() {
-            p.push(
-                "with --pdf, give --date: the date printed on it (from `sales invoice prepare`)",
-            );
-        }
+    // A custom PDF is bound to the prepared invoice it was rendered from;
+    // `prepare` runs before it exists and ignores the key.
+    if p.text("pdf", spec.pdf).is_some() && !overrides.preparing {
+        p.push(
+            "`pdf` in an invoice file is not sent: prepare the invoice with `sales invoice prepare --out <file.json>`, render the PDF from it, then `sales invoice create --prepared <file.json> --pdf <pdf>`",
+        );
     }
     if overrides.number.is_some() && send.is_none() && !overrides.preparing {
         p.push(
@@ -1145,7 +1101,7 @@ fn validate(
         remarks,
         notes,
         vat_mention,
-        pdf,
+        pdf: None,
         number,
         contact,
         lines,
@@ -1348,6 +1304,240 @@ fn validate_line(
 // ---------------------------------------------------------------------------
 // Confirmation and the API call.
 
+// ---------------------------------------------------------------------------
+// Prepared invoices: `prepare --out` and `create --prepared`.
+
+/// The content hash of a prepared invoice: the sha256 of its JSON written
+/// compactly, so reformatting the file does not change it but any edit does.
+pub fn content_hash(prepared: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let text = serde_json::to_string(prepared).expect("serialize prepared invoice");
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// The refusal when `[seller]` is missing from the config.
+pub fn seller_missing() -> YukiError {
+    YukiError::Config(format!(
+        "a prepared invoice prints the issuing firm: add a [seller] table to {}:\n\n{}",
+        Config::default_path().display(),
+        Seller::SNIPPET
+    ))
+}
+
+#[derive(Deserialize)]
+struct PreparedFile {
+    number: Option<String>,
+    admin_id: Option<String>,
+    subject: Option<String>,
+    date: PreparedDate,
+    due_date: Option<PreparedDate>,
+    currency: Option<String>,
+    payment_method: Option<String>,
+    notes: Option<String>,
+    remarks: Option<String>,
+    layout: Option<String>,
+    vat_mention: Option<String>,
+    customer: PreparedCustomer,
+    lines: Vec<PreparedLine>,
+}
+
+#[derive(Deserialize)]
+struct PreparedDate {
+    iso: String,
+}
+
+#[derive(Deserialize)]
+struct PreparedCustomer {
+    code: Option<String>,
+    name: Option<String>,
+    address: Option<String>,
+    address_2: Option<String>,
+    zipcode: Option<String>,
+    city: Option<String>,
+    country: Option<String>,
+    vat_number: Option<String>,
+    email: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PreparedLine {
+    description: String,
+    remarks: Option<String>,
+    unit: Option<String>,
+    qty: String,
+    unit_price: String,
+    vat_percentage: String,
+    vat_type: i64,
+    vat_description: Option<String>,
+    gl_account: Option<String>,
+    product_code: Option<String>,
+}
+
+impl Invoice {
+    /// What `prepare --out` writes: [`prepared_for`](Self::prepared_for) with
+    /// the administration the number is reserved in.
+    pub fn prepared_file(&self, seller: &Seller, admin_id: &str) -> serde_json::Value {
+        let mut json = self.prepared_for(Some(seller));
+        json["admin_id"] = admin_id.into();
+        json
+    }
+
+    /// The invoice a prepared file describes, to book as `send`: exactly its
+    /// number, dates, customer and lines. The file's own figures are not
+    /// trusted; its content hash, checked against the reservation, is.
+    pub fn from_prepared(
+        prepared: &serde_json::Value,
+        origin: &str,
+        send: SendMode,
+    ) -> Result<(Self, String), YukiError> {
+        let bad = |e: String| YukiError::Config(format!("{origin} is not a prepared invoice: {e}"));
+        let file: PreparedFile =
+            serde_json::from_value(prepared.clone()).map_err(|e| bad(e.to_string()))?;
+        let number = file
+            .number
+            .ok_or_else(|| bad("it has no number: run prepare with --number".into()))?;
+        let admin_id = file.admin_id.ok_or_else(|| {
+            bad("it names no administration: write it with `prepare --out`".into())
+        })?;
+        let kind = match file.customer.kind.as_deref() {
+            None => None,
+            Some("Company") => Some("Company"),
+            Some("Person") => Some("Person"),
+            Some(other) => return Err(bad(format!("unknown customer type {other}"))),
+        };
+        let lines = file
+            .lines
+            .into_iter()
+            .map(|l| {
+                Ok(Line {
+                    description: l.description,
+                    qty: parse_quantity(&l.qty)?,
+                    price: parse_price(&l.unit_price)?,
+                    vat_percentage: parse_scaled(&l.vat_percentage, PCT_DECIMALS)?,
+                    vat_type: l.vat_type,
+                    vat_description: l.vat_description,
+                    gl_account: l.gl_account,
+                    product_code: l.product_code,
+                    remarks: l.remarks,
+                    unit: l.unit,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(bad)?;
+        if lines.is_empty() {
+            return Err(bad("it has no lines".into()));
+        }
+        let due_date = file.due_date.map(|d| d.iso);
+        if due_date.is_none() {
+            return Err(bad(
+                "it has no due date, which a booked invoice needs: give due_days or due_date and prepare it again".into(),
+            ));
+        }
+        let c = file.customer;
+        let invoice = Self {
+            origin: origin.to_string(),
+            subject: file.subject,
+            date: parse_date(&file.date.iso).map_err(bad)?,
+            due_date,
+            layout: file.layout,
+            currency: file.currency,
+            payment_method: file.payment_method,
+            remarks: file.remarks,
+            notes: file.notes,
+            vat_mention: file.vat_mention,
+            pdf: None,
+            number: Some(number),
+            contact: Contact {
+                code: c.code,
+                name: c.name,
+                country: c.country,
+                address: c.address,
+                address_2: c.address_2,
+                zipcode: c.zipcode,
+                city: c.city,
+                vat_number: c.vat_number,
+                email: c.email,
+                kind,
+            },
+            lines,
+            send: Some(send),
+        };
+        if send.email() && invoice.contact.code.is_none() && invoice.contact.email.is_none() {
+            return Err(bad(
+                "--send email needs the customer's email for a contact without a code".into(),
+            ));
+        }
+        Ok((invoice, admin_id))
+    }
+
+    /// Attach the custom PDF read from `path`, which Yuki stores instead of
+    /// the invoice it would generate.
+    pub fn attach_pdf(&mut self, path: &Path) -> Result<(), YukiError> {
+        self.pdf = Some(Pdf::read(path).map_err(|e| YukiError::Config(format!("--pdf: {e}")))?);
+        Ok(())
+    }
+}
+
+/// Read a prepared invoice file: its JSON and content hash.
+pub fn read_prepared(path: &Path) -> Result<(serde_json::Value, String), YukiError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| YukiError::Config(format!("{}: {e}", path.display())))?;
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        YukiError::Config(format!("{} is not a prepared invoice: {e}", path.display()))
+    })?;
+    let hash = content_hash(&json);
+    Ok((json, hash))
+}
+
+/// `prepare --out`: reserve the invoice's number for exactly this content in
+/// administration `admin_id`, then write it to `out` (never over an
+/// existing file). Returns what was written.
+pub fn write_prepared(
+    invoice: &Invoice,
+    seller: &Seller,
+    admin_id: &str,
+    out: &Path,
+) -> Result<serde_json::Value, YukiError> {
+    let number = invoice
+        .number
+        .as_deref()
+        .ok_or_else(|| YukiError::Config("--out needs --number auto or a number".into()))?;
+    if invoice.due_date.is_none() {
+        return Err(YukiError::Config(
+            "a prepared invoice is booked, which needs a due date: give due_days or due_date"
+                .into(),
+        ));
+    }
+    if out.exists() {
+        return Err(YukiError::Config(format!(
+            "{} exists already; choose another --out (an older prepared invoice keeps its reservation until released)",
+            out.display()
+        )));
+    }
+    let json = invoice.prepared_file(seller, admin_id);
+    let hash = content_hash(&json);
+    InvoiceLedger::open()?.reserve_prepared(
+        &Claim {
+            admin: admin_id,
+            number,
+            date: &invoice.date,
+            customer: &invoice.contact.label(),
+            gross: &invoice.gross().to_string(),
+        },
+        &hash,
+    )?;
+    let mut text = serde_json::to_string_pretty(&json).expect("serialize prepared invoice");
+    text.push('\n');
+    if let Err(e) = crate::ledger::atomic_write(out, text.as_bytes()) {
+        // Nothing to send without the file: free the number again.
+        let _ = InvoiceLedger::open().and_then(|mut l| l.release(admin_id, number));
+        return Err(YukiError::Config(format!("{}: {e}", out.display())));
+    }
+    Ok(json)
+}
+
 /// Whether a confirmation prompt can be asked and answered.
 pub fn can_prompt() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
@@ -1411,14 +1601,17 @@ pub async fn submit(
     Ok(import)
 }
 
-/// [`submit`], with a number the CLI gave reserved in the ledger first and
-/// settled by Yuki's answer: booked when the invoice was booked as asked,
-/// rejected (the number free again) when Yuki refused it or nothing was
-/// sent, and left pending when the outcome is unknown or partial.
+/// [`submit`], with a number the CLI gave recorded as pending in the ledger
+/// first and settled by Yuki's answer: booked when the invoice was booked as
+/// asked, rejected (the number free again) when Yuki refused it or nothing
+/// was sent, and left pending when the outcome is unknown or partial. A
+/// prepared invoice (`prepared`: its content hash) moves its reservation to
+/// pending, refused unless the reservation is for exactly that content.
 pub async fn submit_numbered(
     config: &Config,
     admin: Option<&str>,
     invoice: &Invoice,
+    prepared: Option<&str>,
     format: Option<&str>,
     quiet: bool,
 ) -> Result<SalesInvoicesImport, SubmitError> {
@@ -1426,13 +1619,19 @@ pub async fn submit_numbered(
         return submit(config, admin, invoice, format, quiet).await;
     };
     let admin_id = config.target(admin)?.admin_id;
-    InvoiceLedger::open()?.reserve(&Claim {
-        admin: admin_id,
-        number,
-        date: &invoice.date,
-        customer: &invoice.contact.label(),
-        gross: &invoice.gross().to_string(),
-    })?;
+    let mut ledger = InvoiceLedger::open()?;
+    match prepared {
+        Some(hash) => ledger.send_reserved(admin_id, number, hash)?,
+        None => ledger.reserve(&Claim {
+            admin: admin_id,
+            number,
+            date: &invoice.date,
+            customer: &invoice.contact.label(),
+            gross: &invoice.gross().to_string(),
+        })?,
+    }
+    // The lock is not held while Yuki is called.
+    drop(ledger);
     let result = submit(config, admin, invoice, format, quiet).await;
     let settled = match &result {
         Ok(import) if import.failure().is_none() && unsent(import, invoice.send).is_none() => {

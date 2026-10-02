@@ -265,19 +265,20 @@ pub fn generate() -> Value {
             },
             {
                 "name": "sales invoice create",
-                "description": "Create a sales invoice in Yuki from a TOML file or a saved template: a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 with invalid_input for a bad file, confirmation_required when not confirmed, outcome_unknown when the request went out without a usable answer (check Yuki before retrying), and invoice_rejected when Yuki fails or skips the invoice or does not book or email what --send asked.",
+                "description": "Create a sales invoice in Yuki from a TOML file, a saved template, or a prepared invoice (--prepared, from prepare --out, booked exactly as prepared): a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 with invalid_input for a bad file, confirmation_required when not confirmed, outcome_unknown when the request went out without a usable answer (check Yuki before retrying), and invoice_rejected when Yuki fails or skips the invoice or does not book or email what --send asked.",
                 "mutating": true,
                 "args": [
-                    {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file or --template is required."},
+                    {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file, --template or --prepared is required."},
                     {"name": "--template", "type": "string", "required": false, "description": "Saved template name, read from ~/.config/yuki/invoices/<name>.toml."},
+                    {"name": "--prepared", "type": "path", "required": false, "description": "A prepared invoice from prepare --out, booked exactly: its number must still be reserved for this content. Excludes --qty, --price, --date, --subject and --number; needs --send or --book."},
                     {"name": "--qty", "type": "number", "required": false, "description": "Quantity of the invoice's only line, up to 4 decimals."},
                     {"name": "--price", "type": "number", "required": false, "description": "Unit price excluding VAT of the invoice's only line, up to 2 decimals."},
                     {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD. Default: the file's date, else today."},
                     {"name": "--subject", "type": "string", "required": false, "description": "Subject (title) of the invoice, replacing the file's."},
-                    {"name": "--pdf", "type": "path", "required": false, "description": "Custom invoice PDF (max 3 MB; not allowed in a template), stored in Yuki instead of the generated invoice; replaces the file's pdf."},
+                    {"name": "--pdf", "type": "path", "required": false, "description": "Custom invoice PDF (max 3 MB) rendered from the --prepared file, which it requires; stored in Yuki as Invoice <number>.pdf instead of the generated invoice."},
                     {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it (or --book), the invoice is a draft."},
                     {"name": "--book", "type": "boolean", "required": false, "description": "Book the invoice without sending it."},
-                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number (Reference) of a booked invoice (needs --send or --book), or auto: one past the highest <year>-<seq> in the sales archive (Invoice/Factuur <year>-<seq>.pdf) and the local ledger for the invoice date's year. Refused when either has it. With --pdf, required and explicit (not auto), with --date."},
+                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number (Reference) of a booked invoice (needs --send or --book), or auto: one past the highest <year>-<seq> in the sales archive (Invoice/Factuur <year>-<seq>.pdf) and the local ledger for the invoice date's year. Refused when either has it."},
                     {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."}
                 ],
                 "output_fields": [
@@ -292,7 +293,7 @@ pub fn generate() -> Value {
             },
             {
                 "name": "sales invoice prepare",
-                "description": "Print the fully resolved invoice as JSON (number, ISO and Dutch dates, customer, lines, totals per VAT rate, Belgian structured payment reference) for rendering a PDF; create sends the same number, dates and lines for the same inputs, while the totals are the CLI's computation (Yuki books its own). Ignores any pdf. Writes nothing; reads the sales archive and the local number ledger with --number.",
+                "description": "Print the fully resolved invoice as JSON (number, ISO and Dutch dates, customer, lines, totals per VAT rate, Belgian structured payment reference, the issuing firm from [seller]) for rendering a PDF; the totals are the CLI's computation (Yuki books its own). Ignores any pdf. Reads the sales archive and the local number ledger with --number. With --out it writes the invoice to that file and reserves its number for exactly that content (a local write); create --prepared books it.",
                 "mutating": false,
                 "args": [
                     {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file or --template is required."},
@@ -301,17 +302,19 @@ pub fn generate() -> Value {
                     {"name": "--price", "type": "number", "required": false, "description": "Unit price excluding VAT of the invoice's only line."},
                     {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD."},
                     {"name": "--subject", "type": "string", "required": false, "description": "Subject of the invoice."},
-                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number, or auto."}
+                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number, or auto."},
+                    {"name": "--out", "type": "path", "required": false, "description": "Write the prepared invoice here (never over an existing file) and reserve its number. Needs --number and [seller] in the config."}
                 ],
                 "output_kind": "data",
                 "stdout_schema": {"type": "object", "required": ["number", "date", "customer", "lines", "totals", "payment_reference"]}
             },
             {
                 "name": "sales invoice numbers",
-                "description": "List the invoice numbers given out, from the local ledger (invoice-numbers.json next to the config): pending from just before Yuki is called, then booked or rejected. --resolve settles a pending number by hand after checking Yuki; makes no API call.",
+                "description": "List the selected administration's invoice numbers, from the local ledger (invoice-numbers.json next to the config): reserved by prepare --out, pending from just before Yuki is called, then booked or rejected. --resolve settles a pending number by hand after checking Yuki (rejected also frees a reservation); --release frees a reservation; makes no API call.",
                 "mutating": false,
                 "args": [
-                    {"name": "--resolve", "type": "string[]", "required": false, "description": "NUMBER STATUS: settle a pending number as booked or rejected (a local write)."}
+                    {"name": "--resolve", "type": "string[]", "required": false, "description": "NUMBER STATUS: settle a pending number as booked or rejected (a local write)."},
+                    {"name": "--release", "type": "string", "required": false, "description": "NUMBER: free a reserved number that will not be sent (a local write)."}
                 ],
                 "output_fields": [
                     {"name": "Number", "type": "string"},
@@ -320,7 +323,8 @@ pub fn generate() -> Value {
                     {"name": "Gross", "type": "string"},
                     {"name": "Status", "type": "string"},
                     {"name": "Recorded", "type": "string"},
-                    {"name": "Booked", "type": "string"}
+                    {"name": "Booked", "type": "string"},
+                    {"name": "Note", "type": "string"}
                 ]
             },
             {

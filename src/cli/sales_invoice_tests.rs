@@ -268,7 +268,6 @@ fn command_line_overrides_replace_the_file_values() {
         price: Some(parse_price("80").unwrap()),
         date: Some("2026-11-01"),
         subject: Some("November"),
-        pdf: None,
         number: None,
         preparing: false,
     };
@@ -537,31 +536,90 @@ fn emailing_a_new_contact_needs_its_address() {
     assert!(parse(&text, "t", &Overrides::default(), None).is_ok());
 }
 
-/// Load `file` booked without sending and numbered 2026-20, as a PDF needs.
-fn load_booked(file: PathBuf, overrides: Overrides<'_>) -> Result<Invoice, YukiError> {
+fn seller() -> crate::config::Seller {
+    toml::from_str(
+        r#"
+name = "Example Studio"
+address = "Kerkstraat 1"
+zipcode = "9000"
+city = "Gent"
+country = "BE"
+phone = "0400000000"
+enterprise_number = "0123.456.789"
+vat_number = "BE0123.456.789"
+iban = "BE00000000000000"
+"#,
+    )
+    .unwrap()
+}
+
+/// `text` prepared as 2026-20 in administration `a1`: the file's JSON and
+/// the invoice it was prepared from, to be booked as `send`.
+fn prepared(text: &str, send: SendMode) -> (serde_json::Value, Invoice) {
     let number = NumberRequest::Given("2026-20".into());
     let overrides = Overrides {
         number: Some(&number),
-        date: Some("2026-10-01"),
-        ..overrides
+        preparing: true,
+        ..Default::default()
     };
-    load(&Source::File(file), &overrides, Some(SendMode::Book))
-}
-
-/// Write `invoice.toml` (the FULL invoice) naming `pdf = "doc.pdf"`, and
-/// `doc.pdf` with `bytes`.
-fn invoice_with_pdf(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::TempDir::new().unwrap();
-    std::fs::write(dir.path().join("doc.pdf"), bytes).unwrap();
-    let file = dir.path().join("invoice.toml");
-    std::fs::write(&file, format!("pdf = \"doc.pdf\"\n{FULL}")).unwrap();
-    (dir, file)
+    let mut inv = parse(text, "t", &overrides, None).unwrap();
+    let json = inv.prepared_file(&seller(), "a1");
+    inv.send = Some(send);
+    (json, inv)
 }
 
 #[test]
-fn a_custom_pdf_is_read_relative_to_the_file_and_embedded_before_the_contact() {
-    let (_dir, file) = invoice_with_pdf(b"%PDF-1.7 hello");
-    let inv = load_booked(file, Overrides::default()).unwrap();
+fn a_prepared_file_books_exactly_what_was_prepared() {
+    let (json, original) = prepared(FULL, SendMode::Email);
+    // The text a reader (and the PDF) sees, plus what booking needs.
+    assert_eq!(json["admin_id"], "a1");
+    assert_eq!(json["firm"]["name"], "Example Studio");
+    assert_eq!(json["lines"][0]["product_code"], "HOST");
+    assert_eq!(json["lines"][0]["vat_description"], "BTW 21%");
+    let (back, admin) = Invoice::from_prepared(&json, "p.json", SendMode::Email).unwrap();
+    assert_eq!(admin, "a1");
+    assert_eq!(back.to_xml(), original.to_xml());
+    assert_eq!(back.gross(), original.gross());
+    // Reformatting does not change the hash; an edit does.
+    let pretty: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    assert_eq!(content_hash(&pretty), content_hash(&json));
+    let mut edited = json.clone();
+    edited["lines"][0]["unit_price"] = "99.00".into();
+    assert_ne!(content_hash(&edited), content_hash(&json));
+}
+
+#[test]
+fn a_prepared_file_needs_a_number_an_administration_and_a_due_date() {
+    let (json, _) = prepared(FULL, SendMode::Book);
+    for (field, expect) in [
+        ("number", "no number"),
+        ("admin_id", "names no administration"),
+        ("due_date", "no due date"),
+    ] {
+        let mut broken = json.clone();
+        broken[field] = serde_json::Value::Null;
+        let err = Invoice::from_prepared(&broken, "p.json", SendMode::Book)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains(expect), "{field}: {err}");
+    }
+    let err = Invoice::from_prepared(&serde_json::json!({"a": 1}), "p.json", SendMode::Book)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("p.json is not a prepared invoice"), "{err}");
+}
+
+#[test]
+fn a_custom_pdf_is_stored_under_the_number_before_the_contact() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("doc.pdf");
+    std::fs::write(&path, b"%PDF-1.7 hello").unwrap();
+    let (json, _) = prepared(FULL, SendMode::Book);
+    let (mut inv, _) = Invoice::from_prepared(&json, "p.json", SendMode::Book).unwrap();
+    inv.attach_pdf(&path).unwrap();
     let xml = inv.to_xml();
     // Stored under the number, whatever the local file is called.
     assert!(
@@ -585,7 +643,6 @@ fn a_custom_pdf_is_read_relative_to_the_file_and_embedded_before_the_contact() {
     );
     // The lines stay: Yuki books from them.
     assert!(xml.contains("<InvoiceLines>"));
-
     let display = inv.to_display_xml();
     assert!(!display.contains(&base64), "{display}");
     assert!(
@@ -602,40 +659,25 @@ fn a_custom_pdf_is_read_relative_to_the_file_and_embedded_before_the_contact() {
 }
 
 #[test]
-fn the_pdf_flag_replaces_the_file_value() {
-    let (dir, file) = invoice_with_pdf(b"%PDF-1.4");
-    let other = dir.path().join("other.pdf");
-    std::fs::write(&other, b"%PDF-1.4 other").unwrap();
-    let overrides = Overrides {
-        pdf: Some(&other),
-        ..Default::default()
-    };
-    let inv = load_booked(file, overrides).unwrap();
-    assert_eq!(inv.pdf.unwrap().name, "other.pdf");
-}
-
-#[test]
 fn a_pdf_that_is_missing_not_a_pdf_or_too_large_is_rejected() {
-    let (_dir, file) = invoice_with_pdf(b"PK\x03\x04 a zip");
-    let err = load_booked(file, Overrides::default())
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("is not a PDF (no %PDF- header)"), "{err}");
-
-    let (dir, file) = invoice_with_pdf(b"%PDF-1.7");
-    std::fs::remove_file(dir.path().join("doc.pdf")).unwrap();
-    let err = load_booked(file, Overrides::default())
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("pdf: ") && err.contains("doc.pdf"), "{err}");
-
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("doc.pdf");
+    std::fs::write(&path, b"PK\x03\x04 a zip").unwrap();
+    assert!(
+        Pdf::read(&path)
+            .unwrap_err()
+            .contains("is not a PDF (no %PDF- header)")
+    );
+    let missing = dir.path().join("missing.pdf");
+    assert!(Pdf::read(&missing).unwrap_err().contains("missing.pdf"));
     let mut big = b"%PDF-1.7".to_vec();
     big.resize(PDF_MAX_BYTES + 1, b' ');
-    let (_dir, file) = invoice_with_pdf(&big);
-    let err = load_booked(file, Overrides::default())
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("over the 3.0 MB limit"), "{err}");
+    std::fs::write(&path, &big).unwrap();
+    assert!(
+        Pdf::read(&path)
+            .unwrap_err()
+            .contains("over the 3.0 MB limit")
+    );
 }
 
 #[test]
@@ -648,42 +690,6 @@ fn a_pdf_name_without_the_extension_gets_one() {
     std::fs::write(&upper, b"%PDF-1.7").unwrap();
     assert_eq!(Pdf::read(&upper).unwrap().name, "INVOICE.PDF");
 }
-
-#[test]
-fn a_template_cannot_carry_a_pdf_but_an_invoice_file_can() {
-    let text = format!("pdf = \"doc.pdf\"\n{MINIMAL}");
-    let err = parse_at(
-        &text,
-        "template",
-        Path::new("."),
-        false,
-        &Overrides::default(),
-        None,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        err.contains("a template can't carry a PDF; pass --pdf per invoice"),
-        "{err}"
-    );
-}
-
-#[test]
-fn a_pdf_needs_a_booked_and_numbered_invoice() {
-    let (dir, file) = invoice_with_pdf(b"%PDF-1.7");
-    let err = load(&Source::File(file), &Overrides::default(), None)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains(
-            "Yuki only accepts a custom PDF on a booked invoice: add --send email|peppol|both (or --book)"
-        ),
-        "{err}"
-    );
-    assert!(err.contains("a custom PDF needs --number"), "{err}");
-    drop(dir);
-}
-
 #[test]
 fn book_books_without_sending_and_the_number_is_the_reference() {
     let number = NumberRequest::Given("2026-20".into());
@@ -771,26 +777,7 @@ fn a_numbered_draft_is_refused() {
 }
 
 #[test]
-fn a_pdf_needs_the_prepared_number_and_date() {
-    let (dir, file) = invoice_with_pdf(b"%PDF-1.7");
-    let auto = NumberRequest::Auto;
-    let overrides = Overrides {
-        number: Some(&auto),
-        ..Default::default()
-    };
-    let err = load(&Source::File(file), &overrides, Some(SendMode::Email))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("with --pdf, give the number printed on it"),
-        "{err}"
-    );
-    assert!(err.contains("with --pdf, give --date"), "{err}");
-    drop(dir);
-}
-
-#[test]
-fn prepare_reads_no_pdf() {
+fn prepare_reads_no_pdf_and_create_refuses_one_in_the_file() {
     // The file names a PDF that does not exist yet: prepare does not care.
     let text = format!("pdf = \"not-rendered-yet.pdf\"\n{MINIMAL}");
     let overrides = Overrides {
@@ -799,13 +786,16 @@ fn prepare_reads_no_pdf() {
     };
     let inv = parse(&text, "t", &overrides, None).unwrap();
     assert!(inv.pdf.is_none());
-    // create does.
+    // create takes a PDF only with the prepared invoice it was rendered from.
     let err = parse(&text, "t", &Overrides::default(), None)
         .unwrap_err()
         .to_string();
-    assert!(err.contains("not-rendered-yet.pdf"), "{err}");
+    assert!(
+        err.contains("`pdf` in an invoice file is not sent"),
+        "{err}"
+    );
+    assert!(err.contains("--prepared <file.json> --pdf <pdf>"), "{err}");
 }
-
 #[test]
 fn a_line_remark_goes_under_the_line_and_into_prepare() {
     let text = MINIMAL.replace(

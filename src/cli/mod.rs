@@ -442,27 +442,30 @@ pub enum SalesCommands {
 pub enum SalesInvoiceCommands {
     /// Create a sales invoice in Yuki: a draft, unless --send or --book books it.
     ///
-    /// The invoice comes from a TOML file (--file) or a saved template
-    /// (--template, read from ~/.config/yuki/invoices/<name>.toml). A preview
-    /// of the customer, lines and totals is printed first, then confirmed on a
-    /// terminal; --yes skips the prompt and is required when not on a terminal.
-    /// --dry-run prints the preview and the exact xmlDoc without contacting Yuki.
-    ///
-    /// A custom --pdf needs --send or --book (Yuki takes a PDF only on a booked
-    /// invoice) and --number (the number printed on it). Booking is immediate:
+    /// The invoice comes from a TOML file (--file), a saved template
+    /// (--template, read from ~/.config/yuki/invoices/<name>.toml), or a
+    /// prepared invoice (--prepared, written by `prepare --out`), which is
+    /// booked exactly as prepared. A preview of the customer, lines and totals
+    /// is printed first, then confirmed on a terminal; --yes skips the prompt
+    /// and is required when not on a terminal. --dry-run prints the preview
+    /// and the exact xmlDoc without contacting Yuki. Booking is immediate:
     /// there is no draft to review.
     #[command(group(
-        clap::ArgGroup::new("source").required(true).args(["file", "template"])
+        clap::ArgGroup::new("source").required(true).args(["file", "template", "prepared"])
     ))]
     Create {
         #[command(flatten)]
         inputs: InvoiceInputs,
 
-        /// Custom invoice PDF (max 3 MB), replacing an invoice file's `pdf`;
-        /// a template takes one only this way. Yuki stores it, as
-        /// `Invoice <number>.pdf`, instead of the invoice it would generate;
-        /// the lines still set the booked amounts. Needs --send or --book,
-        /// and the --number and --date `prepare` printed.
+        /// A prepared invoice (`prepare --out`) to book exactly: its number
+        /// must still be reserved for this content. Takes no other invoice
+        /// inputs; needs --send or --book.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["qty", "price", "date", "subject", "number"])]
+        prepared: Option<String>,
+
+        /// Custom invoice PDF (max 3 MB) rendered from the --prepared file.
+        /// Yuki stores it, as `Invoice <number>.pdf`, instead of the invoice it
+        /// would generate; the lines still set the booked amounts.
         #[arg(long, value_name = "PATH")]
         pdf: Option<String>,
 
@@ -480,33 +483,43 @@ pub enum SalesInvoiceCommands {
         dry_run: bool,
     },
 
-    /// Print the fully resolved invoice as JSON, writing nothing.
+    /// Print the fully resolved invoice as JSON, for rendering its PDF.
     ///
-    /// The same inputs as `create`, which sends the same number, dates,
-    /// customer and lines for them. The totals per VAT rate are the CLI's
-    /// computation; Yuki books its own. Dates come as ISO and Dutch text, with
-    /// the Belgian structured payment reference. Any `pdf` is ignored, as the
-    /// PDF does not exist yet. With --number it reads the sales archive and
-    /// the local number ledger; pass the number and date it prints to
-    /// `create --pdf`.
+    /// The totals per VAT rate are the CLI's computation; Yuki books its own.
+    /// Dates come as ISO and Dutch text, with the Belgian structured payment
+    /// reference and the issuing firm ([seller] in the config). With --number
+    /// it reads the sales archive and the local number ledger. With --out it
+    /// also writes the invoice to a file and reserves its number for exactly
+    /// that content; `create --prepared <file>` books it.
     #[command(group(
         clap::ArgGroup::new("source").required(true).args(["file", "template"])
     ))]
     Prepare {
         #[command(flatten)]
         inputs: InvoiceInputs,
+
+        /// Write the prepared invoice here (never over an existing file) and
+        /// reserve its number in the ledger. Needs --number and [seller].
+        #[arg(long, value_name = "FILE", requires = "number")]
+        out: Option<String>,
     },
 
     /// List the invoice numbers given out, from the local ledger.
     ///
-    /// A number is pending from just before Yuki is called until its answer
-    /// marks it booked or rejected. One left pending (no answer came back)
-    /// stays taken: check "To be sent"/Sales in Yuki, then settle it with
-    /// --resolve <NUMBER> booked|rejected. A rejected number can be used again.
+    /// `prepare --out` reserves a number; it is pending from just before Yuki
+    /// is called until its answer marks it booked or rejected. One left
+    /// pending (no answer came back) stays taken: check "To be sent"/Sales in
+    /// Yuki, then settle it with --resolve <NUMBER> booked|rejected. A
+    /// reservation that will not be sent is freed with --release <NUMBER>
+    /// (or --resolve <NUMBER> rejected). A rejected number can be used again.
     Numbers {
         /// Settle a pending number: --resolve 2026-20 booked (or rejected).
         #[arg(long, num_args = 2, value_names = ["NUMBER", "STATUS"])]
         resolve: Option<Vec<String>>,
+
+        /// Free a reserved number that will not be sent.
+        #[arg(long, value_name = "NUMBER", conflicts_with = "resolve")]
+        release: Option<String>,
     },
 
     /// List saved invoice templates (~/.config/yuki/invoices/*.toml).
@@ -556,7 +569,7 @@ impl InvoiceInputs {
         match (&self.file, &self.template) {
             (Some(file), _) => sales_invoice::Source::File(file.into()),
             (None, Some(name)) => sales_invoice::Source::Template(name.clone()),
-            (None, None) => unreachable!("clap requires --file or --template"),
+            (None, None) => unreachable!("clap requires --file, --template or --prepared"),
         }
     }
 
@@ -566,7 +579,6 @@ impl InvoiceInputs {
             price: self.price,
             date: self.date.as_deref(),
             subject: self.subject.as_deref(),
-            pdf: None,
             number: self.number.as_ref(),
             preparing: false,
         }

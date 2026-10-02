@@ -456,19 +456,67 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                 SalesCommands::Invoice { command } => match command {
                     SalesInvoiceCommands::Create {
                         inputs,
+                        prepared,
                         pdf,
                         send,
                         book,
                         dry_run,
                     } => {
+                        use yuki_cli::cli::invoice_ledger::InvoiceLedger;
                         use yuki_cli::cli::invoice_number::{self, NumberRequest};
-                        use yuki_cli::cli::sales_invoice::{self, SendMode};
+                        use yuki_cli::cli::sales_invoice::{self, Invoice, SendMode};
                         let send = if book { Some(SendMode::Book) } else { send };
-                        let mut overrides = inputs.overrides();
-                        overrides.pdf = pdf.as_deref().map(std::path::Path::new);
-                        let mut invoice = sales_invoice::load(&inputs.source(), &overrides, send)
-                            .map_err(invalid_input)?;
-                        // A dry run needs no configuration and makes no API call.
+                        if pdf.is_some() && prepared.is_none() {
+                            return Err(AppError::InvalidInput(
+                                "--pdf needs --prepared: prepare the invoice with `sales invoice prepare --out <file.json>`, render the PDF from that file, then `create --prepared <file.json> --pdf <pdf>`".into(),
+                            ));
+                        }
+                        // A prepared invoice: exactly that content, its number
+                        // still reserved for it in this administration.
+                        let mut binding: Option<String> = None;
+                        let mut invoice = match &prepared {
+                            Some(file) => {
+                                let send = send.ok_or_else(|| {
+                                    AppError::InvalidInput(
+                                        "a prepared invoice is booked: add --send email|peppol|both, or --book".into(),
+                                    )
+                                })?;
+                                let path = std::path::Path::new(file);
+                                let (json, hash) =
+                                    sales_invoice::read_prepared(path).map_err(invalid_input)?;
+                                let (mut invoice, admin_id) =
+                                    Invoice::from_prepared(&json, file, send)
+                                        .map_err(invalid_input)?;
+                                if let Some(pdf) = &pdf {
+                                    invoice
+                                        .attach_pdf(std::path::Path::new(pdf))
+                                        .map_err(invalid_input)?;
+                                }
+                                let config = load()?;
+                                if config.seller.is_none() {
+                                    return Err(invalid_input(sales_invoice::seller_missing()));
+                                }
+                                let target = config.target(admin)?;
+                                if target.admin_id != admin_id {
+                                    return Err(AppError::InvalidInput(format!(
+                                        "{file} was prepared for administration {admin_id}, not {} ({}): select it with --admin",
+                                        target.config_name, target.admin_id
+                                    )));
+                                }
+                                let number = invoice.number.as_deref().unwrap_or_default();
+                                InvoiceLedger::peek()?
+                                    .check_reserved(&admin_id, number, &hash)
+                                    .map_err(invalid_input)?;
+                                binding = Some(hash);
+                                invoice
+                            }
+                            None => {
+                                sales_invoice::load(&inputs.source(), &inputs.overrides(), send)
+                                    .map_err(invalid_input)?
+                            }
+                        };
+                        // A dry run makes no API call (and, unprepared, needs no
+                        // configuration).
                         if dry_run {
                             if inputs.number == Some(NumberRequest::Auto) {
                                 return Err(AppError::InvalidInput(
@@ -477,7 +525,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             }
                             if !cli.quiet {
                                 eprintln!("{}\n", invoice.preview(None));
-                                if let Some(number) = &invoice.number {
+                                if let (Some(number), None) = (&invoice.number, &binding) {
                                     eprintln!(
                                         "Dry run: number {number} was not checked against the sales archive."
                                     );
@@ -515,7 +563,12 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             }
                         }
                         let import = sales_invoice::submit_numbered(
-                            &config, admin, &invoice, format, cli.quiet,
+                            &config,
+                            admin,
+                            &invoice,
+                            binding.as_deref(),
+                            format,
+                            cli.quiet,
                         )
                         .await
                         .map_err(|e| match e {
@@ -531,7 +584,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             return Err(AppError::InvoiceRejected(failure));
                         }
                     }
-                    SalesInvoiceCommands::Prepare { inputs } => {
+                    SalesInvoiceCommands::Prepare { inputs, out } => {
                         use yuki_cli::cli::{invoice_number, sales_invoice};
                         let overrides = sales_invoice::Overrides {
                             preparing: true,
@@ -544,6 +597,10 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             Some(_) => Some(load()?),
                             None => load().ok(),
                         };
+                        let seller = config.as_ref().and_then(|c| c.seller.as_ref());
+                        if out.is_some() && seller.is_none() {
+                            return Err(invalid_input(sales_invoice::seller_missing()));
+                        }
                         if let (Some(request), Some(config)) = (&inputs.number, &config) {
                             config.target(admin)?;
                             invoice.number = Some(
@@ -552,15 +609,33 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                     .map_err(invalid_input)?,
                             );
                         }
-                        let seller = config.as_ref().and_then(|c| c.seller.as_ref());
+                        let json = match (&out, &config, seller) {
+                            (Some(out), Some(config), Some(seller)) => {
+                                let admin_id = config.target(admin)?.admin_id;
+                                let json = sales_invoice::write_prepared(
+                                    &invoice,
+                                    seller,
+                                    admin_id,
+                                    std::path::Path::new(out),
+                                )
+                                .map_err(invalid_input)?;
+                                if !cli.quiet {
+                                    let number = invoice.number.as_deref().unwrap_or_default();
+                                    eprintln!(
+                                        "Reserved invoice number {number} for this content in {out}. Render the PDF from it, then: yuki sales invoice create --prepared {out} --pdf <pdf> --send email (free the number instead with: yuki sales invoice numbers --release {number})"
+                                    );
+                                }
+                                json
+                            }
+                            _ => invoice.prepared_for(seller),
+                        };
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&invoice.prepared_for(seller))
-                                .expect("serialize invoice")
+                            serde_json::to_string_pretty(&json).expect("serialize invoice")
                         );
                     }
-                    SalesInvoiceCommands::Numbers { resolve } => {
-                        use yuki_cli::cli::invoice_ledger::{self, Status};
+                    SalesInvoiceCommands::Numbers { resolve, release } => {
+                        use yuki_cli::cli::invoice_ledger::{self, Settle, Status};
                         let resolve = match resolve.as_deref() {
                             Some([number, status]) => {
                                 let status = match status.to_ascii_lowercase().as_str() {
@@ -576,12 +651,13 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             }
                             _ => None,
                         };
+                        let settle = match (&resolve, &release) {
+                            (Some((number, status)), _) => Some(Settle::Resolve(number, *status)),
+                            (None, Some(number)) => Some(Settle::Release(number)),
+                            (None, None) => None,
+                        };
                         let config = load()?;
-                        invoice_ledger::numbers(
-                            config.target(admin)?.admin_id,
-                            resolve.as_ref().map(|(n, s)| (n.as_str(), *s)),
-                            format,
-                        )?;
+                        invoice_ledger::numbers(config.target(admin)?.admin_id, settle, format)?;
                     }
                     SalesInvoiceCommands::Templates => {
                         yuki_cli::cli::sales_invoice::templates(format)?;

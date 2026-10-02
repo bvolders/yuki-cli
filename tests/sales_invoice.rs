@@ -381,108 +381,275 @@ fn templates_lists_valid_and_invalid_templates() {
     assert_eq!(items[1]["Status"], "ok");
 }
 
-#[test]
-fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
-    let (root, log) = mock(import_response(true, true, false, "2026-20"));
-    let home = home(&root);
-    let dir = home.path().join(".config/yuki/invoices");
-    let pdf = b"%PDF-1.7\nmade-up invoice body\n%%EOF\n";
-    std::fs::write(dir.join("hosting.pdf"), pdf).expect("write pdf");
-    let pdf_path = dir.join("hosting.pdf");
-    let pdf_arg = pdf_path.to_str().unwrap();
-    let base64 = "JVBERi0xLjcKbWFkZS11cCBpbnZvaWNlIGJvZHkKJSVFT0YK";
+/// The `[seller]` a prepared invoice prints.
+const SELLER: &str = r#"
+[seller]
+name = "Example Studio"
+address = "Kerkstraat 1"
+zipcode = "9000"
+city = "Gent"
+country = "BE"
+phone = "0400000000"
+enterprise_number = "0123.456.789"
+vat_number = "BE0123.456.789"
+iban = "BE00000000000000"
+"#;
 
-    let dry = yuki(
-        &home,
+/// [`home`] with a `[seller]`, and a second monthly template, `support`.
+fn home_with_seller(root: &str) -> TempDir {
+    let home = common::home_with_config(root, "test-key", SELLER);
+    let dir = home.path().join(".config/yuki/invoices");
+    std::fs::create_dir_all(&dir).expect("invoices dir");
+    std::fs::write(dir.join("hosting.toml"), TEMPLATE).expect("write template");
+    std::fs::write(
+        dir.join("support.toml"),
+        TEMPLATE
+            .replace("Managed hosting", "Support")
+            .replace("C0042", "C0043"),
+    )
+    .expect("write template");
+    home
+}
+
+/// `prepare --template <template> --number auto --out <out>`.
+fn prepare_out(home: &TempDir, template: &str, out: &std::path::Path) -> std::process::Output {
+    yuki(
+        home,
         &[
             "sales",
             "invoice",
-            "create",
+            "prepare",
             "--template",
-            "hosting",
-            "--pdf",
-            pdf_arg,
-            "--book",
-            "--number",
-            "2026-20",
+            template,
             "--date",
-            "2026-10-02",
-            "--dry-run",
+            "2026-10-31",
+            "--number",
+            "auto",
+            "--out",
+            out.to_str().unwrap(),
         ],
+    )
+}
+
+/// `create --prepared <file>` with `extra`.
+fn create_prepared(home: &TempDir, file: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let mut args = vec![
+        "sales",
+        "invoice",
+        "create",
+        "--prepared",
+        file.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    yuki(home, &args)
+}
+
+fn status_of(home: &TempDir, number: &str) -> Value {
+    ledger_rows(home)
+        .into_iter()
+        .find(|r| r["Number"] == number)
+        .map(|r| r["Status"].clone())
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn two_prepared_invoices_get_distinct_numbers_and_book_as_prepared() {
+    let (root, log) = mock(import_response(true, true, false, "2026-20"));
+    let home = home_with_seller(&root);
+    let first = home.path().join("2026-10-hosting.json");
+    let second = home.path().join("2026-10-support.json");
+    let out = prepare_out(&home, "hosting", &first);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("Reserved invoice number 2026-20"));
+    let out = prepare_out(&home, "support", &second);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let written: Value = serde_json::from_slice(&std::fs::read(&second).unwrap()).unwrap();
+    assert_eq!(written["number"], "2026-21");
+    assert_eq!(written["firm"]["name"], "Example Studio");
+    assert_eq!(written["admin_id"], "admin-1");
+    // stdout carries the same JSON as the file.
+    assert_eq!(json(&out), written);
+    assert_eq!(status_of(&home, "2026-20"), "reserved");
+    assert_eq!(status_of(&home, "2026-21"), "reserved");
+    // --out never overwrites.
+    let again = prepare_out(&home, "hosting", &first);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(
+        stderr(&again).contains("exists already"),
+        "{}",
+        stderr(&again)
     );
+    assert_eq!(status_of(&home, "2026-22"), Value::Null);
+
+    // The first is booked with its PDF, exactly as prepared.
+    let pdf = home.path().join("rendered.pdf");
+    std::fs::write(&pdf, b"%PDF-1.7 rendered from the prepared JSON").unwrap();
+    let base64 = "JVBERi0xLjcgcmVuZGVyZWQgZnJvbSB0aGUgcHJlcGFyZWQgSlNPTg==";
+    let pdf_arg = pdf.to_str().unwrap();
+    let dry = create_prepared(&home, &first, &["--pdf", pdf_arg, "--book", "--dry-run"]);
     assert!(dry.status.success(), "{}", stderr(&dry));
     let xml = String::from_utf8_lossy(&dry.stdout);
     assert!(!xml.contains(base64), "{xml}");
-    assert!(
-        xml.contains("<!-- 48 bytes base64 (36-byte PDF) -->"),
-        "{xml}"
+    assert!(xml.contains("bytes base64 (40-byte PDF)"), "{xml}");
+    assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
+    let booked = create_prepared(
+        &home,
+        &first,
+        &["--pdf", pdf_arg, "--book", "--yes", "--output", "json"],
     );
-    assert!(stderr(&dry).contains(
-        "custom PDF hosting.pdf (36 bytes), stored as Invoice 2026-20.pdf, replaces Yuki's layout"
-    ));
-    assert!(actions(&log).is_empty());
+    assert!(booked.status.success(), "{}", stderr(&booked));
+    assert_eq!(json(&booked)["items"][0]["PDF"], "Invoice 2026-20.pdf");
+    let body = sent_body(&log);
+    for fragment in [
+        "<Reference>2026-20</Reference>",
+        "<Date>2026-10-31</Date>",
+        "<DocumentFileName>Invoice 2026-20.pdf</DocumentFileName>",
+        &format!("<DocumentBase64>{base64}</DocumentBase64>"),
+    ] {
+        assert!(body.contains(fragment), "{fragment}: {body}");
+    }
+    assert_eq!(status_of(&home, "2026-20"), "booked");
+    assert_eq!(status_of(&home, "2026-21"), "reserved");
+    // A prepared invoice books once.
+    let twice = create_prepared(&home, &first, &["--book", "--yes"]);
+    assert_eq!(twice.status.code(), Some(1));
+    assert!(
+        stderr(&twice).contains("is booked already"),
+        "{}",
+        stderr(&twice)
+    );
+}
 
-    let output = yuki(
+#[test]
+fn a_prepared_file_that_changed_or_lost_its_reservation_is_refused() {
+    let (root, log) = mock(import_response(true, true, false, "2026-20"));
+    let home = home_with_seller(&root);
+    let file = home.path().join("prepared.json");
+    assert!(prepare_out(&home, "hosting", &file).status.success());
+    let original = std::fs::read_to_string(&file).unwrap();
+
+    // Reformatted is the same content; a changed price is not.
+    let reformatted: Value = serde_json::from_str(&original).unwrap();
+    std::fs::write(&file, serde_json::to_string(&reformatted).unwrap()).unwrap();
+    let dry = create_prepared(&home, &file, &["--book", "--dry-run"]);
+    assert!(dry.status.success(), "{}", stderr(&dry));
+    std::fs::write(&file, original.replace("\"100.00\"", "\"90.00\"")).unwrap();
+    let edited = create_prepared(&home, &file, &["--book", "--yes"]);
+    assert_eq!(edited.status.code(), Some(1));
+    let err = stderr(&edited);
+    assert!(
+        err.contains("not the one prepare reserved the number for"),
+        "{err}"
+    );
+    assert!(err.contains("\"kind\":\"invalid_input\""), "{err}");
+
+    // Released, the number is free and the file can no longer be booked.
+    std::fs::write(&file, &original).unwrap();
+    let release = yuki(
         &home,
         &[
             "sales",
             "invoice",
-            "create",
-            "--template",
-            "hosting",
-            "--pdf",
-            pdf_arg,
-            "--book",
-            "--number",
+            "numbers",
+            "--release",
             "2026-20",
-            "--date",
-            "2026-10-02",
-            "--yes",
             "--output",
             "json",
         ],
     );
-    assert!(output.status.success(), "{}", stderr(&output));
-    let json = json(&output);
-    // The archive file is named after the number, not the local file.
-    assert_eq!(json["items"][0]["PDF"], "Invoice 2026-20.pdf");
-    let body = sent_body(&log);
+    assert!(release.status.success(), "{}", stderr(&release));
+    assert_eq!(status_of(&home, "2026-20"), "rejected");
+    let released = create_prepared(&home, &file, &["--book", "--yes"]);
+    assert_eq!(released.status.code(), Some(1));
     assert!(
-        body.contains("<DocumentFileName>Invoice 2026-20.pdf</DocumentFileName>"),
-        "{body}"
+        stderr(&released).contains("is not reserved"),
+        "{}",
+        stderr(&released)
     );
-    assert!(
-        body.contains(&format!("<DocumentBase64>{base64}</DocumentBase64>")),
-        "{body}"
+    assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
+    // --release is for reservations only.
+    let bad = yuki(
+        &home,
+        &["sales", "invoice", "numbers", "--release", "2026-20"],
     );
+    assert_eq!(bad.status.code(), Some(3), "{}", stderr(&bad));
 }
 
 #[test]
-fn a_template_with_a_pdf_is_refused() {
-    let (root, log) = mock(String::new());
-    let home = home(&root);
-    let dir = home.path().join(".config/yuki/invoices");
-    std::fs::write(
-        dir.join("monthly.toml"),
-        format!("pdf = \"x.pdf\"\n{TEMPLATE}"),
-    )
-    .expect("write template");
-    let output = yuki(
+fn flags_that_would_change_a_prepared_invoice_are_refused() {
+    let (root, log) = mock(import_response(true, true, false, "2026-20"));
+    let home = home_with_seller(&root);
+    let file = home.path().join("prepared.json");
+    assert!(prepare_out(&home, "hosting", &file).status.success());
+    for extra in [
+        ["--qty", "2"],
+        ["--price", "1.00"],
+        ["--date", "2026-10-01"],
+        ["--subject", "Other"],
+        ["--number", "2026-30"],
+        ["--template", "hosting"],
+        ["--file", "x.toml"],
+    ] {
+        let mut args = extra.to_vec();
+        args.extend(["--book", "--yes"]);
+        let out = create_prepared(&home, &file, &args);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("cannot be used with"),
+            "{extra:?}: {}",
+            stderr(&out)
+        );
+    }
+    // A prepared invoice is booked, and a PDF needs a prepared invoice.
+    let draft = create_prepared(&home, &file, &["--yes"]);
+    assert_eq!(draft.status.code(), Some(1));
+    assert!(stderr(&draft).contains("a prepared invoice is booked"));
+    let loose = yuki(
         &home,
         &[
             "sales",
             "invoice",
             "create",
             "--template",
-            "monthly",
-            "--dry-run",
+            "hosting",
+            "--pdf",
+            "x.pdf",
+            "--book",
+            "--yes",
         ],
     );
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("a template can't carry a PDF; pass --pdf per invoice"));
-    assert!(actions(&log).is_empty());
+    assert_eq!(loose.status.code(), Some(1));
+    assert!(
+        stderr(&loose).contains("--pdf needs --prepared"),
+        "{}",
+        stderr(&loose)
+    );
+    assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
 }
 
+#[test]
+fn prepare_out_needs_a_seller_and_the_admin_it_was_prepared_for() {
+    let (root, _log) = mock(String::new());
+    let home = home(&root);
+    let file = home.path().join("prepared.json");
+    let out = prepare_out(&home, "hosting", &file);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("add a [seller] table"), "{err}");
+    assert!(err.contains("enterprise_number"), "{err}");
+    assert!(!file.exists());
+    assert!(ledger_rows(&home).is_empty());
+
+    // Booked under another administration than it was prepared for: refused.
+    let home = home_with_seller(&root);
+    assert!(prepare_out(&home, "hosting", &file).status.success());
+    let config = home.path().join(".config/yuki/config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace("admin-1", "admin-9")).unwrap();
+    let wrong = create_prepared(&home, &file, &["--book", "--yes"]);
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(stderr(&wrong).contains("was prepared for administration admin-1"));
+}
 #[test]
 fn a_lost_answer_warns_that_the_invoice_may_exist() {
     // The mock drops the connection once it has read the request.

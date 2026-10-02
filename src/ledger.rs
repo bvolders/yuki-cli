@@ -21,7 +21,8 @@ use crate::error::YukiError;
 
 /// What a ledger file holds.
 pub trait LedgerFormat: Serialize + DeserializeOwned + Default {
-    /// The format version this build reads and writes.
+    /// The format version this build writes; it reads this one and older ones,
+    /// whose fields are a subset.
     const VERSION: u32;
     /// What the file is, for messages: "sync state".
     const WHAT: &'static str;
@@ -202,7 +203,8 @@ fn load<S: LedgerFormat>(path: &Path) -> Result<S, YukiError> {
     let mut raw: Value = serde_json::from_str(&text).map_err(|e| corrupt(e.to_string()))?;
     let version = raw.as_object_mut().and_then(|o| o.remove("version"));
     match version.as_ref().map(Value::as_u64) {
-        Some(Some(v)) if v == u64::from(S::VERSION) => {}
+        // An older version is read as this one: formats only add fields.
+        Some(Some(v)) if (1..=u64::from(S::VERSION)).contains(&v) => {}
         Some(Some(v)) if v > u64::from(S::VERSION) => {
             return Err(YukiError::Config(format!(
                 "{} has format version {v}, newer than this yuki understands ({}); upgrade yuki",
@@ -350,6 +352,9 @@ mod tests {
             Ledger::<Legacy>::peek(&path).unwrap().state().notes,
             ["old"]
         );
+        // An older version is read as the current one.
+        fs::write(&path, r#"{"version": 1, "notes": ["v1"]}"#).unwrap();
+        assert_eq!(Ledger::<Notes>::peek(&path).unwrap().state().notes, ["v1"]);
     }
 
     #[test]

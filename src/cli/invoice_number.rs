@@ -190,6 +190,9 @@ pub fn choose(
             crate::cli::invoice_ledger::Status::Pending => {
                 "pending (outcome unknown: check Yuki, then `yuki sales invoice numbers --resolve`)"
             }
+            crate::cli::invoice_ledger::Status::Reserved => {
+                "reserved by `prepare --out` (free it with `yuki sales invoice numbers --release`)"
+            }
             _ => "booked",
         });
         return Err(YukiError::Config(format!(

@@ -298,14 +298,14 @@ yuki sales invoice create --file invoice.toml           # Ad-hoc invoice, create
 yuki sales invoice create --template acme-hosting       # From ~/.config/yuki/invoices/acme-hosting.toml
 yuki sales invoice create --template acme-consulting \
   --qty 7.5 --subject "Consultancy October 2026"        # Monthly run: this month's hours
-yuki sales invoice create --template acme-hosting \
-  --send email                                          # Book it and email it to the customer
 yuki sales invoice create --file invoice.toml --dry-run # Preview and xmlDoc only; no API call
-yuki sales invoice create --template acme-hosting --book  # Book it now; you send it yourself
-yuki sales invoice prepare --template acme-hosting --number auto  # Resolved invoice as JSON
-yuki sales invoice create --template acme-hosting --number 2026-20 \
-  --date 2026-10-31 --pdf rendered.pdf --send email     # Book your own PDF and email it
+yuki sales invoice create --template acme-hosting --number auto --book  # Book it in Yuki's layout
+yuki sales invoice prepare --template acme-hosting --number auto \
+  --date 2026-10-31 --out 2026-10-acme.json             # Reserve the number for this content
+yuki sales invoice create --prepared 2026-10-acme.json \
+  --pdf 2026-10-acme.pdf --send email                   # Book exactly that, with your PDF
 yuki sales invoice numbers                              # Invoice numbers given out (local ledger)
+yuki sales invoice numbers --release 2026-20            # Free a reservation that will not be sent
 yuki sales invoice numbers --resolve 2026-20 booked     # Settle a number left pending
 yuki sales invoice templates                            # List saved templates, each validated
 ```
@@ -314,27 +314,17 @@ yuki sales invoice templates                            # List saved templates, 
 unbooked and without an invoice number, so you can still check or edit it in
 Yuki. `--send email|peppol|both` books it instead and sends it; `--book` books
 it without sending, for invoices you send yourself. Booking is immediate and
-fixes the number: there is no draft to review, and the preview says so.
+fixes the number: there is no draft to review, and the preview says so. A
+booking needs a due date (`due_days` or `due_date`).
 Before any write, the command prints a preview to stderr (customer, lines, net,
 VAT, gross total, and whether it creates a draft or books and sends) and asks
 for confirmation, which declines unless you answer `y`. `--yes` skips the prompt
-and is required when stdin or stderr is not a terminal. `--dry-run` prints the preview, then the exact `xmlDoc` on stdout, and
-contacts nothing, not even to authenticate. The command exits 1 with kind
-`invoice_rejected` when Yuki fails or skips the invoice, or does not book or
-email it as `--send` asked, after printing Yuki's answer; `invalid_input` lists
-every problem in the file; `confirmation_required` means nothing was sent.
-Totals must be positive: credit notes are not supported.
-
-With `--pdf <PATH>` (or `pdf = "..."` in an invoice file, not a template),
-Yuki stores your PDF instead of the invoice it would generate from its layout.
-Yuki takes a custom PDF only on a booked invoice, so `--pdf` needs `--send` or
-`--book`, and `--number`: the number printed on the PDF.
-The lines are still required: Yuki books the amounts, and builds a Peppol
-invoice, from them, so the amounts in the PDF must match. The file must start
-with `%PDF-` and be at most 3 MB (Yuki's request limit, with base64 on top).
-A template can't carry a PDF, since it is reused every month; pass `--pdf` per
-invoice. `--dry-run` shows a size comment in place of the PDF's base64, and the
-result has a `PDF` column naming the file sent.
+and is required when stdin or stderr is not a terminal. `--dry-run` prints the
+preview, then the exact `xmlDoc` on stdout, and makes no API call. The command
+exits 1 with kind `invoice_rejected` when Yuki fails or skips the invoice, or
+does not book it as `--send` asked, after printing Yuki's answer;
+`invalid_input` lists every problem in the file; `confirmation_required` means
+nothing was sent. Totals must be positive: credit notes are not supported.
 
 #### Your own PDF with your own number
 
@@ -349,33 +339,46 @@ the existing numbers. A number either already has is refused. Yuki's own
 counter does not learn about numbers given this way, so once you start, number
 every invoice here.
 
+To book a PDF rendered elsewhere, the number, the PDF and the booking are tied
+to one prepared invoice:
+
+1. `yuki sales invoice prepare --template acme-hosting --number auto --date
+   2026-10-31 --out 2026-10-acme.json` writes the fully resolved invoice to the
+   file (never over an existing one), prints it, and **reserves** its number in
+   the ledger for exactly that content. The JSON has the number, the dates in
+   ISO and Dutch (`31 oktober 2026`), the issuing firm (`firm`, from
+   `[seller]`), the customer with address and VAT number, the lines with their
+   remarks and unit, the totals per VAT rate, the `vat_mention`, and the
+   Belgian structured payment reference. The totals are the CLI's computation
+   (VAT per rate); Yuki books its own, and `totals.vat_rounded_per_line`
+   appears when rounding per line would differ. Preparing the next invoice
+   gives the next number (`2026-21`), even before the first is booked.
+2. Render the PDF from that file.
+3. `yuki sales invoice create --prepared 2026-10-acme.json --pdf 2026-10-acme.pdf
+   --send email` books exactly the prepared content: it takes no `--file`,
+   `--template`, `--qty`, `--price`, `--date`, `--subject` or `--number`, and is
+   refused unless the number is still reserved, in the selected administration,
+   for a file with the same content (reformatting it is fine; any edit is not).
+   The reservation becomes `pending`, then `booked`. Yuki stores the PDF as
+   `Invoice <number>.pdf`, whatever the local file is called, so the archive
+   keeps showing the number. `--pdf` needs `--prepared`, and Yuki takes a custom
+   PDF only on a booked invoice. The lines are still sent: Yuki books the
+   amounts, and builds a Peppol invoice, from them. The PDF must start with
+   `%PDF-` and be at most 3 MB (Yuki's request limit, with base64 on top).
+
+A reservation that will not be sent is freed with
+`yuki sales invoice numbers --release <number>` (or `--resolve <number>
+rejected`); the prepared file can then no longer be booked.
+
 The ledger, `~/.config/yuki/invoice-numbers.json`, covers the time before the
-archive shows an invoice: a number is `pending` from just before Yuki is
-called, then `booked`, or `rejected` (free again) when Yuki refuses it. When no
-answer comes back it stays pending and taken: check "To be sent" or Sales in
-Yuki, then `yuki sales invoice numbers --resolve <number> booked` (or
-`rejected`). Even with `--quiet --yes`, a booking prints one line to stderr:
+archive shows an invoice: a number is `reserved` by `prepare --out`, `pending`
+from just before Yuki is called, then `booked`, or `rejected` (free again)
+when Yuki refuses it. When no answer comes back it stays pending and taken:
+check "To be sent" or Sales in Yuki, then
+`yuki sales invoice numbers --resolve <number> booked` (or `rejected`). Even
+with `--quiet --yes`, a booking prints one line to stderr:
 `BOOKS IMMEDIATELY: <number> <customer> <gross>`. The ledger keeps each
 administration's numbers apart, and `2026-01` is the same number as `2026-1`.
-
-To send a PDF rendered elsewhere:
-
-1. `yuki sales invoice prepare --template acme-hosting --number auto` prints the
-   fully resolved invoice as JSON and writes nothing: the number, the dates in
-   ISO and Dutch (`30 september 2026`), the customer with address and VAT number,
-   the lines with their remarks and unit, the totals per VAT rate, and the
-   Belgian structured payment reference. It ignores any `pdf`, which does not
-   exist yet. The totals are the CLI's computation (VAT per rate); Yuki books its
-   own, and `totals.vat_rounded_per_line` appears when rounding per line would
-   differ. The preview warns about the same.
-2. Render the PDF from that JSON.
-3. `yuki sales invoice create --template acme-hosting --number 2026-20 --date
-   2026-10-31 --pdf rendered.pdf --send email` sends the same number, dates and
-   lines. With `--pdf`, the number must be the one `prepare` printed (not `auto`)
-   and `--date` is required, so the PDF and the booking agree. Yuki stores the
-   PDF as `Invoice <number>.pdf`, whatever the local file is called, so the
-   archive keeps showing the number.
-
 The structured reference (`+++DDD/DDDD/DDDCC+++`) has ten base digits: the
 year, then the sequence padded to six digits, for a `<year>-<seq>` number
 (`2026-20` → `2026000020`), or else every digit of the number, left-padded with
@@ -406,7 +409,6 @@ due_days = 30                     # or: due_date = 2026-11-01; required to book
 # currency = "EUR"                # Yuki's default
 # notes = "Thank you for your business."   # printed on the invoice, max 500 characters
 # remarks = "internal"            # stored, not printed
-# pdf = "invoice.pdf"             # invoice files only: your own PDF, relative to this file
 
 [contact]
 # Yuki matches an existing contact by name and address, or creates it.
