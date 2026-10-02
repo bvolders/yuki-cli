@@ -17,7 +17,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::client::accounting::AccountingClient;
 use crate::client::archive::{ArchiveClient, ArchiveDocument};
 use crate::config::Config;
-use crate::error::YukiError;
+use crate::error::{Delivery, YukiError};
 use crate::folders::folder_id;
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
 use crate::sync::{self, Entry, Excludes, Found, Lock, STATE_FILE, State, Status, shell_quote};
@@ -498,7 +498,8 @@ async fn run_dir(
     plan.refresh_moved();
 
     let (mut failed, mut pending) = (0, 0);
-    let mut early: Vec<String> = Vec::new();
+    // A run whose first uploads all fail the same way is systemic: stop it.
+    let (mut first_err, mut streak) = (None, 0);
     let mut stop: Option<YukiError> = None;
     for (i, file) in batch.iter().enumerate() {
         if stop.is_some() {
@@ -543,7 +544,7 @@ async fn run_dir(
         let result = client
             .upload_document(target.admin_id, name, &BASE64.encode(&bytes), fid)
             .await;
-        let row = match result {
+        let e = match result {
             Ok(id) => {
                 if !quiet {
                     eprintln!("{id}");
@@ -551,81 +552,55 @@ async fn run_dir(
                 entry.status = Status::Uploaded;
                 entry.document_id = Some(id.clone());
                 entry.uploaded_at = Some(sync::now_utc());
-                Row::new(&file.rel, "uploaded").doc(Some(&id))
+                plan.state.files.insert(file.hash.clone(), entry);
+                record(&plan, &file.rel)?;
+                rows.push(Row::new(&file.rel, "uploaded").doc(Some(&id)));
+                streak = usize::MAX;
+                continue;
             }
-            Err(e) => {
-                if !quiet {
-                    eprintln!("{e}");
-                }
-                entry.error = Some(e.to_string());
-                match &e {
-                    // HTTP 401/403/429: refused before the request was
-                    // processed. Undo the write-ahead and stop, as every
-                    // further call would be refused too.
-                    YukiError::AuthFailed(m) if m.starts_with("HTTP ") => {
-                        undo(&mut plan, &file.hash, before)?;
-                        rows.push(Row::new(&file.rel, "not-attempted").error(e.to_string()));
-                        stop = Some(e);
-                        continue;
-                    }
-                    YukiError::RateLimited => {
-                        undo(&mut plan, &file.hash, before)?;
-                        rows.push(Row::new(&file.rel, "not-attempted").error(e.to_string()));
-                        stop = Some(e);
-                        continue;
-                    }
-                    // Any other authentication fault (matched by keywords)
-                    // may have come after processing: it stays pending, and
-                    // the run stops.
-                    YukiError::AuthFailed(_) => {
-                        pending += 1;
-                        stop = Some(YukiError::AuthFailed(e.to_string()));
-                        Row::new(&file.rel, "pending")
-                            .error(e.to_string())
-                            .note(pending_note(&plan.root, &file.rel))
-                    }
-                    YukiError::Request(r) if r.is_connect() || r.is_builder() => {
-                        failed += 1;
-                        entry.status = Status::Failed;
-                        Row::new(&file.rel, "failed")
-                            .error(e.to_string())
-                            .note("never reached Yuki; retried next run")
-                    }
-                    _ => {
-                        pending += 1;
-                        Row::new(&file.rel, "pending")
-                            .error(e.to_string())
-                            .note(pending_note(&plan.root, &file.rel))
-                    }
-                }
+            Err(e) => e,
+        };
+        if !quiet {
+            eprintln!("{e}");
+        }
+        let row = match e.delivery() {
+            // Refused unprocessed: undo the write-ahead and stop, as every
+            // further call would be refused too.
+            Delivery::Refused => {
+                undo(&mut plan, &file.hash, before)?;
+                rows.push(Row::new(&file.rel, "not-attempted").error(e.to_string()));
+                stop = Some(e);
+                continue;
+            }
+            Delivery::NotSent => {
+                failed += 1;
+                entry.status = Status::Failed;
+                Row::new(&file.rel, "failed")
+                    .error(e.to_string())
+                    .note("never reached Yuki; retried next run")
+            }
+            Delivery::Unknown => {
+                pending += 1;
+                Row::new(&file.rel, "pending")
+                    .error(e.to_string())
+                    .note(pending_note(&plan.root, &file.rel))
             }
         };
-        let ok = row.action == "uploaded";
-        let error = row.error.clone();
+        entry.error = Some(e.to_string());
         plan.state.files.insert(file.hash.clone(), entry);
-        if let Err(e) = plan.state.save(&plan.root) {
-            // The entry stays pending on disk, which is the safe reading.
-            return Err(YukiError::Config(format!(
-                "{} could not record the result for {} ({}): {e}; it stays pending",
-                STATE_FILE, file.rel, row.action
-            )));
-        }
+        record(&plan, &file.rel)?;
         rows.push(row);
-        // A run whose first uploads all go wrong the same way is systemic.
-        if i < EARLY_STOP && !ok && early.len() == i {
-            early.push(error);
-            if early.len() == EARLY_STOP && early.iter().all(|e| *e == early[0]) {
-                if !quiet {
-                    eprintln!(
-                        "stopping: the first {EARLY_STOP} uploads all failed with: {}",
-                        early[0]
-                    );
-                }
-                stop = Some(YukiError::Config(format!(
-                    "stopped after the first {EARLY_STOP} uploads all failed with: {}",
-                    early[0]
-                )));
-            }
+        let kind = std::mem::discriminant(&e);
+        if streak == i && first_err.is_none_or(|k| k == kind) {
+            first_err = Some(kind);
+            streak += 1;
+        }
+        if matches!(e, YukiError::AuthFailed(_)) {
+            stop = Some(e);
+        } else if streak == EARLY_STOP {
+            stop = Some(YukiError::Config(format!(
+                "stopped after the first {EARLY_STOP} uploads all failed alike, last with: {e}"
+            )));
         }
     }
     rows.append(&mut plan.rows);
@@ -644,6 +619,16 @@ async fn run_dir(
     }
     parts.extend(plan.attention());
     Ok(outcome(parts))
+}
+
+/// Save the state after a result; when that fails the entry stays pending on
+/// disk, which is the safe reading.
+fn record(plan: &Plan, rel: &str) -> Result<(), YukiError> {
+    plan.state.save(&plan.root).map_err(|e| {
+        YukiError::Config(format!(
+            "could not record the result for {rel}: {e}; it stays pending"
+        ))
+    })
 }
 
 /// Put back the record `hash` had before its write-ahead.

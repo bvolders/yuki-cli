@@ -54,7 +54,7 @@ impl AppError {
     fn kind(&self) -> &str {
         match self {
             Self::Yuki(e) => match e {
-                YukiError::AuthFailed(_) => "auth_failed",
+                YukiError::AuthFailed(_) | YukiError::Unauthorized(_) => "auth_failed",
                 YukiError::NotFound(_) => "not_found",
                 YukiError::RateLimited => "rate_limited",
                 YukiError::Config(_) => "config_error",

@@ -907,7 +907,7 @@ mod tests {
             "Invalid access key".into()
         )));
         // A WAF or proxy refusing the request says nothing about the key.
-        assert!(!rejects_key(&YukiError::AuthFailed("HTTP 403".into())));
+        assert!(!rejects_key(&YukiError::Unauthorized(403)));
         assert!(!rejects_key(&YukiError::RateLimited));
     }
 }

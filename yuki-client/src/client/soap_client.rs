@@ -160,7 +160,7 @@ impl SoapClient {
         }
 
         if status == 401 || status == 403 {
-            return Err(YukiError::AuthFailed(format!("HTTP {status}")));
+            return Err(YukiError::Unauthorized(status.as_u16()));
         }
         if status == 429 {
             return Err(YukiError::RateLimited);
