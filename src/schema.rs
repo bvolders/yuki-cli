@@ -99,15 +99,23 @@ pub fn generate() -> Value {
             },
             {
                 "name": "contacts search",
-                "description": "Search contacts by name or other criteria.",
+                "description": "Search contacts, active or not, by any field (default) or by the one --by names.",
                 "mutating": false,
                 "args": [
-                    {"name": "query", "type": "string", "required": true, "description": "Search query."}
+                    {"name": "query", "type": "string", "required": true, "description": "Search value."},
+                    {"name": "--by", "type": "string", "required": false, "enum": crate::client::contact::SEARCH_OPTIONS, "default": "All", "description": "Field to search (case-insensitive)."}
                 ],
                 "output_fields": [
-                    {"name": "id", "type": "string"},
-                    {"name": "name", "type": "string"},
-                    {"name": "type", "type": "string"}
+                    {"name": "ID", "type": "string"},
+                    {"name": "HID", "type": "string"},
+                    {"name": "Code", "type": "string"},
+                    {"name": "Name", "type": "string"},
+                    {"name": "Type", "type": "string"},
+                    {"name": "City", "type": "string"},
+                    {"name": "Country", "type": "string"},
+                    {"name": "VAT Number", "type": "string"},
+                    {"name": "Supplier", "type": "string"},
+                    {"name": "Customer", "type": "string"}
                 ]
             },
             {
@@ -256,6 +264,85 @@ pub fn generate() -> Value {
                 ]
             },
             {
+                "name": "sales invoice create",
+                "description": "Create a sales invoice in Yuki from a TOML file, a saved template, or a prepared invoice (--prepared, from prepare --out, booked exactly as prepared): a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 with invalid_input for a bad file, confirmation_required when not confirmed, outcome_unknown when the request went out without a usable answer (check Yuki before retrying), invoice_rejected when Yuki fails or skips the invoice or does not book it, send_incomplete when it booked but did not email it, and reference_mismatch when Yuki booked a prepared invoice under another reference than its number. A numbered booking goes through --prepared; --yes on a booking needs --confirm <number>.",
+                "mutating": true,
+                "args": [
+                    {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file, --template or --prepared is required."},
+                    {"name": "--template", "type": "string", "required": false, "description": "Saved template name, read from ~/.config/yuki/invoices/<name>.toml."},
+                    {"name": "--prepared", "type": "path", "required": false, "description": "A prepared invoice from prepare --out, booked exactly: its number must still be reserved for this content. Excludes --qty, --price, --date, --subject and --number; needs --send or --book."},
+                    {"name": "--qty", "type": "number", "required": false, "description": "Quantity of the invoice's only line, up to 4 decimals."},
+                    {"name": "--price", "type": "number", "required": false, "description": "Unit price excluding VAT of the invoice's only line, up to 2 decimals."},
+                    {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD. Default: the file's date, else today."},
+                    {"name": "--subject", "type": "string", "required": false, "description": "Subject (title) of the invoice, replacing the file's."},
+                    {"name": "--pdf", "type": "path", "required": false, "description": "Custom invoice PDF (max 3 MB) rendered from the --prepared file, which it requires; stored in Yuki as Invoice <number>.pdf instead of the generated invoice."},
+                    {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it (or --book), the invoice is a draft."},
+                    {"name": "--book", "type": "boolean", "required": false, "description": "Book the invoice without sending it."},
+                    {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."},
+                    {"name": "--confirm", "type": "string", "required": false, "description": "The invoice number being booked, repeated: required with --yes when booking (--send or --book), and must equal the number. A booking Yuki numbers itself can only be confirmed at the prompt."}
+                ],
+                "output_fields": [
+                    {"name": "Succeeded", "type": "string"},
+                    {"name": "Processed", "type": "string"},
+                    {"name": "Email Sent", "type": "string"},
+                    {"name": "Reference", "type": "string"},
+                    {"name": "Subject", "type": "string"},
+                    {"name": "PDF", "type": "string"},
+                    {"name": "Peppol", "type": "string"},
+                    {"name": "Message", "type": "string"}
+                ]
+            },
+            {
+                "name": "sales invoice prepare",
+                "description": "Print the fully resolved invoice as JSON (number, ISO and Dutch dates, customer, lines, totals per VAT rate, Belgian structured payment reference, the issuing firm from [seller]) for rendering a PDF; the totals are the CLI's computation (Yuki books its own). Ignores any pdf. Reads the sales archive and the local number ledger with --number. With --out it writes the invoice to that file and reserves its number for exactly that content (a local write); create --prepared books it.",
+                "mutating": false,
+                "args": [
+                    {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file or --template is required."},
+                    {"name": "--template", "type": "string", "required": false, "description": "Saved template name."},
+                    {"name": "--qty", "type": "number", "required": false, "description": "Quantity of the invoice's only line."},
+                    {"name": "--price", "type": "number", "required": false, "description": "Unit price excluding VAT of the invoice's only line."},
+                    {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD."},
+                    {"name": "--subject", "type": "string", "required": false, "description": "Subject of the invoice."},
+                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number (Reference), or auto: the lowest <year>-<seq> of the invoice date's year above the sales archive's highest (Invoice/Factuur <year>-<seq>.pdf) that the local ledger does not hold. Refused when either has it."},
+                    {"name": "--out", "type": "path", "required": false, "description": "Write the prepared invoice here (never over an existing file) and reserve its number. Needs --number and [seller] in the config."}
+                ],
+                "output_kind": "data",
+                "stdout_schema": {"type": "object", "required": ["number", "date", "customer", "lines", "totals", "payment_reference"]}
+            },
+            {
+                "name": "sales invoice numbers",
+                "description": "List the selected administration's invoice numbers, from the local ledger (invoice-numbers.json next to the config): reserved by prepare --out, pending from just before Yuki is called, then booked or rejected. --resolve <number> --as booked|rejected settles a pending number by hand after checking Yuki; --as rejected also frees a reservation, which can never be booked; makes no API call.",
+                "mutating": false,
+                "args": [
+                    {"name": "--resolve", "type": "string", "required": false, "description": "NUMBER to settle by hand, with --as (a local write)."},
+                    {"name": "--as", "type": "string", "required": false, "enum": ["booked", "rejected"], "description": "What --resolve settles the number as: booked (pending only) or rejected (pending or reserved)."}
+                ],
+                "output_fields": [
+                    {"name": "Number", "type": "string"},
+                    {"name": "Date", "type": "string"},
+                    {"name": "Customer", "type": "string"},
+                    {"name": "Gross", "type": "string"},
+                    {"name": "Status", "type": "string"},
+                    {"name": "Recorded", "type": "string"},
+                    {"name": "Booked", "type": "string"},
+                    {"name": "Note", "type": "string"}
+                ]
+            },
+            {
+                "name": "sales invoice templates",
+                "description": "List saved invoice templates (~/.config/yuki/invoices/*.toml), each validated; makes no API call.",
+                "mutating": false,
+                "output_fields": [
+                    {"name": "Name", "type": "string"},
+                    {"name": "Customer", "type": "string"},
+                    {"name": "Subject", "type": "string"},
+                    {"name": "Lines", "type": "string"},
+                    {"name": "Net", "type": "string"},
+                    {"name": "Path", "type": "string"},
+                    {"name": "Status", "type": "string"}
+                ]
+            },
+            {
                 "name": "invoices show",
                 "description": "Show one transaction by ID. Yuki cannot look a transaction up by ID, so this fetches every line on --account within --period (one API call) and keeps the matching one.",
                 "mutating": false,
@@ -276,15 +363,30 @@ pub fn generate() -> Value {
             },
             {
                 "name": "invoices document",
-                "description": "Show the document linked to a transaction.",
+                "description": "Save the document linked to a transaction under its own file name, or to --out (a file or a directory); never over an existing file. Read-only towards Yuki.",
                 "mutating": false,
                 "args": [
-                    {"name": "id", "type": "string", "required": true, "description": "Transaction ID."}
+                    {"name": "id", "type": "string", "required": true, "description": "Transaction ID."},
+                    {"name": "--out", "type": "path", "required": false, "description": "File or directory to write to."}
                 ],
                 "output_fields": [
-                    {"name": "id", "type": "string"},
-                    {"name": "filename", "type": "string"},
-                    {"name": "url", "type": "string"}
+                    {"name": "Transaction", "type": "string"},
+                    {"name": "Path", "type": "string"},
+                    {"name": "Bytes", "type": "string"}
+                ]
+            },
+            {
+                "name": "documents download",
+                "description": "Save an archive document's file under its own file name, or to --out (a file or a directory); never over an existing file. Read-only towards Yuki.",
+                "mutating": false,
+                "args": [
+                    {"name": "id", "type": "string", "required": true, "description": "Document ID, as shown by documents list."},
+                    {"name": "--out", "type": "path", "required": false, "description": "File or directory to write to."}
+                ],
+                "output_fields": [
+                    {"name": "Document", "type": "string"},
+                    {"name": "Path", "type": "string"},
+                    {"name": "Bytes", "type": "string"}
                 ]
             },
             {
@@ -414,6 +516,49 @@ pub fn generate() -> Value {
                     {"name": "id", "type": "string"},
                     {"name": "filename", "type": "string"},
                     {"name": "folder", "type": "string"}
+                ]
+            },
+            {
+                "name": "upload dir",
+                "description": "Upload the pdf/jpg/jpeg/png files under a directory that are not in Yuki yet, tracked by content hash in <path>/.yuki-sync.json. Uploads are recorded as pending before they are sent and never retried automatically when the outcome is uncertain; --seed-from-yuki records files Yuki already has.",
+                "mutating": true,
+                "args": [
+                    {"name": "path", "type": "path", "required": true, "description": "Directory to upload from."},
+                    {"name": "--folder", "type": "string", "required": false, "description": "Target folder.", "default": "uitzoeken"},
+                    {"name": "--exclude", "type": "string[]", "required": false, "description": "Case-insensitive glob of paths to skip; repeatable. Without / it matches any path component (a directory name skips its whole subtree); with / the whole relative path. _to_delete and .* are always skipped; symbolic links are never followed."},
+                    {"name": "--max", "type": "integer", "required": false, "description": "Upload at most this many files in this run.", "default": 25},
+                    {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the plan only: no API calls, nothing written."},
+                    {"name": "--seed-from-yuki", "type": "boolean", "required": false, "description": "Upload nothing; record files whose file name matches exactly one unclaimed Yuki document as already-in-yuki, after confirmation."},
+                    {"name": "--seed-folder", "type": "string[]", "required": false, "description": "Yuki folder to look in when seeding; repeatable. Defaults to --folder and inkoop."}
+                ],
+                "output_fields": [
+                    {"name": "Path", "type": "string", "description": "Path relative to the directory."},
+                    {"name": "Action", "type": "string", "description": "uploaded, pending, failed, changed, error, not-attempted, deferred, synced, duplicate, excluded; would-upload or would-seed on --dry-run; already-in-yuki, ambiguous, possible-match or not-in-yuki when seeding."},
+                    {"name": "Doc ID", "type": "string"},
+                    {"name": "Error", "type": "string"},
+                    {"name": "Note", "type": "string"}
+                ]
+            },
+            {
+                "name": "upload mark",
+                "description": "Record by hand, in the synced directory's .yuki-sync.json, that a file is in Yuki as a document (--doc-id), must never be uploaded (--skip), or is to be forgotten (--forget). Does not contact Yuki.",
+                "mutating": true,
+                "args": [
+                    {"name": "file", "type": "path", "required": true, "description": "The file to record."},
+                    {"name": "--doc-id", "type": "string", "required": false, "description": "The Yuki document ID the file was uploaded as."},
+                    {"name": "--skip", "type": "boolean", "required": false, "description": "Never upload this file."},
+                    {"name": "--forget", "type": "boolean", "required": false, "description": "Remove the record, so the next run treats the file as new; for a changed file, the record of the earlier content at its path."},
+                    {"name": "--folder", "type": "string", "required": false, "description": "The Yuki folder the document is in."},
+                    {"name": "--note", "type": "string", "required": false, "description": "Note to keep with the record."},
+                    {"name": "--dir", "type": "path", "required": false, "description": "The synced directory (its root); defaults to the nearest directory above the file with a .yuki-sync.json."},
+                    {"name": "--force", "type": "boolean", "required": false, "description": "Replace an existing record, or record a document ID already recorded for another file."}
+                ],
+                "output_fields": [
+                    {"name": "Path", "type": "string"},
+                    {"name": "Action", "type": "string", "description": "recorded, unchanged, or forgotten."},
+                    {"name": "Doc ID", "type": "string"},
+                    {"name": "Error", "type": "string"},
+                    {"name": "Note", "type": "string"}
                 ]
             },
             {
@@ -614,6 +759,36 @@ pub fn generate() -> Value {
                 "description": "A mutating command was invoked non-interactively without --yes."
             },
             {
+                "kind": "invalid_input",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "An invoice file or template is missing or invalid; every problem is listed."
+            },
+            {
+                "kind": "outcome_unknown",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "The invoice request went out but no usable answer came back: it may already exist in Yuki, so check before retrying."
+            },
+            {
+                "kind": "invoice_rejected",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "Yuki answered, but failed or skipped an invoice, or did not book it as --send or --book asked; its message is in the output and the error."
+            },
+            {
+                "kind": "send_incomplete",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "Yuki booked the invoice but did not email it as --send asked; the number is booked. Send it from Yuki or yourself. Peppol delivery is never reported, so it is not checked."
+            },
+            {
+                "kind": "reference_mismatch",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "Yuki booked the invoice under another reference than the number sent; the number stays pending in the ledger with a note giving both. Check Sales in Yuki."
+            },
+            {
                 "kind": "error",
                 "exit_code": 1,
                 "retryable": false,
@@ -640,7 +815,7 @@ fn enrich_v0_3(schema: &mut Value) {
             "effects".into(),
             json!(if !mutating {
                 "read_only"
-            } else if name == "upload file" {
+            } else if matches!(name.as_str(), "upload file" | "sales invoice create") {
                 "non_idempotent"
             } else {
                 "idempotent"
@@ -670,7 +845,10 @@ fn enrich_v0_3(schema: &mut Value) {
             );
             object.insert("fields_arg".into(), json!("--fields"));
         }
-        if matches!(name.as_str(), "upload file" | "profile remove") {
+        if matches!(
+            name.as_str(),
+            "upload file" | "upload dir" | "profile remove" | "sales invoice create"
+        ) {
             object.insert("confirmation_bypass_arg".into(), json!("--yes"));
         }
         if name == "capabilities" {

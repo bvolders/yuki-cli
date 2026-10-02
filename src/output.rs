@@ -153,6 +153,15 @@ pub fn format_error_json(message: &str, kind: &str) -> String {
     .unwrap_or_else(|_| format!(r#"{{"error":{{"kind":"{kind}","message":"{message}"}}}}"#))
 }
 
+/// `2048` → `2.0 KB`, for a human.
+pub fn human_size(bytes: u64) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} bytes"),
+        b if b < 1024 * 1024 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+    }
+}
+
 pub fn is_tty() -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stdout())
 }

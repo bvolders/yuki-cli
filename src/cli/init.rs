@@ -73,7 +73,7 @@ fn to_entries(admins: &[Administration]) -> BTreeMap<String, AdminEntry> {
 }
 
 /// The next line of `input`, trimmed; `None` at end of input.
-fn next_line(input: &mut impl BufRead) -> Option<String> {
+pub(crate) fn next_line(input: &mut impl BufRead) -> Option<String> {
     let mut line = String::new();
     match input.read_line(&mut line) {
         Ok(0) | Err(_) => None,
@@ -565,6 +565,8 @@ pub async fn run_with<R: BufRead>(
         region: None,
         base_url: saved_url.clone(),
         endpoint_override: None,
+        // The firm issuing invoices is not something init discovers.
+        seller: existing.as_ref().and_then(|c| c.seller.clone()),
     };
 
     // A saved base_url is an endpoint the user chose, like a flag: keep it.
@@ -907,7 +909,7 @@ mod tests {
             "Invalid access key".into()
         )));
         // A WAF or proxy refusing the request says nothing about the key.
-        assert!(!rejects_key(&YukiError::AuthFailed("HTTP 403".into())));
+        assert!(!rejects_key(&YukiError::Unauthorized(403)));
         assert!(!rejects_key(&YukiError::RateLimited));
     }
 }

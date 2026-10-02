@@ -17,6 +17,29 @@ fn builds_soap_envelope_with_session() {
 }
 
 #[test]
+fn param_values_are_escaped_and_survive_a_parse() {
+    let name = r#"Tom & Jerry <x> "q" 'a'.pdf"#;
+    let envelope = SoapEnvelope::new("UploadDocument")
+        .session("s-1")
+        .param("fileName", name)
+        .param("folder", "7")
+        .build();
+    assert!(
+        envelope.contains("Tom &amp; Jerry &lt;x&gt; &quot;q&quot; &apos;a&apos;.pdf"),
+        "{envelope}"
+    );
+    // A real XML parser reads the envelope and gets the name back unchanged.
+    assert_eq!(
+        SoapClient::parse_single_result(&envelope, "fileName").unwrap(),
+        name
+    );
+    assert_eq!(
+        SoapClient::parse_single_result(&envelope, "folder").unwrap(),
+        "7"
+    );
+}
+
+#[test]
 fn builds_soap_envelope_without_session() {
     let envelope = SoapEnvelope::new("Authenticate")
         .param("accessKey", "my-api-key")
@@ -129,4 +152,19 @@ fn parses_outstanding_debtor_items() {
     assert_eq!(items[0].date, "2025-03-01");
     assert_eq!(items[0].amount, "1000.00");
     assert_eq!(items[0].open_amount, "500.00");
+}
+
+#[test]
+fn a_payload_buys_time_up_to_ten_minutes() {
+    use std::time::Duration;
+    use yuki_client::client::soap_client::{REQUEST_TIMEOUT, payload_timeout};
+    assert_eq!(payload_timeout(""), REQUEST_TIMEOUT);
+    assert_eq!(
+        payload_timeout(&"a".repeat(4_000_000)),
+        Duration::from_secs(180)
+    );
+    assert_eq!(
+        payload_timeout(&"a".repeat(100_000_000)),
+        Duration::from_secs(600)
+    );
 }

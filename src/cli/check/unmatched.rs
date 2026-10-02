@@ -7,14 +7,15 @@ use std::collections::{HashMap, HashSet};
 use futures_util::future::try_join_all;
 
 use super::resolve_period;
-use crate::cli::setup_domain;
+use crate::cli::setup_archive;
 use crate::client::Region;
 use crate::client::accounting::{
     AccountingClient, GlTransactionWithContact, OutstandingItem, TransactionType,
 };
-use crate::client::archive::{ArchiveClient, ArchiveDocument};
+use crate::client::archive::ArchiveDocument;
 use crate::config::Config;
 use crate::error::YukiError;
+pub(super) use crate::money::Cents;
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
 use crate::period::month_start_before;
 
@@ -313,55 +314,6 @@ struct UnmatchedDebit {
     amount: String,
     counterparty: String,
     description: String,
-}
-
-/// An amount in whole cents, so amounts compare exactly and key maps directly.
-///
-/// Assumes the API sends at most two decimals, which Yuki does. An amount
-/// with more is rounded per amount, half away from zero (`1.005` may land on
-/// either cent through its `f64` form), where the code before `Cents` compared
-/// `{:.2}`-formatted strings; the two can differ only on such amounts.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct Cents(pub(super) i64);
-
-impl Cents {
-    pub(super) const ZERO: Self = Self(0);
-
-    /// Parse an API amount such as `"-7.3"`, rounded to the cent.
-    pub(super) fn parse(amount: &str) -> Option<Self> {
-        let value = amount
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|a| a.is_finite())?;
-        Some(Self((value * 100.0).round() as i64))
-    }
-
-    pub(super) fn abs(self) -> Self {
-        Self(self.0.abs())
-    }
-}
-
-impl std::ops::Neg for Cents {
-    type Output = Self;
-    fn neg(self) -> Self {
-        Self(-self.0)
-    }
-}
-
-impl std::iter::Sum for Cents {
-    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        Self(iter.map(|c| c.0).sum())
-    }
-}
-
-impl std::fmt::Display for Cents {
-    /// Two decimals with a dot, as the API writes amounts: `-7.30`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let sign = if self.0 < 0 { "-" } else { "" };
-        let abs = self.0.unsigned_abs();
-        write!(f, "{sign}{}.{:02}", abs / 100, abs % 100)
-    }
 }
 
 /// Date and amount, under which a bank debit and its ledger counter-entry meet.
@@ -777,7 +729,14 @@ pub async fn unmatched(
     quiet: bool,
 ) -> Result<(), YukiError> {
     let (start, end) = resolve_period(period)?;
-    let (accounting, target) = setup_domain(config, admin).await?;
+    // The Accounting session works on the archive too, saving an
+    // Authenticate. It also carries SetCurrentDomain(target.domain_id), so
+    // the archive is searched in the target administration's domain,
+    // deliberately: the documents must belong to the administration whose
+    // bank lines are being checked. A fresh Archive session (as `documents`
+    // and `upload` use) would search the key's default domain instead, which
+    // differs for a key that reaches several domains.
+    let (accounting, archive, target) = setup_archive(config, admin).await?;
     let setup = UnmatchedSetup::resolve(config, target.config_name, bank_accounts);
     // Read the creditors account far enough back to see invoices paid later.
     let lookback = month_start_before(&start, LOOKBACK_MONTHS);
@@ -796,19 +755,6 @@ pub async fn unmatched(
         eprintln!("Fetching booked invoices from archive...");
     }
     let admin_id = target.admin_id;
-    // The Accounting session works on the archive too, saving an Authenticate.
-    // It also carries SetCurrentDomain(target.domain_id), so the archive is
-    // searched in the target administration's domain, deliberately: the
-    // documents must belong to the administration whose bank lines are being
-    // checked. A fresh Archive session (as `documents` and `upload` use) would
-    // search the key's default domain instead, which differs for a key that
-    // reaches several domains.
-    let session = accounting
-        .session_id()
-        .ok_or_else(|| YukiError::AuthFailed("no session after authenticating".into()))?;
-    let archive = ArchiveClient::new()
-        .with_api_root(target.api_root)
-        .with_session(session);
     // The requests are independent, so they run concurrently; results keep
     // their order, so the output does not depend on timing.
     let (bank_entries, creditor_entries, transfer_entries, creditor_items, archive_docs) = tokio::try_join!(
@@ -1153,16 +1099,6 @@ mod tests {
 
     fn key(date: &str, amount: &str) -> EntryKey {
         entry_key(date, Cents::parse(amount).unwrap())
-    }
-
-    #[test]
-    fn cents_parse_and_print_like_the_api() {
-        assert_eq!(Cents::parse(" -7.3 "), Some(Cents(-730)));
-        assert_eq!(Cents::parse("133.20"), Some(Cents(13320)));
-        assert_eq!(Cents::parse("x"), None);
-        assert_eq!(Cents(-730).to_string(), "-7.30");
-        assert_eq!(Cents(5).to_string(), "0.05");
-        assert_eq!(Cents(-5).to_string(), "-0.05");
     }
 
     /// Whether the ledger shows the payment of `amount` on `date` as covered.

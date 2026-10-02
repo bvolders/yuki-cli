@@ -6,95 +6,26 @@
 //! tests/config.rs and cli::tests. A local mock stands in for Yuki; nothing
 //! leaves the machine.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
-
 mod common;
 
-use common::{stdout_json, yuki, yuki_with_env};
+use common::{RequestLog, response, stdout_json, yuki, yuki_with_env};
 
 use tempfile::TempDir;
 
-const AUTHENTICATE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <AuthenticateResponse xmlns="http://www.theyukicompany.com/">
-      <AuthenticateResult>session-1</AuthenticateResult>
-    </AuthenticateResponse>
-  </soap:Body>
-</soap:Envelope>"#;
-
-const ADMINISTRATIONS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <AdministrationsResponse xmlns="http://www.theyukicompany.com/">
-      <AdministrationsResult>
-        <Administrations xmlns="">
-          <Administration ID="admin-be">
-            <Name>Voorbeeld BV</Name>
-            <DomainID>domain-be</DomainID>
-          </Administration>
-        </Administrations>
-      </AdministrationsResult>
-    </AdministrationsResponse>
-  </soap:Body>
-</soap:Envelope>"#;
-
-/// `(path, SOAPAction)` of every request the mock received.
-type RequestLog = Arc<Mutex<Vec<(String, String)>>>;
+const ADMINISTRATIONS: &str = r#"<Administrations xmlns="">
+  <Administration ID="admin-be">
+    <Name>Voorbeeld BV</Name>
+    <DomainID>domain-be</DomainID>
+  </Administration>
+</Administrations>"#;
 
 /// Serve Authenticate/Administrations on a random port. Returns the API root and
 /// the request log.
 fn mock_yuki() -> (String, RequestLog) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
-    let root = format!("http://{}/ws", listener.local_addr().expect("addr"));
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let log = Arc::clone(&seen);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let mut request_line = String::new();
-            reader.read_line(&mut request_line).ok();
-            let path = request_line
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_default()
-                .to_string();
-            let (mut action, mut length) = (String::new(), 0usize);
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                    break;
-                }
-                let lower = line.to_ascii_lowercase();
-                if let Some(v) = lower.strip_prefix("content-length:") {
-                    length = v.trim().parse().unwrap_or(0);
-                } else if lower.starts_with("soapaction:") {
-                    action = line["soapaction:".len()..]
-                        .trim()
-                        .trim_matches('"')
-                        .to_string();
-                }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).ok();
-            let reply = if action.ends_with("Administrations") {
-                ADMINISTRATIONS
-            } else {
-                AUTHENTICATE
-            };
-            log.lock().expect("log").push((path, action));
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-                reply.len()
-            )
-            .ok();
-        }
-    });
-    (root, seen)
+    common::mock(|r| match r.action.as_str() {
+        "Administrations" => (200, response("Administrations", ADMINISTRATIONS)),
+        _ => (200, response("Authenticate", "session-1")),
+    })
 }
 
 fn config_path(home: &TempDir) -> std::path::PathBuf {
@@ -117,17 +48,23 @@ fn init_with_region_be_stores_it_and_later_commands_use_the_belgian_host() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let requests = seen.lock().expect("log").clone();
+    // The full SOAPAction header: namespace and quotes.
+    let requests: Vec<(String, String)> = seen
+        .lock()
+        .expect("log")
+        .iter()
+        .map(|r| (r.path.clone(), r.soap_action.clone()))
+        .collect();
     assert_eq!(
         requests,
-        vec![
+        [
             (
-                "/ws/Accounting.asmx".to_string(),
-                "http://www.theyukicompany.com/Authenticate".to_string()
+                "/ws/Accounting.asmx".into(),
+                "\"http://www.theyukicompany.com/Authenticate\"".into()
             ),
             (
-                "/ws/Accounting.asmx".to_string(),
-                "http://www.theyukicompany.com/Administrations".to_string()
+                "/ws/Accounting.asmx".into(),
+                "\"http://www.theyukicompany.com/Administrations\"".into()
             ),
         ]
     );

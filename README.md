@@ -4,7 +4,7 @@
 
 CLI client for the [Yuki](https://www.yukiworks.nl) bookkeeping SOAP API.
 
-[Yuki](https://www.yukiworks.nl) is a Dutch bookkeeping SaaS used for accounting, VAT returns, and document archiving. This CLI lets you query your administration, find missing invoices, and upload documents — from the terminal or as part of automated workflows.
+[Yuki](https://www.yukiworks.nl) is a Dutch bookkeeping SaaS used for accounting, VAT returns, and document archiving. This CLI lets you query your administration, find missing invoices, upload documents, and create sales invoices — from the terminal or as part of automated workflows.
 
 > **Note:** This project is not affiliated with or endorsed by Yuki Software.
 
@@ -165,10 +165,11 @@ yuki invoices list                        # Outstanding sales invoices (debtor i
 yuki invoices list --invoice-type purchase # Outstanding purchase invoices (creditor items)
 yuki invoices list --period 2025-Q1       # Only items dated in the period
 yuki invoices show <transaction-id> --account 400000 --period 2025-Q1  # One transaction
-yuki invoices document <transaction-id>   # Document linked to a transaction
+yuki invoices document <transaction-id>   # Save the document linked to a transaction
 yuki sales items                          # Sales item catalogue (products/services)
 
-yuki contacts search "Hetzner"            # Search contacts
+yuki contacts search "Hetzner"            # Search contacts on every field
+yuki contacts search BE0123456789 --by VATNumber  # One field: Name, City, Code, HID, ...
 yuki contacts list                        # List all suppliers and customers
 
 yuki accounts balance --account 11001 --period 2025-Q1  # Balance on 2025-03-31 (or today, if earlier)
@@ -183,6 +184,7 @@ yuki projects balance <code> --period 2025  # Project balance
 yuki documents list --folder inkoop       # List documents in a folder
 yuki documents search "factuur"           # Full-text search
 yuki documents exists --amount 7.28 --date 2025-03  # Check if invoice exists
+yuki documents download <id> [--out <path>]  # Save the file, under its own name by default
 
 yuki admin list                           # List administrations
 yuki admin switch <name>                  # Change default administration
@@ -240,6 +242,253 @@ yuki upload file invoice.pdf --amount 114.27 \
 yuki upload categories                                  # List cost category IDs
 yuki upload payment-methods                             # List payment method IDs
 ```
+
+#### A folder of receipts, uploaded once
+
+`upload dir` uploads the pdf, jpg, jpeg and png files under a directory that
+are not in Yuki yet. It records every file in `<dir>/.yuki-sync.json`, keyed by
+the file's sha256, so a renamed or moved file is not uploaded again. Run it on
+the root of the tree: a state file above or below the directory is refused. An
+OS lock on `.yuki-sync.json.lock` keeps two runs apart, and is released when a
+run ends or is killed.
+
+```sh
+yuki upload dir ~/Receipts --dry-run                    # The plan: no API calls, nothing written
+yuki upload dir ~/Receipts --seed-from-yuki             # Record files Yuki already has (by file name)
+yuki upload mark <file> --doc-id <id>                   # Record one file by hand
+yuki upload mark <file> --skip                          # Never upload this file
+yuki upload mark <file> --forget                        # Drop its record: upload it (again)
+yuki upload dir ~/Receipts                              # Show the plan, ask, then upload
+yuki upload dir ~/Receipts --yes --max 10 \
+  --exclude 2025                                         # Unattended, at most 10, skip any 2025/ directory
+```
+
+Dotfiles, dot-directories and `_to_delete` are always skipped, and symbolic
+links are never followed. Excludes are case-insensitive globs: one without `/`
+matches any path component (so `2025` skips that directory and everything in
+it), one with `/` the whole relative path.
+
+It prints the plan and asks before uploading; without a terminal it needs
+`--yes`. Before each upload the file is recorded as **pending**; when Yuki
+returns a document ID it becomes **uploaded**. Every other outcome, whether a
+timeout, a SOAP fault, a server error, a crash or a kill, leaves it pending,
+because the file may already be in Yuki. Pending files are never retried
+automatically and the exit code stays 1 until each is resolved: check Yuki,
+then `upload mark <file> --doc-id <id>`, or `--forget` to upload it again, or
+seed. Only a request that never reached Yuki (a refused connection) is
+recorded as **failed** and retried. A recorded path whose content changed is
+shown as **changed** and not uploaded until you `--forget` or `--skip` it. An
+authentication error, or the first 3 uploads of a run failing the same way,
+stops the run. `--max` (default 25) caps the uploads of one run.
+
+Seeding reads the upload folder and `inkoop` (or `--seed-folder`) and matches
+by file name only, because Yuki reports no size or hash: a different file
+uploaded under the same name is recorded as in Yuki, and a copy uploaded under
+another name is not found. A Yuki document is claimed at most once; names
+matching several documents, documents already recorded, and documents two local
+files claim are `ambiguous` and not recorded. Near matches (`possible-match`)
+are listed, never recorded. Seeding shows the matches and asks before writing,
+and records nothing if the listing pages look wrong. A state file that does not
+parse is refused rather than overwritten.
+
+### Sales invoices
+
+```sh
+yuki sales invoice create --file invoice.toml           # Ad-hoc invoice, created as a draft
+yuki sales invoice create --template acme-hosting       # From ~/.config/yuki/invoices/acme-hosting.toml
+yuki sales invoice create --template acme-consulting \
+  --qty 7.5 --subject "Consultancy October 2026"        # Monthly run: this month's hours
+yuki sales invoice create --file invoice.toml --dry-run # Preview and xmlDoc only; no API call
+yuki sales invoice prepare --template acme-hosting --number auto \
+  --date 2026-10-31 --out 2026-10-acme.json             # Reserve the number for this content
+yuki sales invoice create --prepared 2026-10-acme.json \
+  --pdf 2026-10-acme.pdf --send email                   # Book exactly that, with your PDF
+yuki sales invoice create --prepared 2026-10-acme.json \
+  --pdf 2026-10-acme.pdf --send email --yes --confirm 2026-20  # The same, unattended
+yuki sales invoice numbers                              # Invoice numbers given out (local ledger)
+yuki sales invoice numbers --resolve 2026-20 --as rejected  # Free a reservation, or a number Yuki did not create
+yuki sales invoice numbers --resolve 2026-20 --as booked    # Settle a pending number Yuki booked
+yuki sales invoice templates                            # List saved templates, each validated
+```
+
+`create --file` or `--template` makes a **draft** by default: it lands in
+Yuki's "To be sent" list, unbooked and without an invoice number, so you can
+still check or edit it in Yuki. `--send email|peppol|both` books it instead and
+sends it; `--book` books it without sending, for invoices you send yourself.
+Booking is immediate and fixes the number: there is no draft to review, and
+the preview says so. A booking needs a due date (`due_days` or `due_date`), and
+`--send email` an email address for a contact without a code. Yuki's answer
+says nothing about Peppol delivery: with `--send peppol` or `both`, the preview
+and the result's `Peppol` column say `requested (Yuki does not report
+delivery)`, never delivered.
+
+Before any write, the command prints a preview to stderr (customer, lines, net,
+VAT, gross total, and whether it creates a draft or books and sends) and asks
+for confirmation, which declines unless you answer `y`; the question names the
+invoice number. `--yes` skips the prompt and is required when stdin or stderr
+is not a terminal. A booking without the prompt also needs `--confirm
+<number>`, the invoice number repeated, so an unattended run books only the
+number it meant to; a booking Yuki numbers itself can only be confirmed at the
+prompt. `--dry-run` prints the preview, then the exact `xmlDoc` on stdout, and
+makes no API call. The command exits 1 with kind `invalid_input` for a bad
+file (every problem listed), `confirmation_required` when nothing was sent for
+want of a confirmation, `invoice_rejected` when Yuki fails or skips the invoice
+or does not book it (after printing Yuki's answer), `send_incomplete` when it
+booked the invoice but did not email it (send it from Yuki or yourself), and
+`outcome_unknown` or `reference_mismatch` as below. Totals must be positive:
+credit notes are not supported.
+
+#### Your own PDF with your own number
+
+Only a prepared invoice carries a CLI-given number, so the number, the PDF and
+the booking are tied to one file:
+
+1. `yuki sales invoice prepare --template acme-hosting --number auto --date
+   2026-10-31 --out 2026-10-acme.json` writes the fully resolved invoice to the
+   file (never over an existing one), prints it, and **reserves** its number in
+   the ledger for exactly that content. The JSON has the number, the dates in
+   ISO and Dutch (`31 oktober 2026`), the issuing firm (`firm`, from
+   `[seller]`), the customer with address and VAT number, the lines with their
+   remarks and unit, the totals per VAT rate, the `vat_mention`, and the
+   Belgian structured payment reference. The totals are the CLI's computation
+   (VAT per rate); Yuki books its own, and `totals.vat_rounded_per_line`
+   appears when rounding per line would differ.
+2. Render the PDF from that file.
+3. `yuki sales invoice create --prepared 2026-10-acme.json --pdf 2026-10-acme.pdf
+   --send email` books exactly the prepared content: it takes no `--file`,
+   `--template`, `--qty`, `--price`, `--date` or `--subject`, and is refused
+   unless the number is still reserved, in the selected administration, for a
+   file with the same content (reformatting it is fine; any edit is not). Yuki
+   stores the PDF as `Invoice <number>.pdf`, whatever the local file is called,
+   so the archive keeps showing the number; `--pdf` needs `--prepared`. The
+   lines are still sent: Yuki books the amounts, and builds a Peppol invoice,
+   from them. The PDF must start with `%PDF-` and be at most 3 MB.
+
+`--number <REF>` gives that number; `--number auto` reads the sales (`verkoop`)
+archive for the invoice year, where Yuki names each invoice PDF after its
+number (`Invoice 2026-19.pdf`; only `.pdf` files named `Invoice <year>-<seq>`
+or `Factuur <year>-<seq>` count), and takes the lowest number above the
+archive's highest that the ledger does not hold, padded like the existing
+numbers (`2026-20`, then `2026-21` for the next invoice, even before the first
+is booked). A number the archive or the ledger already has is refused. Yuki's
+own counter does not learn about numbers given this way, so once you start,
+number every invoice here.
+
+The ledger, `~/.config/yuki/invoice-numbers.json`, keeps each administration's
+numbers (`2026-01` is the same number as `2026-1`) from `prepare` until the
+archive shows the invoice. A number is `reserved` by `prepare --out`, `pending`
+from just before Yuki is called, then `booked`, or `rejected` (free again) when
+Yuki did not create it. If nothing reached Yuki (no connection, or refused
+unprocessed with HTTP 401, 403 or 429), it is `reserved` again for the same
+file: run the same `create --prepared` again. If the request went out but no
+usable answer came back (a timeout, a dropped connection, a SOAP fault or a
+server error), the command exits 1 with kind `outcome_unknown` and the number
+stays `pending`: check "To be sent" or Sales in Yuki, then settle it with
+`yuki sales invoice numbers --resolve <number> --as booked` (or `--as
+rejected`). If Yuki booked it under another `Reference` (`2026-020` counts as
+`2026-20`), or none, the command exits 1 with kind `reference_mismatch` and a
+`REFERENCE MISMATCH` message, even with `--quiet`, saying whether the email
+was requested and sent and whether Peppol was requested; the number stays
+pending with a note naming both. Correct the booking in Sales in Yuki, then
+settle ours as `booked` if the customer may have the invoice under it, else as
+`rejected`. A reservation that will not be sent is freed with `--resolve
+<number> --as rejected` (it can never be `--as booked`); the next `auto` gives
+the number out again. `prepare`, `create` and `numbers` warn about a
+reservation older than 7 days: with continuous numbering, a number never booked
+is a gap. Even with `--quiet --yes`, a booking prints one line to stderr:
+`BOOKS IMMEDIATELY: <number> <customer> <gross>`. The request may take 60
+seconds plus 30 per megabyte of PDF.
+
+The structured reference (`+++DDD/DDDD/DDDCC+++`) has ten base digits: the
+year, then the sequence padded to six digits, for a `<year>-<seq>` number
+(`2026-20` → `2026000020`), or else every digit of the number, left-padded with
+zeros. `CC` is the base modulo 97, or 97 when that is 0: `2026-20` gives
+`+++202/6000/02014+++`.
+
+Recurring invoices are templates you run yourself: one file per customer in
+`~/.config/yuki/invoices/<name>.toml`, prepared each month with `prepare
+--template <name> --number auto --out <file>` (or created as a draft with
+`create --template`). `--qty` and `--price` replace the quantity and
+price of a single-line invoice, `--date` the invoice date (default: the file's,
+else today) and `--subject` its subject. An invoice file has the same format:
+
+```toml
+# ~/.config/yuki/invoices/acme-hosting.toml
+subject = "Managed hosting"
+due_days = 30                     # or: due_date = 2026-11-01; required to book
+# vat_mention = "Btw verlegd"     # printed on a rendered invoice; the preview warns at 0% without one
+# date = 2026-10-01               # default: today
+# payment_method = "ElectronicTransfer"
+# layout = "Standard"             # a layout name from Yuki; default layout if unknown
+# currency = "EUR"                # without it, none is sent (prepared files too): Yuki's default
+# notes = "Thank you for your business."   # printed on the invoice, max 500 characters
+# remarks = "internal"            # stored, not printed
+
+[contact]
+# Yuki matches an existing contact by name and address, or creates it.
+name = "Acme BV"
+country = "BE"                    # required without a code (ISO 3166-1 alpha-2)
+address = "Kerkstraat 1"
+zipcode = "9000"
+city = "Gent"
+vat_number = "BE0123456789"
+email = "billing@acme.example"    # needed for --send email
+type = "company"                  # or "person" (Yuki's default)
+# address_2 = "bus 2"
+# code = "C0042"                  # a contact code, if yours has one
+
+[[lines]]
+description = "Managed hosting"
+qty = 1                           # default 1, up to 4 decimals
+price = 100.00                    # unit price excluding VAT, up to 2 decimals
+vat_percentage = 21               # with vat_type, selects the VAT code
+vat_type = 1                      # your administration's VAT type number
+gl_account = "700000"             # optional revenue account
+# vat_description = "BTW 21%"     # optional, to pick between VAT codes
+# product_code = "HOST"           # optional item number of a Yuki sales item
+# remarks = "waarvan overdracht auteursrecht van 25% of €{pct_of_net:25}"  # shown under the line
+# unit = "u"                      # unit of qty, for prepare's JSON (a rendered PDF) only
+```
+
+The `subject`, `notes`, `remarks` and `vat_mention`, and each line's
+`description` and `remarks`, may hold placeholders, filled in for the invoice
+date when the invoice is read (so `prepare` already shows the final text):
+`{month}` (the Dutch month name, `oktober`), `{year}` (`2026`), `{month_num}`
+(`10`) and, in a line only, `{pct_of_net:25}`: 25% of that line's net, rounded
+to the cent, in Belgian notation (`4.312,50`). `{{` and `}}` are literal
+braces; any other text between braces, or a brace on its own, is an error.
+
+A rendered invoice also prints the firm that issues it. `prepare` gives it as
+`firm`, from a `[seller]` table in `~/.config/yuki/config.toml` (`bic`,
+`legal_form` and `rpr` are optional and come out as `null` when unset);
+`prepare --out` needs it, while `create --prepared` reads the firm from the
+file:
+
+```toml
+[seller]
+name = "Your Firm"
+address = "Street 1"
+zipcode = "1000"
+city = "Brussel"
+country = "BE"
+phone = "0400000000"
+enterprise_number = "0123.456.789"
+vat_number = "BE0123.456.789"
+iban = "BE00000000000000"
+# bic = "GEBABEBB"
+# legal_form = "BV"
+# rpr = "RPR Brussel"
+```
+
+Real Yuki contacts often have an empty `Code`, so match on name, address and VAT
+number. `yuki contacts search <name>` shows each contact's HID, city and VAT
+number to copy into a template.
+
+The example uses Belgian 21% VAT; nothing in the CLI assumes a country. The VAT
+percentage and type must match a VAT code of your administration, or Yuki
+rejects the invoice: check Settings > VAT rates in Yuki or `yuki vat codes`. The
+preview's VAT is computed per rate on the summed net and rounded once; the
+booked figure is Yuki's own.
 
 ### Global flags
 

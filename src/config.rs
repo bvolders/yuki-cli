@@ -174,6 +174,54 @@ pub struct Config {
     /// Wins over everything in the file and is never written back to it.
     #[serde(skip)]
     pub endpoint_override: Option<EndpointOverride>,
+    /// `[seller]`: the firm issuing sales invoices, as a rendered invoice
+    /// prints it. Needed by `sales invoice prepare --out`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller: Option<Seller>,
+}
+
+/// The firm issuing sales invoices (`[seller]` in the config).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Seller {
+    pub name: String,
+    pub address: String,
+    pub zipcode: String,
+    pub city: String,
+    /// ISO 3166-1 alpha-2, e.g. `BE`.
+    pub country: String,
+    pub phone: String,
+    /// Ondernemingsnummer, e.g. `0748.926.706`.
+    pub enterprise_number: String,
+    pub vat_number: String,
+    pub iban: String,
+    // Written as `null` in a prepared invoice's `firm`; TOML leaves a
+    // `None` out of the config by itself.
+    #[serde(default)]
+    pub bic: Option<String>,
+    #[serde(default)]
+    pub legal_form: Option<String>,
+    /// RPR/RPM and its court, e.g. `RPR Antwerpen, afdeling Antwerpen`.
+    #[serde(default)]
+    pub rpr: Option<String>,
+}
+
+impl Seller {
+    /// The `[seller]` table to add to the config, for an error message.
+    pub const SNIPPET: &'static str = r#"[seller]
+name = "Your Firm"
+address = "Street 1"
+zipcode = "1000"
+city = "Brussel"
+country = "BE"
+phone = "0400000000"
+enterprise_number = "0123.456.789"
+vat_number = "BE0123.456.789"
+iban = "BE00000000000000"
+# bic = "GEBABEBB"
+# legal_form = "BV"
+# rpr = "RPR Brussel"
+"#;
 }
 
 /// A run-scoped endpoint: where to send requests and, when known, which
@@ -194,6 +242,14 @@ pub struct Endpoint<'a> {
 }
 
 impl Config {
+    /// The directory the config lives in, where the invoice templates and
+    /// the invoice number ledger live too.
+    pub fn dir() -> PathBuf {
+        Self::default_path()
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    }
+
     pub fn default_path() -> PathBuf {
         #[cfg(unix)]
         {

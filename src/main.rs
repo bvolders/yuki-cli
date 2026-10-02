@@ -4,10 +4,11 @@ use std::process;
 use clap::{CommandFactory, Parser};
 use owo_colors::OwoColorize;
 use yuki_cli::cli::Commands;
+use yuki_cli::cli::sales_invoice::InvoiceError;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
     DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, SalesCommands,
-    UploadCommands, VatCommands,
+    SalesInvoiceCommands, UploadCommands, VatCommands,
 };
 use yuki_cli::cli::{Cli, RunEndpoint};
 use yuki_cli::config::Config;
@@ -17,7 +18,9 @@ use yuki_cli::output::{ListOptions, format_error_json, is_tty};
 enum AppError {
     Yuki(YukiError),
     Other(anyhow::Error),
-    ConfirmationRequired(String),
+    /// A failure with its own error kind (`invalid_input`,
+    /// `confirmation_required`, `outcome_unknown`, …), always exit code 1.
+    Kinded(&'static str, String),
 }
 
 impl fmt::Display for AppError {
@@ -25,7 +28,7 @@ impl fmt::Display for AppError {
         match self {
             Self::Yuki(e) => write!(f, "{e}"),
             Self::Other(e) => write!(f, "{e}"),
-            Self::ConfirmationRequired(message) => write!(f, "{message}"),
+            Self::Kinded(_, message) => write!(f, "{message}"),
         }
     }
 }
@@ -42,26 +45,38 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+impl From<InvoiceError> for AppError {
+    fn from(e: InvoiceError) -> Self {
+        match e {
+            InvoiceError::Yuki(e) => Self::Yuki(e),
+            other => Self::Kinded(other.kind(), other.to_string()),
+        }
+    }
+}
+
 impl AppError {
+    fn confirmation_required(message: impl Into<String>) -> Self {
+        Self::Kinded("confirmation_required", message.into())
+    }
+
     fn exit_code(&self) -> u8 {
         match self {
             Self::Yuki(e) => e.exit_code(),
-            Self::Other(_) => 1,
-            Self::ConfirmationRequired(_) => 1,
+            Self::Other(_) | Self::Kinded(..) => 1,
         }
     }
 
     fn kind(&self) -> &str {
         match self {
             Self::Yuki(e) => match e {
-                YukiError::AuthFailed(_) => "auth_failed",
+                YukiError::AuthFailed(_) | YukiError::Unauthorized(_) => "auth_failed",
                 YukiError::NotFound(_) => "not_found",
                 YukiError::RateLimited => "rate_limited",
                 YukiError::Config(_) => "config_error",
                 _ => "error",
             },
             Self::Other(_) => "error",
-            Self::ConfirmationRequired(_) => "confirmation_required",
+            Self::Kinded(kind, _) => kind,
         }
     }
 }
@@ -178,8 +193,8 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                 }
                 ProfileCommands::Remove { name } => {
                     if !cli.yes {
-                        return Err(AppError::ConfirmationRequired(
-                            "profile removal requires --yes".into(),
+                        return Err(AppError::confirmation_required(
+                            "profile removal requires --yes",
                         ));
                     }
                     yuki_cli::cli::account::profile_remove(&mut config, &name, format, cli.quiet)?;
@@ -254,8 +269,8 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
             let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
-                ContactCommands::Search { query } => {
-                    yuki_cli::cli::contacts::search(&config, admin, &query, format).await?;
+                ContactCommands::Search { query, by } => {
+                    yuki_cli::cli::contacts::search(&config, admin, &query, &by, format).await?;
                 }
                 ContactCommands::List {
                     contact_type,
@@ -393,14 +408,21 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?;
                 }
-                InvoiceCommands::Document { id } => {
-                    yuki_cli::cli::invoices::document(&config, admin, &id, format).await?;
+                InvoiceCommands::Document { id, out } => {
+                    yuki_cli::cli::invoices::document(
+                        &config,
+                        admin,
+                        &id,
+                        out.as_deref(),
+                        format,
+                        cli.quiet,
+                    )
+                    .await?;
                 }
             }
         }
 
         Commands::Sales { command } => {
-            let config = Config::load()?;
             let admin = cli.admin.as_deref();
             match command {
                 SalesCommands::Items {
@@ -408,6 +430,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     offset,
                     fields,
                 } => {
+                    let config = load()?;
                     yuki_cli::cli::sales::items(
                         &config,
                         admin,
@@ -420,6 +443,61 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?;
                 }
+                SalesCommands::Invoice { command } => match command {
+                    SalesInvoiceCommands::Create {
+                        inputs,
+                        prepared,
+                        pdf,
+                        send,
+                        book,
+                        dry_run,
+                        confirm,
+                    } => {
+                        use yuki_cli::cli::sales_invoice::{self, CreateArgs, SendMode};
+                        let args = CreateArgs {
+                            source: inputs.source(),
+                            overrides: inputs.overrides(),
+                            prepared: prepared.as_deref().map(std::path::Path::new),
+                            pdf: pdf.as_deref().map(std::path::Path::new),
+                            send: if book { Some(SendMode::Book) } else { send },
+                            dry_run,
+                            confirm: confirm.as_deref(),
+                        };
+                        sales_invoice::create(load, admin, args, cli.yes, cli.quiet, format)
+                            .await?;
+                    }
+                    SalesInvoiceCommands::Prepare {
+                        inputs,
+                        number,
+                        out,
+                    } => {
+                        let source = inputs.source().expect("clap requires --file or --template");
+                        yuki_cli::cli::sales_invoice::prepare(
+                            load,
+                            admin,
+                            &source,
+                            &inputs.overrides(),
+                            number.as_ref(),
+                            out.as_deref().map(std::path::Path::new),
+                            cli.quiet,
+                        )
+                        .await?;
+                    }
+                    SalesInvoiceCommands::Numbers {
+                        resolve,
+                        resolution,
+                    } => {
+                        yuki_cli::cli::invoice_ledger::numbers(
+                            &load()?,
+                            admin,
+                            resolve.as_deref().zip(resolution),
+                            format,
+                        )?;
+                    }
+                    SalesInvoiceCommands::Templates => {
+                        yuki_cli::cli::sales_invoice::templates(format)?;
+                    }
+                },
             }
         }
 
@@ -450,6 +528,17 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                 }
                 DocumentCommands::Search { query } => {
                     yuki_cli::cli::documents::search(&config, admin, &query, format).await?;
+                }
+                DocumentCommands::Download { id, out } => {
+                    yuki_cli::cli::documents::download(
+                        &config,
+                        admin,
+                        &id,
+                        out.as_deref(),
+                        format,
+                        cli.quiet,
+                    )
+                    .await?;
                 }
                 DocumentCommands::Exists {
                     amount,
@@ -548,9 +637,77 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
         }
 
         Commands::Upload { command } => {
-            let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
+                UploadCommands::Dir {
+                    path,
+                    folder,
+                    exclude,
+                    max,
+                    dry_run,
+                    seed_from_yuki,
+                    seed_folder,
+                } => {
+                    use yuki_cli::cli::upload_dir::{Confirm, DirOptions, Outcome};
+                    let confirm = if cli.yes {
+                        Confirm::Yes
+                    } else if yuki_cli::cli::interactive() {
+                        Confirm::Prompt
+                    } else {
+                        Confirm::Refuse
+                    };
+                    let options = DirOptions {
+                        path: &path,
+                        folder: &folder,
+                        excludes: &exclude,
+                        max,
+                        dry_run,
+                        seed: seed_from_yuki,
+                        seed_folders: &seed_folder,
+                    };
+                    match yuki_cli::cli::upload_dir::dir(
+                        load, admin, options, confirm, format, cli.quiet,
+                    )
+                    .await?
+                    {
+                        Outcome::Done => {}
+                        Outcome::NeedsConfirmation(message) => {
+                            return Err(AppError::confirmation_required(message));
+                        }
+                        Outcome::NeedsAttention(message) => {
+                            return Err(AppError::Other(anyhow::anyhow!(message)));
+                        }
+                    }
+                }
+                UploadCommands::Mark {
+                    file,
+                    doc_id,
+                    skip,
+                    forget,
+                    folder,
+                    note,
+                    dir,
+                    force,
+                } => {
+                    use yuki_cli::cli::upload_dir::{Mark, MarkOptions};
+                    let mark = match (doc_id.as_deref(), skip, forget) {
+                        (Some(id), _, _) => Mark::Document(id),
+                        (None, true, _) => Mark::Skip,
+                        _ => Mark::Forget,
+                    };
+                    yuki_cli::cli::upload_dir::mark(
+                        MarkOptions {
+                            file: &file,
+                            mark,
+                            folder: folder.as_deref(),
+                            note: note.as_deref(),
+                            dir: dir.as_deref(),
+                            force,
+                        },
+                        format,
+                        cli.quiet,
+                    )?;
+                }
                 UploadCommands::File {
                     file,
                     folder,
@@ -562,11 +719,12 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     currency,
                 } => {
                     // Require explicit confirmation for non-interactive uploads.
-                    if !is_tty() && !cli.yes {
-                        return Err(AppError::ConfirmationRequired(
-                            "upload file is a mutating operation; pass --yes to confirm in non-interactive mode".into(),
+                    if !yuki_cli::cli::interactive() && !cli.yes {
+                        return Err(AppError::confirmation_required(
+                            "upload file is a mutating operation; pass --yes to confirm in non-interactive mode",
                         ));
                     }
+                    let config = load()?;
                     let options = yuki_cli::cli::upload::UploadOptions {
                         folder: &folder,
                         amount,
@@ -580,9 +738,11 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         .await?;
                 }
                 UploadCommands::Categories => {
+                    let config = load()?;
                     yuki_cli::cli::upload::categories(&config, admin, format).await?;
                 }
                 UploadCommands::PaymentMethods => {
+                    let config = load()?;
                     yuki_cli::cli::upload::payment_methods(&config, admin, format).await?;
                 }
             }

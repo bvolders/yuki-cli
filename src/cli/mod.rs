@@ -5,21 +5,61 @@ pub mod check;
 pub mod contacts;
 pub mod documents;
 pub mod init;
+pub mod invoice_ledger;
+pub mod invoice_number;
 pub mod invoices;
 pub mod projects;
 pub mod sales;
+pub mod sales_invoice;
 pub mod upload;
+pub mod upload_dir;
 pub mod vat;
 
 use std::ffi::OsString;
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 
 use crate::client::Region;
 use crate::client::accounting::AccountingClient;
+use crate::client::archive::ArchiveClient;
 use crate::config::{Config, Target};
 use crate::error::YukiError;
+
+/// Whether a confirmation can be asked: stdin is a terminal to answer on.
+/// Without one, a mutating command needs `--yes`.
+pub fn interactive() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin())
+}
+
+/// [`interactive`], and stderr a terminal too, so the question is seen:
+/// for a booking, which must not be confirmed blind.
+pub fn can_prompt() -> bool {
+    interactive() && std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// Ask `question` on stderr, `[y/N]`, and read the answer from stdin.
+pub fn ask_yes_no(question: &str) -> bool {
+    ask_yes_no_on(
+        question,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// [`ask_yes_no`] on `input` and `output`: only `y` or `yes`, in any case,
+/// confirms, so an empty line, end of input or a read error declines.
+pub fn ask_yes_no_on(
+    question: &str,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> bool {
+    let _ = write!(output, "{question} [y/N] ");
+    let _ = output.flush();
+    let mut answer = String::new();
+    input.read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
 
 /// Authenticate a client and set the active administration domain.
 ///
@@ -34,6 +74,24 @@ pub async fn setup_domain<'a>(
     client.authenticate(target.api_key).await?;
     client.set_current_domain(target.domain_id).await?;
     Ok((client, target))
+}
+
+/// [`setup_domain`], plus an archive client on the same session. The
+/// archive's folder listings take no administration: they read the
+/// session's current domain, which `SetCurrentDomain` set to the target's,
+/// and sharing the session saves an Authenticate.
+pub async fn setup_archive<'a>(
+    config: &'a Config,
+    admin: Option<&str>,
+) -> Result<(AccountingClient, ArchiveClient, Target<'a>), YukiError> {
+    let (accounting, target) = setup_domain(config, admin).await?;
+    let session = accounting
+        .session_id()
+        .ok_or_else(|| YukiError::AuthFailed("no session after authenticating".into()))?;
+    let archive = ArchiveClient::new()
+        .with_api_root(target.api_root)
+        .with_session(session);
+    Ok((accounting, archive, target))
 }
 
 /// Top-level CLI entry point for the Yuki bookkeeping API client.
@@ -389,10 +447,18 @@ pub enum InvoiceCommands {
         period: Option<String>,
     },
 
-    /// Show the document linked to a transaction.
+    /// Save the document linked to a transaction.
+    ///
+    /// Written under the document's own file name in the working directory,
+    /// or to --out (a file, or a directory to put it in); never over an
+    /// existing file.
     Document {
         /// Transaction ID.
         id: String,
+
+        /// File or directory to write to.
+        #[arg(long, value_name = "PATH")]
+        out: Option<String>,
     },
 }
 
@@ -412,6 +478,182 @@ pub enum SalesCommands {
         #[arg(long)]
         fields: Option<String>,
     },
+
+    /// Create sales invoices from a file or a saved template.
+    Invoice {
+        #[command(subcommand)]
+        command: SalesInvoiceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SalesInvoiceCommands {
+    /// Create a sales invoice in Yuki: a draft, unless --send or --book books it.
+    ///
+    /// A prepared invoice (--prepared, written by `prepare --out`) is booked
+    /// exactly as prepared, under the number reserved for it. A TOML file
+    /// (--file) or a saved template (--template, read from
+    /// ~/.config/yuki/invoices/<name>.toml) becomes a draft, or a booking
+    /// Yuki numbers itself, confirmed at the prompt. A preview of the
+    /// customer, lines and totals is printed first, then confirmed on a
+    /// terminal; --yes skips the prompt and is required when not on a
+    /// terminal. --dry-run prints the preview and the exact xmlDoc without
+    /// contacting Yuki. Booking is immediate: there is no draft to review.
+    #[command(group(
+        clap::ArgGroup::new("source").args(["file", "template"])
+    ))]
+    Create {
+        #[command(flatten)]
+        inputs: InvoiceInputs,
+
+        /// A prepared invoice (`prepare --out`) to book exactly: its number
+        /// must still be reserved for this content. Takes no other invoice
+        /// inputs; needs --send or --book.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["source", "qty", "price", "date", "subject"]
+        )]
+        prepared: Option<String>,
+
+        /// Custom invoice PDF (max 3 MB) rendered from the --prepared file.
+        /// Yuki stores it, as `Invoice <number>.pdf`, instead of the invoice it
+        /// would generate; the lines still set the booked amounts.
+        // clap does not require an arg that conflicts with a present one, so
+        // `requires = "prepared"` alone would let `--template … --pdf` pass:
+        // the conflict says it.
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "prepared",
+            conflicts_with = "source"
+        )]
+        pdf: Option<String>,
+
+        /// Book the invoice and send it: email, peppol, or both. Without it
+        /// (or --book), the invoice is created as a draft in "To be sent".
+        #[arg(long, value_enum)]
+        send: Option<sales_invoice::SendMode>,
+
+        /// Book the invoice without sending it, for invoices you send yourself.
+        #[arg(long, conflicts_with = "send")]
+        book: bool,
+
+        /// Print the preview and the xmlDoc XML; make no API call at all.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// The invoice number being booked, repeated: required with --yes
+        /// when booking (--send or --book), so an unattended run books only
+        /// the number it meant to.
+        #[arg(long, value_name = "NUMBER")]
+        confirm: Option<String>,
+    },
+
+    /// Print the fully resolved invoice as JSON, for rendering its PDF.
+    ///
+    /// The totals per VAT rate are the CLI's computation; Yuki books its own.
+    /// Dates come as ISO and Dutch text, with the Belgian structured payment
+    /// reference and the issuing firm ([seller] in the config). With --number
+    /// it reads the sales archive and the local number ledger. With --out it
+    /// also writes the invoice to a file and reserves its number for exactly
+    /// that content; `create --prepared <file>` books it.
+    #[command(group(
+        clap::ArgGroup::new("source").required(true).args(["file", "template"])
+    ))]
+    Prepare {
+        #[command(flatten)]
+        inputs: InvoiceInputs,
+
+        /// Invoice number (Yuki's Reference), or `auto`: the lowest
+        /// <year>-<seq> of the invoice date's year above the sales archive's
+        /// highest that the local ledger does not hold. Refused when either
+        /// has it. Yuki's own counter does not learn numbers given here, so
+        /// once you start, number every invoice this way.
+        #[arg(long, value_name = "REF|auto", value_parser = invoice_number::parse_number_request)]
+        number: Option<invoice_number::NumberRequest>,
+
+        /// Write the prepared invoice here (never over an existing file) and
+        /// reserve its number in the ledger. Needs --number and [seller].
+        #[arg(long, value_name = "FILE", requires = "number")]
+        out: Option<String>,
+    },
+
+    /// List the invoice numbers given out, from the local ledger.
+    ///
+    /// `prepare --out` reserves a number; it is pending from just before Yuki
+    /// is called until its answer marks it booked or rejected. One left
+    /// pending (no answer came back) stays taken: check "To be sent"/Sales in
+    /// Yuki, then settle it with --resolve <NUMBER> --as booked|rejected. A
+    /// reservation that will not be sent is freed with --resolve <NUMBER>
+    /// --as rejected. A rejected number is given out again.
+    Numbers {
+        /// Settle this number by hand, as --as says.
+        #[arg(long, value_name = "NUMBER", requires = "resolution")]
+        resolve: Option<String>,
+
+        /// What --resolve settles the number as: booked (pending only) or
+        /// rejected (pending or reserved).
+        #[arg(
+            long = "as",
+            id = "resolution",
+            value_name = "STATUS",
+            value_enum,
+            requires = "resolve"
+        )]
+        resolution: Option<invoice_ledger::Resolution>,
+    },
+
+    /// List saved invoice templates (~/.config/yuki/invoices/*.toml).
+    Templates,
+}
+
+/// What an invoice is made of: `create` and `prepare` take the same.
+#[derive(clap::Args)]
+pub struct InvoiceInputs {
+    /// Invoice described in a TOML file.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<String>,
+
+    /// Saved template name (see `sales invoice templates`).
+    #[arg(long, value_name = "NAME")]
+    pub template: Option<String>,
+
+    /// Quantity of the invoice's only line, e.g. 7.5.
+    #[arg(long, value_parser = sales_invoice::parse_quantity)]
+    pub qty: Option<sales_invoice::Quantity>,
+
+    /// Unit price excluding VAT of the invoice's only line, e.g. 1250.00.
+    #[arg(long, value_parser = sales_invoice::parse_price)]
+    pub price: Option<crate::money::Cents>,
+
+    /// Invoice date, YYYY-MM-DD. Default: the file's date, else today.
+    #[arg(long, value_parser = sales_invoice::parse_date)]
+    pub date: Option<String>,
+
+    /// Subject (title) of the invoice, replacing the file's.
+    #[arg(long)]
+    pub subject: Option<String>,
+}
+
+impl InvoiceInputs {
+    /// The invoice file or template; `None` when neither is given.
+    pub fn source(&self) -> Option<sales_invoice::Source> {
+        match (&self.file, &self.template) {
+            (Some(file), _) => Some(sales_invoice::Source::File(file.into())),
+            (None, Some(name)) => Some(sales_invoice::Source::Template(name.clone())),
+            (None, None) => None,
+        }
+    }
+
+    pub fn overrides(&self) -> sales_invoice::Overrides<'_> {
+        sales_invoice::Overrides {
+            qty: self.qty,
+            price: self.price,
+            date: self.date.as_deref(),
+            subject: self.subject.as_deref(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -446,6 +688,20 @@ pub enum DocumentCommands {
         query: String,
     },
 
+    /// Save an archive document's file.
+    ///
+    /// Written under the document's own file name in the working directory,
+    /// or to --out (a file, or a directory to put it in); never over an
+    /// existing file.
+    Download {
+        /// Document ID (as shown by `documents list`).
+        id: String,
+
+        /// File or directory to write to.
+        #[arg(long, value_name = "PATH")]
+        out: Option<String>,
+    },
+
     /// Check if an invoice exists in the archive (by amount, date, and optional contact).
     Exists {
         /// Invoice amount to search for.
@@ -462,10 +718,20 @@ pub enum DocumentCommands {
 
 #[derive(Subcommand)]
 pub enum ContactCommands {
-    /// Search contacts by name or other criteria.
+    /// Search contacts, active or not, by any field or by one (--by).
     Search {
-        /// Search query.
+        /// Search value.
         query: String,
+
+        /// Field to search: All (default) or one of Yuki's search options,
+        /// e.g. Name, City, VATNumber, Code, HID. Case-insensitive.
+        #[arg(
+            long,
+            default_value = "All",
+            ignore_case = true,
+            value_parser = PossibleValuesParser::new(crate::client::contact::SEARCH_OPTIONS),
+        )]
+        by: String,
     },
 
     /// List contacts filtered by type.
@@ -655,6 +921,88 @@ pub enum UploadCommands {
         currency: String,
     },
 
+    /// Upload the receipts in a directory that are not in Yuki yet, once each.
+    ///
+    /// State is kept in PATH/.yuki-sync.json, keyed by content hash. Prints the
+    /// plan and asks first (--yes without a terminal). An upload whose outcome
+    /// is uncertain stays pending and is never retried: resolve it with
+    /// `upload mark`. Exits 1 when any file needs attention. See the README.
+    Dir {
+        /// Directory to upload from.
+        path: String,
+
+        /// Target folder: uitzoeken (default), inkoop, verkoop, bank, personeel, belasting, overig-financieel.
+        #[arg(long, default_value = "uitzoeken")]
+        folder: String,
+
+        /// Skip paths matching this case-insensitive glob; repeatable. A name
+        /// without / matches any path component. _to_delete and .* always apply.
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+
+        /// Upload at most this many files in this run.
+        #[arg(long, default_value_t = 25)]
+        max: usize,
+
+        /// Print the plan only: no API calls, nothing written.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Upload nothing; record the files whose file name matches exactly one
+        /// Yuki document, claimed by no other file, as already-in-yuki, and
+        /// list ambiguous and near matches for review. Asks before writing.
+        #[arg(long)]
+        seed_from_yuki: bool,
+
+        /// Yuki folder to look in when seeding; repeatable. Defaults to
+        /// --folder and inkoop.
+        #[arg(long = "seed-folder", requires = "seed_from_yuki")]
+        seed_folder: Vec<String>,
+    },
+
+    /// Record by hand that a file is in Yuki, should be skipped, or is to be forgotten.
+    ///
+    /// Updates the .yuki-sync.json of the synced directory without contacting
+    /// Yuki: --dir, else the nearest directory above FILE that has one.
+    /// Resolves files `upload dir` reports as pending or changed: --doc-id when
+    /// Yuki has the file, --forget to upload it (again), --skip to keep it out.
+    #[command(group(ArgGroup::new("record").required(true).args(["doc_id", "skip", "forget"])))]
+    Mark {
+        /// The file to record.
+        file: String,
+
+        /// The Yuki document ID the file was uploaded as.
+        #[arg(long)]
+        doc_id: Option<String>,
+
+        /// Never upload this file.
+        #[arg(long)]
+        skip: bool,
+
+        /// Remove the record, so the next run treats the file as new. For a
+        /// changed file, removes the record of the earlier content at its path.
+        #[arg(long)]
+        forget: bool,
+
+        /// The Yuki folder the document is in.
+        #[arg(long)]
+        folder: Option<String>,
+
+        /// Note to keep with the record.
+        #[arg(long)]
+        note: Option<String>,
+
+        /// The synced directory (its root), needed when it has no
+        /// .yuki-sync.json yet.
+        #[arg(long)]
+        dir: Option<String>,
+
+        /// Replace an existing record, or record a document ID already
+        /// recorded for another file.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// List available cost categories.
     Categories,
 
@@ -665,6 +1013,24 @@ pub enum UploadCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_explicit_yes_confirms() {
+        for (answer, confirmed) in [
+            ("y\n", true),
+            ("YES\n", true),
+            (" yes \n", true),
+            ("\n", false),
+            ("n\n", false),
+            ("yep\n", false),
+            ("", false),
+        ] {
+            let mut prompt = Vec::new();
+            let got = ask_yes_no_on("Create?", &mut answer.as_bytes(), &mut prompt);
+            assert_eq!(got, confirmed, "{answer:?}");
+            assert_eq!(String::from_utf8(prompt).unwrap(), "Create? [y/N] ");
+        }
+    }
 
     fn endpoint(args: &[&str], env: &[(&str, &str)]) -> Result<RunEndpoint, clap::Error> {
         let env: Vec<(&str, OsString)> = env.iter().map(|(k, v)| (*k, (*v).into())).collect();

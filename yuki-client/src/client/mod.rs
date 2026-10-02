@@ -14,7 +14,7 @@ use crate::error::YukiError;
 
 pub use region::Region;
 pub(crate) use region::service_url;
-pub use soap_client::{SoapClient, SoapEnvelope};
+pub use soap_client::{SoapClient, SoapEnvelope, escape_text};
 
 /// Strip any XML namespace prefix, returning only the local name.
 pub(crate) fn local_name(name: &str) -> &str {
