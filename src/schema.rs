@@ -265,7 +265,7 @@ pub fn generate() -> Value {
             },
             {
                 "name": "sales invoice create",
-                "description": "Create a sales invoice in Yuki from a TOML file or a saved template: a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 with invalid_input for a bad file, confirmation_required when not confirmed, and invoice_rejected when Yuki fails or skips the invoice or does not book or email what --send asked.",
+                "description": "Create a sales invoice in Yuki from a TOML file or a saved template: a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 with invalid_input for a bad file, confirmation_required when not confirmed, outcome_unknown when the request went out without a usable answer (check Yuki before retrying), and invoice_rejected when Yuki fails or skips the invoice or does not book or email what --send asked.",
                 "mutating": true,
                 "args": [
                     {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file or --template is required."},
@@ -274,7 +274,7 @@ pub fn generate() -> Value {
                     {"name": "--price", "type": "number", "required": false, "description": "Unit price excluding VAT of the invoice's only line, up to 2 decimals."},
                     {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD. Default: the file's date, else today."},
                     {"name": "--subject", "type": "string", "required": false, "description": "Subject (title) of the invoice, replacing the file's."},
-                    {"name": "--pdf", "type": "path", "required": false, "description": "Custom invoice PDF (max 10 MB), stored in Yuki instead of the generated invoice; replaces the file's pdf."},
+                    {"name": "--pdf", "type": "path", "required": false, "description": "Custom invoice PDF (max 3 MB; not allowed in a template), stored in Yuki instead of the generated invoice; replaces the file's pdf."},
                     {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it, the invoice is a draft."},
                     {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."}
                 ],
@@ -284,6 +284,7 @@ pub fn generate() -> Value {
                     {"name": "Email Sent", "type": "string"},
                     {"name": "Reference", "type": "string"},
                     {"name": "Subject", "type": "string"},
+                    {"name": "PDF", "type": "string"},
                     {"name": "Message", "type": "string"}
                 ]
             },
@@ -664,6 +665,12 @@ pub fn generate() -> Value {
                 "exit_code": 1,
                 "retryable": false,
                 "description": "An invoice file or template is missing or invalid; every problem is listed."
+            },
+            {
+                "kind": "outcome_unknown",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "The invoice request went out but no usable answer came back: it may already exist in Yuki, so check before retrying."
             },
             {
                 "kind": "invoice_rejected",

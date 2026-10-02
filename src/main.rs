@@ -22,6 +22,8 @@ enum AppError {
     InvoiceRejected(String),
     /// An invoice file or template that cannot be read or is invalid.
     InvalidInput(String),
+    /// A write whose request went out without a usable answer.
+    OutcomeUnknown(String),
 }
 
 impl fmt::Display for AppError {
@@ -31,7 +33,8 @@ impl fmt::Display for AppError {
             Self::Other(e) => write!(f, "{e}"),
             Self::ConfirmationRequired(message)
             | Self::InvoiceRejected(message)
-            | Self::InvalidInput(message) => {
+            | Self::InvalidInput(message)
+            | Self::OutcomeUnknown(message) => {
                 write!(f, "{message}")
             }
         }
@@ -55,7 +58,10 @@ impl AppError {
         match self {
             Self::Yuki(e) => e.exit_code(),
             Self::Other(_) => 1,
-            Self::ConfirmationRequired(_) | Self::InvoiceRejected(_) | Self::InvalidInput(_) => 1,
+            Self::ConfirmationRequired(_)
+            | Self::InvoiceRejected(_)
+            | Self::InvalidInput(_)
+            | Self::OutcomeUnknown(_) => 1,
         }
     }
 
@@ -72,6 +78,7 @@ impl AppError {
             Self::ConfirmationRequired(_) => "confirmation_required",
             Self::InvoiceRejected(_) => "invoice_rejected",
             Self::InvalidInput(_) => "invalid_input",
+            Self::OutcomeUnknown(_) => "outcome_unknown",
         }
     }
 }
@@ -489,7 +496,13 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         }
                         let import =
                             sales_invoice::submit(&config, admin, &invoice, format, cli.quiet)
-                                .await?;
+                                .await
+                                .map_err(|e| match e {
+                                    sales_invoice::SubmitError::Yuki(e) => AppError::from(e),
+                                    sales_invoice::SubmitError::OutcomeUnknown(message) => {
+                                        AppError::OutcomeUnknown(message)
+                                    }
+                                })?;
                         if let Some(failure) = import
                             .failure()
                             .or_else(|| sales_invoice::unsent(&import, invoice.send))

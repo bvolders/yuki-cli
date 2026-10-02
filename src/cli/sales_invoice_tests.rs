@@ -525,12 +525,13 @@ fn emailing_a_new_contact_needs_its_address() {
     assert!(parse(&text, "t", &Overrides::default(), None).is_ok());
 }
 
-/// Write `invoice.toml` naming `pdf = "doc.pdf"`, and `doc.pdf` with `bytes`.
+/// Write `invoice.toml` (the FULL invoice) naming `pdf = "doc.pdf"`, and
+/// `doc.pdf` with `bytes`.
 fn invoice_with_pdf(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(dir.path().join("doc.pdf"), bytes).unwrap();
     let file = dir.path().join("invoice.toml");
-    std::fs::write(&file, format!("pdf = \"doc.pdf\"\n{MINIMAL}")).unwrap();
+    std::fs::write(&file, format!("pdf = \"doc.pdf\"\n{FULL}")).unwrap();
     (dir, file)
 }
 
@@ -550,7 +551,13 @@ fn a_custom_pdf_is_read_relative_to_the_file_and_embedded_before_the_contact() {
     );
     assert_in_order(
         &xml,
-        &["Date", "DocumentFileName", "DocumentBase64", "Contact"],
+        &[
+            "Currency",
+            "Remarks",
+            "DocumentFileName",
+            "DocumentBase64",
+            "Contact",
+        ],
     );
     // The lines stay: Yuki books from them.
     assert!(xml.contains("<InvoiceLines>"));
@@ -604,5 +611,35 @@ fn a_pdf_that_is_missing_not_a_pdf_or_too_large_is_rejected() {
     let err = load(&Source::File(file), &Overrides::default(), None)
         .unwrap_err()
         .to_string();
-    assert!(err.contains("over the 10.0 MB limit"), "{err}");
+    assert!(err.contains("over the 3.0 MB limit"), "{err}");
+}
+
+#[test]
+fn a_pdf_name_without_the_extension_gets_one() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("factuur-2026-10");
+    std::fs::write(&path, b"%PDF-1.7").unwrap();
+    assert_eq!(Pdf::read(&path).unwrap().name, "factuur-2026-10.pdf");
+    let upper = dir.path().join("INVOICE.PDF");
+    std::fs::write(&upper, b"%PDF-1.7").unwrap();
+    assert_eq!(Pdf::read(&upper).unwrap().name, "INVOICE.PDF");
+}
+
+#[test]
+fn a_template_cannot_carry_a_pdf_but_an_invoice_file_can() {
+    let text = format!("pdf = \"doc.pdf\"\n{MINIMAL}");
+    let err = parse_at(
+        &text,
+        "template",
+        Path::new("."),
+        false,
+        &Overrides::default(),
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("a template can't carry a PDF; pass --pdf per invoice"),
+        "{err}"
+    );
 }

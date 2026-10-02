@@ -398,8 +398,8 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
     let dir = home.path().join(".config/yuki/invoices");
     let pdf = b"%PDF-1.7\nmade-up invoice body\n%%EOF\n";
     std::fs::write(dir.join("hosting.pdf"), pdf).expect("write pdf");
-    let template = format!("pdf = \"hosting.pdf\"\n{TEMPLATE}");
-    std::fs::write(dir.join("hosting.toml"), template).expect("write template");
+    let pdf_path = dir.join("hosting.pdf");
+    let pdf_arg = pdf_path.to_str().unwrap();
     let base64 = "JVBERi0xLjcKbWFkZS11cCBpbnZvaWNlIGJvZHkKJSVFT0YK";
 
     let dry = yuki(
@@ -410,6 +410,8 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
             "create",
             "--template",
             "hosting",
+            "--pdf",
+            pdf_arg,
             "--dry-run",
         ],
     );
@@ -431,10 +433,16 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
             "create",
             "--template",
             "hosting",
+            "--pdf",
+            pdf_arg,
             "--yes",
+            "--output",
+            "json",
         ],
     );
     assert!(output.status.success(), "{}", stderr(&output));
+    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    assert_eq!(json["items"][0]["PDF"], "hosting.pdf");
     let body = sent_body(&log);
     assert!(
         body.contains("<DocumentFileName>hosting.pdf</DocumentFileName>"),
@@ -444,4 +452,59 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
         body.contains(&format!("<DocumentBase64>{base64}</DocumentBase64>")),
         "{body}"
     );
+}
+
+#[test]
+fn a_template_with_a_pdf_is_refused() {
+    let (root, log) = mock(String::new());
+    let home = home_with_config(&root);
+    let dir = home.path().join(".config/yuki/invoices");
+    std::fs::write(
+        dir.join("monthly.toml"),
+        format!("pdf = \"x.pdf\"\n{TEMPLATE}"),
+    )
+    .expect("write template");
+    let output = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "monthly",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("a template can't carry a PDF; pass --pdf per invoice"));
+    assert!(actions(&log).is_empty());
+}
+
+#[test]
+fn a_lost_answer_warns_that_the_invoice_may_exist() {
+    // The mock drops the connection once it has read the request.
+    let (root, log) = mock_yuki(|action, _| match action {
+        "Authenticate" => soap_response("Authenticate", "session-1"),
+        _ => String::new(),
+    });
+    let home = home_with_config(&root);
+    let output = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "hosting",
+            "--yes",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("\"kind\":\"outcome_unknown\""), "{err}");
+    assert!(
+        err.contains("the invoice may already have been created in Yuki — check 'To be sent'/'Sales' before retrying"),
+        "{err}"
+    );
+    assert_eq!(actions(&log), ["Authenticate", "ProcessSalesInvoices"]);
 }

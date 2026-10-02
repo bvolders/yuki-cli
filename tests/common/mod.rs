@@ -49,8 +49,9 @@ pub struct Request {
 pub type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<Request>>>;
 
 /// Serve a local Yuki mock on a random port. `reply(action, body)` gives the
-/// response body to each request, sent as HTTP 200. Returns the API root to
-/// put in the config and the request log.
+/// response body to each request, sent as HTTP 200; an empty reply drops the
+/// connection without answering. Returns the API root to put in the config
+/// and the request log.
 pub fn mock_yuki(reply: impl Fn(&str, &str) -> String + Send + 'static) -> (String, RequestLog) {
     use std::io::{BufRead, BufReader, Read, Write};
 
@@ -88,6 +89,9 @@ pub fn mock_yuki(reply: impl Fn(&str, &str) -> String + Send + 'static) -> (Stri
             let body = String::from_utf8_lossy(&body).into_owned();
             let response = reply(&action, &body);
             seen.lock().expect("log").push(Request { action, body });
+            if response.is_empty() {
+                continue;
+            }
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",

@@ -458,9 +458,9 @@ pub enum SalesInvoiceCommands {
         #[arg(long)]
         subject: Option<String>,
 
-        /// Custom invoice PDF, replacing the file's `pdf`. Yuki stores it
-        /// instead of the invoice it would generate; the lines still set
-        /// the booked amounts.
+        /// Custom invoice PDF (max 3 MB), replacing an invoice file's `pdf`;
+        /// a template takes one only this way. Yuki stores it instead of the
+        /// invoice it would generate; the lines still set the booked amounts.
         #[arg(long, value_name = "PATH")]
         pdf: Option<String>,
 

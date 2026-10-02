@@ -269,11 +269,18 @@ email it as `--send` asked, after printing Yuki's answer; `invalid_input` lists
 every problem in the file; `confirmation_required` means nothing was sent.
 Totals must be positive: credit notes are not supported.
 
-With `pdf` (or `--pdf <PATH>`, which replaces it), Yuki stores your PDF instead
-of the invoice it would generate from its layout. The lines are still required:
-Yuki books the amounts, and builds a Peppol invoice, from them, so the amounts
-in the PDF must match. The file must start with `%PDF-` and be at most 10 MB.
-`--dry-run` shows a size comment in place of the PDF's base64.
+With `--pdf <PATH>` (or `pdf = "..."` in an invoice file, not a template),
+Yuki stores your PDF instead of the invoice it would generate from its layout.
+The lines are still required: Yuki books the amounts, and builds a Peppol
+invoice, from them, so the amounts in the PDF must match. The file must start
+with `%PDF-` and be at most 3 MB (Yuki's request limit, with base64 on top).
+A template can't carry a PDF, since it is reused every month; pass `--pdf` per
+invoice. `--dry-run` shows a size comment in place of the PDF's base64, and the
+result has a `PDF` column naming the file sent.
+
+If the request goes out but no answer comes back (a timeout or a dropped
+connection), the command exits 1 with kind `outcome_unknown`: the invoice may
+already exist, so check "To be sent" or Sales in Yuki before running it again.
 
 Recurring invoices are templates you run yourself: one file per customer in
 `~/.config/yuki/invoices/<name>.toml`, created each month with `--template`
@@ -291,21 +298,20 @@ due_days = 30                     # or: due_date = 2026-11-01
 # currency = "EUR"                # Yuki's default
 # notes = "Thank you for your business."   # printed on the invoice, max 500 characters
 # remarks = "internal"            # stored, not printed
-# pdf = "acme-hosting.pdf"        # your own invoice PDF, relative to this file (max 10 MB)
+# pdf = "invoice.pdf"             # invoice files only: your own PDF, relative to this file
 
 [contact]
-code = "C0042"                    # an existing Yuki contact
-
-# Or a contact Yuki matches by name and address, or creates:
-# name = "Acme BV"
-# country = "BE"                  # required without a code (ISO 3166-1 alpha-2)
-# address = "Kerkstraat 1"
+# Yuki matches an existing contact by name and address, or creates it.
+name = "Acme BV"
+country = "BE"                    # required without a code (ISO 3166-1 alpha-2)
+address = "Kerkstraat 1"
+zipcode = "9000"
+city = "Gent"
+vat_number = "BE0123456789"
+email = "billing@acme.example"    # needed for --send email
+type = "company"                  # or "person" (Yuki's default)
 # address_2 = "bus 2"
-# zipcode = "9000"
-# city = "Gent"
-# vat_number = "BE0123456789"
-# email = "billing@acme.example"
-# type = "company"                # or "person" (Yuki's default)
+# code = "C0042"                  # a contact code, if yours has one
 
 [[lines]]
 description = "Managed hosting"
@@ -317,6 +323,10 @@ gl_account = "700000"             # optional revenue account
 # vat_description = "BTW 21%"     # optional, to pick between VAT codes
 # product_code = "HOST"           # optional item number of a Yuki sales item
 ```
+
+Real Yuki contacts often have an empty `Code`, so match on name, address and VAT
+number. `yuki contacts search <name>` shows each contact's HID, city and VAT
+number to copy into a template.
 
 The example uses Belgian 21% VAT; nothing in the CLI assumes a country. The VAT
 percentage and type must match a VAT code of your administration, or Yuki

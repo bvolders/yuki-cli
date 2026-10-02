@@ -38,9 +38,10 @@ const PAYMENT_METHOD_MAX: usize = 60;
 const QTY_MAX: i64 = 10_i64.pow(10 + QTY_DECIMALS);
 const PRICE_MAX: i64 = 10_i64.pow(12);
 const LINE_AMOUNT_MAX: i128 = 10_i128.pow(12);
-/// The largest custom PDF accepted. Yuki documents no limit; this keeps the
-/// request (the PDF grows by a third as base64) to a size a SOAP call carries.
-pub const PDF_MAX_BYTES: usize = 10 * 1024 * 1024;
+/// The largest custom PDF accepted. Yuki documents no limit, but ASP.NET's
+/// default `maxRequestLength` is 4 MB and base64 adds a third, so 3 MB of
+/// PDF (4 MB encoded) is about what one request can carry.
+pub const PDF_MAX_BYTES: usize = 3 * 1024 * 1024;
 /// The longest payment term accepted, in days.
 const DUE_DAYS_MAX: i64 = 3_650;
 
@@ -277,10 +278,14 @@ impl Pdf {
         if !bytes.starts_with(b"%PDF-") {
             return Err(format!("{shown} is not a PDF (no %PDF- header)"));
         }
-        let name = path
+        let mut name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // Yuki names the stored document after DocumentFileName.
+        if !name.to_ascii_lowercase().ends_with(".pdf") {
+            name.push_str(".pdf");
+        }
         Ok(Self { name, bytes })
     }
 }
@@ -696,7 +701,9 @@ pub fn load(
         YukiError::Config(format!("{}: {e}{hint}", path.display()))
     })?;
     let base = path.parent().unwrap_or(Path::new("."));
-    parse_at(&text, &origin, base, overrides, send)
+    // A template is reused every month; a PDF belongs to one invoice.
+    let allow_pdf = matches!(source, Source::File(_));
+    parse_at(&text, &origin, base, allow_pdf, overrides, send)
 }
 
 /// Parse and validate invoice TOML; `origin` names it in errors, and a
@@ -707,7 +714,7 @@ pub fn parse(
     overrides: &Overrides<'_>,
     send: Option<SendMode>,
 ) -> Result<Invoice, YukiError> {
-    parse_at(text, origin, Path::new("."), overrides, send)
+    parse_at(text, origin, Path::new("."), true, overrides, send)
 }
 
 /// [`parse`], with a relative `pdf` resolved against `base`, the directory
@@ -716,12 +723,13 @@ fn parse_at(
     text: &str,
     origin: &str,
     base: &Path,
+    allow_pdf: bool,
     overrides: &Overrides<'_>,
     send: Option<SendMode>,
 ) -> Result<Invoice, YukiError> {
     let spec: InvoiceSpec = toml::from_str(text)
         .map_err(|e| YukiError::Config(format!("invalid invoice {origin}: {e}")))?;
-    validate(spec, origin, base, overrides, send).map_err(|problems| {
+    validate(spec, origin, base, allow_pdf, overrides, send).map_err(|problems| {
         YukiError::Config(format!(
             "invalid invoice {origin}:\n  - {}",
             problems.join("\n  - ")
@@ -791,6 +799,7 @@ fn validate(
     spec: InvoiceSpec,
     origin: &str,
     base: &Path,
+    allow_pdf: bool,
     overrides: &Overrides<'_>,
     send: Option<SendMode>,
 ) -> Result<Invoice, Vec<String>> {
@@ -899,9 +908,14 @@ fn validate(
         p.push("--send email needs contact.email for a contact without a code");
     }
 
+    let file_pdf = p.text("pdf", spec.pdf);
+    if file_pdf.is_some() && !allow_pdf {
+        p.push("a template can't carry a PDF; pass --pdf per invoice");
+    }
     let pdf_path = match overrides.pdf {
         Some(path) => Some(path.to_path_buf()),
-        None => p.text("pdf", spec.pdf).map(|pdf| base.join(pdf)),
+        None if allow_pdf => file_pdf.map(|pdf| base.join(pdf)),
+        None => None,
     };
     let pdf = pdf_path.and_then(|path| {
         Pdf::read(&path)
@@ -1115,21 +1129,57 @@ pub async fn submit(
     invoice: &Invoice,
     format: Option<&str>,
     quiet: bool,
-) -> Result<SalesInvoicesImport, YukiError> {
+) -> Result<SalesInvoicesImport, SubmitError> {
     let target = config.target(admin)?;
     let mut client = SalesClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let import = client
         .process_sales_invoices(target.admin_id, &invoice.to_xml())
-        .await?;
+        .await
+        .map_err(|e| {
+            if may_have_been_created(&e) {
+                SubmitError::OutcomeUnknown(format!(
+                    "{e}: the invoice may already have been created in Yuki — check 'To be sent'/'Sales' before retrying"
+                ))
+            } else {
+                SubmitError::Yuki(e)
+            }
+        })?;
 
     if !quiet {
-        print_import(&import, format);
+        print_import(&import, invoice.pdf.as_ref(), format);
     }
     Ok(import)
 }
 
-fn print_import(import: &SalesInvoicesImport, format: Option<&str>) {
+/// Why [`submit`] failed.
+#[derive(Debug)]
+pub enum SubmitError {
+    /// Nothing reached Yuki, or Yuki refused it outright.
+    Yuki(YukiError),
+    /// The request went out but no usable answer came back.
+    OutcomeUnknown(String),
+}
+
+impl From<YukiError> for SubmitError {
+    fn from(e: YukiError) -> Self {
+        Self::Yuki(e)
+    }
+}
+
+/// Whether a failed `ProcessSalesInvoices` may still have created the
+/// invoice: the request may have reached Yuki (anything but a failure to
+/// connect) and no SOAP answer said otherwise.
+fn may_have_been_created(error: &YukiError) -> bool {
+    match error {
+        YukiError::Request(e) => !e.is_connect() && !e.is_builder(),
+        YukiError::Http { status, .. } => *status >= 500,
+        YukiError::Xml(_) => true,
+        _ => false,
+    }
+}
+
+fn print_import(import: &SalesInvoicesImport, pdf: Option<&Pdf>, format: Option<&str>) {
     let yes_no = |b: bool| if b { "Yes" } else { "No" }.to_string();
     let headers: Vec<String> = [
         "Succeeded",
@@ -1137,10 +1187,12 @@ fn print_import(import: &SalesInvoicesImport, format: Option<&str>) {
         "Email Sent",
         "Reference",
         "Subject",
+        "PDF",
         "Message",
     ]
     .map(String::from)
     .to_vec();
+    let pdf_name = pdf.map(|p| p.name.clone()).unwrap_or_default();
     let rows: Vec<Vec<String>> = import
         .invoices
         .iter()
@@ -1151,6 +1203,7 @@ fn print_import(import: &SalesInvoicesImport, format: Option<&str>) {
                 yes_no(i.email_sent),
                 i.reference.clone(),
                 i.subject.clone(),
+                pdf_name.clone(),
                 i.message.clone(),
             ]
         })
