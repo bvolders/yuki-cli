@@ -311,48 +311,37 @@ yuki sales invoice numbers --resolve 2026-20 --as booked    # Settle a pending n
 yuki sales invoice templates                            # List saved templates, each validated
 ```
 
-`create` makes a **draft** by default: it lands in Yuki's "To be sent" list,
-unbooked and without an invoice number, so you can still check or edit it in
-Yuki. `--send email|peppol|both` books it instead and sends it; `--book` books
-it without sending, for invoices you send yourself. Booking is immediate and
-fixes the number: there is no draft to review, and the preview says so. A
-booking needs a due date (`due_days` or `due_date`).
+`create --file` or `--template` makes a **draft** by default: it lands in
+Yuki's "To be sent" list, unbooked and without an invoice number, so you can
+still check or edit it in Yuki. `--send email|peppol|both` books it instead and
+sends it; `--book` books it without sending, for invoices you send yourself.
+Booking is immediate and fixes the number: there is no draft to review, and
+the preview says so. A booking needs a due date (`due_days` or `due_date`), and
+`--send email` an email address for a contact without a code. Yuki's answer
+says nothing about Peppol delivery: with `--send peppol` or `both`, the preview
+and the result's `Peppol` column say `requested (Yuki does not report
+delivery)`, never delivered.
+
 Before any write, the command prints a preview to stderr (customer, lines, net,
 VAT, gross total, and whether it creates a draft or books and sends) and asks
 for confirmation, which declines unless you answer `y`; the question names the
 invoice number. `--yes` skips the prompt and is required when stdin or stderr
-is not a terminal. A booking (`--send`, `--book`) without the prompt also needs
-`--confirm <number>`, the invoice number repeated, so an unattended run books
-only the number it meant to; a booking Yuki numbers itself can only be
-confirmed at the prompt. `--dry-run` prints the
-preview, then the exact `xmlDoc` on stdout, and makes no API call. The command
-exits 1 with kind `invoice_rejected` when Yuki fails or skips the invoice, or
-does not book it as `--send` asked, after printing Yuki's answer, and with
-`send_incomplete` when it booked the invoice but did not email it (the number
-is booked; send it from Yuki or yourself); `invalid_input` lists every problem
-in the file; `confirmation_required` means nothing was sent. Totals must be
-positive: credit notes are not supported.
-
-Yuki's answer says nothing about Peppol delivery. With `--send peppol` or
-`both`, the preview and the result's `Peppol` column say `requested (Yuki does
-not report delivery)`; check delivery in Yuki.
+is not a terminal. A booking without the prompt also needs `--confirm
+<number>`, the invoice number repeated, so an unattended run books only the
+number it meant to; a booking Yuki numbers itself can only be confirmed at the
+prompt. `--dry-run` prints the preview, then the exact `xmlDoc` on stdout, and
+makes no API call. The command exits 1 with kind `invalid_input` for a bad
+file (every problem listed), `confirmation_required` when nothing was sent for
+want of a confirmation, `invoice_rejected` when Yuki fails or skips the invoice
+or does not book it (after printing Yuki's answer), `send_incomplete` when it
+booked the invoice but did not email it (send it from Yuki or yourself), and
+`outcome_unknown` or `reference_mismatch` as below. Totals must be positive:
+credit notes are not supported.
 
 #### Your own PDF with your own number
 
-Only a prepared invoice carries a CLI-given number: `prepare --number <REF>`
-sets the invoice number (Yuki's `Reference`), and `--number auto` reads the sales (`verkoop`) archive for the
-invoice year, where Yuki names each invoice PDF after its number
-(`Invoice 2026-19.pdf`; only `.pdf` files named `Invoice <year>-<seq>` or
-`Factuur <year>-<seq>` count) and takes the lowest number above the archive's
-highest of the invoice date's year that the local ledger does not hold as
-reserved, pending or booked (`2026-20`), padded like the existing numbers. A
-number released or rejected is given out again, so the numbering keeps no
-gaps. A number the archive or the ledger already has is refused. Yuki's own
-counter does not learn about numbers given this way, so once you start, number
-every invoice here.
-
-To book a PDF rendered elsewhere, the number, the PDF and the booking are tied
-to one prepared invoice:
+Only a prepared invoice carries a CLI-given number, so the number, the PDF and
+the booking are tied to one file:
 
 1. `yuki sales invoice prepare --template acme-hosting --number auto --date
    2026-10-31 --out 2026-10-acme.json` writes the fully resolved invoice to the
@@ -363,50 +352,52 @@ to one prepared invoice:
    remarks and unit, the totals per VAT rate, the `vat_mention`, and the
    Belgian structured payment reference. The totals are the CLI's computation
    (VAT per rate); Yuki books its own, and `totals.vat_rounded_per_line`
-   appears when rounding per line would differ. Preparing the next invoice
-   gives the next number (`2026-21`), even before the first is booked.
+   appears when rounding per line would differ.
 2. Render the PDF from that file.
 3. `yuki sales invoice create --prepared 2026-10-acme.json --pdf 2026-10-acme.pdf
    --send email` books exactly the prepared content: it takes no `--file`,
-   `--template`, `--qty`, `--price`, `--date`, `--subject` or `--number`, and is
-   refused unless the number is still reserved, in the selected administration,
-   for a file with the same content (reformatting it is fine; any edit is not).
-   The reservation becomes `pending`, then `booked`. Yuki stores the PDF as
-   `Invoice <number>.pdf`, whatever the local file is called, so the archive
-   keeps showing the number. `--pdf` needs `--prepared`, and Yuki takes a custom
-   PDF only on a booked invoice. The lines are still sent: Yuki books the
-   amounts, and builds a Peppol invoice, from them. The PDF must start with
-   `%PDF-` and be at most 3 MB (Yuki's request limit, with base64 on top).
+   `--template`, `--qty`, `--price`, `--date` or `--subject`, and is refused
+   unless the number is still reserved, in the selected administration, for a
+   file with the same content (reformatting it is fine; any edit is not). Yuki
+   stores the PDF as `Invoice <number>.pdf`, whatever the local file is called,
+   so the archive keeps showing the number; `--pdf` needs `--prepared`. The
+   lines are still sent: Yuki books the amounts, and builds a Peppol invoice,
+   from them. The PDF must start with `%PDF-` and be at most 3 MB.
 
-After a booking, the `Reference` Yuki returns is compared with the number
-sent (`2026-020` counts as `2026-20`). When it differs, or is missing, the
-command exits 1 with kind `reference_mismatch` and a `REFERENCE MISMATCH`
-message, even with `--quiet`, which says whether an email was requested and
-reported sent and whether Peppol was requested. The number stays pending in
-the ledger with a note naming both numbers. Correct the booking in Sales in
-Yuki, then settle ours: `--resolve <number> --as booked` if the customer may
-have the invoice under it (emailed, or sent over Peppol), else
-`--resolve <number> --as rejected` to free it.
+`--number <REF>` gives that number; `--number auto` reads the sales (`verkoop`)
+archive for the invoice year, where Yuki names each invoice PDF after its
+number (`Invoice 2026-19.pdf`; only `.pdf` files named `Invoice <year>-<seq>`
+or `Factuur <year>-<seq>` count), and takes the lowest number above the
+archive's highest that the ledger does not hold, padded like the existing
+numbers (`2026-20`, then `2026-21` for the next invoice, even before the first
+is booked). A number the archive or the ledger already has is refused. Yuki's
+own counter does not learn about numbers given this way, so once you start,
+number every invoice here.
 
-A reservation that will not be sent is freed with
-`yuki sales invoice numbers --resolve <number> --as rejected`; the prepared file can then no longer be booked, and the next
-`auto` gives the number out again. A booking that never reached Yuki (no
-connection, or refused unprocessed with HTTP 401, 403 or 429) puts its number
-back to reserved for the same file, so the same `create --prepared` can simply
-be run again. `prepare`, `create` and `numbers` warn about a reservation older
-than 7 days (`2026-20 reserved since 2026-10-01 for Buuurt: book it or
-release it`): with continuous numbering, a number never booked is a gap.
-
-The ledger, `~/.config/yuki/invoice-numbers.json`, covers the time before the
-archive shows an invoice: a number is `reserved` by `prepare --out`, `pending`
-from just before Yuki is called, then `booked`, or `rejected` (free again)
-when Yuki refuses it. When no answer comes back it stays pending and taken:
-check "To be sent" or Sales in Yuki, then
+The ledger, `~/.config/yuki/invoice-numbers.json`, keeps each administration's
+numbers (`2026-01` is the same number as `2026-1`) from `prepare` until the
+archive shows the invoice. A number is `reserved` by `prepare --out`, `pending`
+from just before Yuki is called, then `booked`, or `rejected` (free again) when
+Yuki did not create it. If nothing reached Yuki (no connection, or refused
+unprocessed with HTTP 401, 403 or 429), it is `reserved` again for the same
+file: run the same `create --prepared` again. If the request went out but no
+usable answer came back (a timeout, a dropped connection, a SOAP fault or a
+server error), the command exits 1 with kind `outcome_unknown` and the number
+stays `pending`: check "To be sent" or Sales in Yuki, then settle it with
 `yuki sales invoice numbers --resolve <number> --as booked` (or `--as
-rejected`). Even
-with `--quiet --yes`, a booking prints one line to stderr:
-`BOOKS IMMEDIATELY: <number> <customer> <gross>`. The ledger keeps each
-administration's numbers apart, and `2026-01` is the same number as `2026-1`.
+rejected`). If Yuki booked it under another `Reference` (`2026-020` counts as
+`2026-20`), or none, the command exits 1 with kind `reference_mismatch` and a
+`REFERENCE MISMATCH` message, even with `--quiet`, saying whether the email
+was requested and sent and whether Peppol was requested; the number stays
+pending with a note naming both. Correct the booking in Sales in Yuki, then
+settle ours as `booked` if the customer may have the invoice under it, else as
+`rejected`. A reservation that will not be sent is freed with `--resolve
+<number> --as rejected` (it can never be `--as booked`); the next `auto` gives
+the number out again. `prepare`, `create` and `numbers` warn about a
+reservation older than 7 days: with continuous numbering, a number never booked
+is a gap. Even with `--quiet --yes`, a booking prints one line to stderr:
+`BOOKS IMMEDIATELY: <number> <customer> <gross>`. The request may take 60
+seconds plus 30 per megabyte of PDF.
 
 The structured reference (`+++DDD/DDDD/DDDCC+++`) has ten base digits: the
 year, then the sequence padded to six digits, for a `<year>-<seq>` number
@@ -414,16 +405,10 @@ year, then the sequence padded to six digits, for a `<year>-<seq>` number
 zeros. `CC` is the base modulo 97, or 97 when that is 0: `2026-20` gives
 `+++202/6000/02014+++`.
 
-If the request goes out but no usable answer comes back (a timeout, a dropped
-connection, a SOAP fault or a server error), the command exits 1 with kind
-`outcome_unknown`: the invoice may already exist, so check "To be sent" or Sales
-in Yuki before running it again. Only a request that never left, or that Yuki
-refused unprocessed (HTTP 401, 403 or 429), frees its number. The request may
-take 60 seconds plus 30 per megabyte of PDF.
-
 Recurring invoices are templates you run yourself: one file per customer in
-`~/.config/yuki/invoices/<name>.toml`, created each month with `--template`
-and approved at the prompt. `--qty` and `--price` replace the quantity and
+`~/.config/yuki/invoices/<name>.toml`, prepared each month with `prepare
+--template <name> --number auto --out <file>` (or created as a draft with
+`create --template`). `--qty` and `--price` replace the quantity and
 price of a single-line invoice, `--date` the invoice date (default: the file's,
 else today) and `--subject` its subject. An invoice file has the same format:
 
@@ -475,7 +460,9 @@ braces; any other text between braces, or a brace on its own, is an error.
 
 A rendered invoice also prints the firm that issues it. `prepare` gives it as
 `firm`, from a `[seller]` table in `~/.config/yuki/config.toml` (`bic`,
-`legal_form` and `rpr` are optional and come out as `null` when unset):
+`legal_form` and `rpr` are optional and come out as `null` when unset);
+`prepare --out` needs it, while `create --prepared` reads the firm from the
+file:
 
 ```toml
 [seller]

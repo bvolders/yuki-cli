@@ -594,7 +594,13 @@ pub enum SalesInvoiceCommands {
 
         /// What --resolve settles the number as: booked (pending only) or
         /// rejected (pending or reserved).
-        #[arg(long = "as", id = "resolution", value_enum, requires = "resolve")]
+        #[arg(
+            long = "as",
+            id = "resolution",
+            value_name = "STATUS",
+            value_enum,
+            requires = "resolve"
+        )]
         resolution: Option<invoice_ledger::Resolution>,
     },
 

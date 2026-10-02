@@ -1,10 +1,12 @@
 //! `yuki sales invoice`: create a sales invoice in Yuki from a TOML file or a
-//! saved per-customer template, as a draft unless `--send` books and sends it.
+//! saved per-customer template, as a draft unless `--send` books and sends it,
+//! or prepare a numbered invoice (`prepare --out`) and book exactly that
+//! (`create --prepared`).
 //!
 //! The invoice is read and validated, totalled in exact cents, and turned into
 //! the `xmlDoc` of `ProcessSalesInvoices`, whose element order follows Yuki's
-//! `SalesInvoices.xsd`. `main` shows the preview and asks for confirmation;
-//! [`submit`] is the only step that contacts Yuki.
+//! `SalesInvoices.xsd`. [`create`] shows the preview and asks for
+//! confirmation; [`submit`] is the only step that contacts Yuki.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -1330,9 +1332,6 @@ fn validate_line(
     }
     Some(line)
 }
-
-// ---------------------------------------------------------------------------
-// Confirmation and the API call.
 
 // ---------------------------------------------------------------------------
 // Prepared invoices: `prepare --out` and `create --prepared`.
