@@ -648,7 +648,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                 if !cli.quiet {
                                     let number = invoice.number.as_deref().unwrap_or_default();
                                     eprintln!(
-                                        "Reserved invoice number {number} for this content in {out}. Render the PDF from it, then: yuki sales invoice create --prepared {out} --pdf <pdf> --send email (free the number instead with: yuki sales invoice numbers --release {number})"
+                                        "Reserved invoice number {number} for this content in {out}. Render the PDF from it, then: yuki sales invoice create --prepared {out} --pdf <pdf> --send email (add --yes --confirm {number} without a prompt; free the number instead with: yuki sales invoice numbers --release {number})"
                                     );
                                 }
                                 json
