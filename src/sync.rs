@@ -7,7 +7,7 @@
 //! lock on `<root>/.yuki-sync.json.lock` keeps two runs apart; the kernel
 //! releases it when the holder exits or dies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -183,6 +183,18 @@ impl State {
             return Err(corrupt(format!("unsupported hash {:?}", state.hash)));
         }
         Ok(state)
+    }
+
+    /// The record at `rel` whose content is no longer in the tree (`present`
+    /// holds the hashes scanned): a different file at that path is a changed
+    /// version of it, while content that moved elsewhere keeps its record.
+    pub fn stale_record_at(&self, rel: &str, present: &HashSet<&str>) -> Option<(&str, &Entry)> {
+        self.files
+            .iter()
+            .find(|(h, e)| {
+                e.path == rel && e.status != Status::Failed && !present.contains(h.as_str())
+            })
+            .map(|(h, e)| (h.as_str(), e))
     }
 
     /// Write the state of `root` atomically: a crash leaves the old or the new

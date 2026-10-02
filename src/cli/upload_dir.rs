@@ -186,14 +186,6 @@ fn plan(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
     }
 
     let scanned: HashSet<&str> = scan.files.iter().map(|f| f.hash.as_str()).collect();
-    // Records whose content is no longer anywhere in the tree, by path: a new
-    // hash at such a path is a changed file, not a new one.
-    let gone: HashMap<&str, &Entry> = state
-        .files
-        .iter()
-        .filter(|(hash, e)| !scanned.contains(hash.as_str()) && e.status != Status::Failed)
-        .map(|(_, e)| (e.path.as_str(), e))
-        .collect();
 
     let (mut new, mut retries, mut pending, mut rows, mut moved) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -206,8 +198,8 @@ fn plan(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
             continue;
         }
         let Some(entry) = state.files.get(&file.hash) else {
-            match gone.get(file.rel.as_str()) {
-                Some(e) => {
+            match state.stale_record_at(&file.rel, &scanned) {
+                Some((_, e)) => {
                     trouble += 1;
                     let hint = mark_hint(&root, &file.rel);
                     rows.push(
@@ -875,31 +867,23 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
         Mark::Forget => {
             // The file's own record, else (a changed file) the record of the
             // earlier content at its path.
-            let before = state.files.len();
-            let mut doc = existing.as_ref().and_then(|e| e.document_id.clone());
-            if existing.is_some() {
-                state.files.remove(&hash);
+            let target = if existing.is_some() {
+                Some(hash.clone())
             } else {
-                // Only a record whose content is gone from the tree, the same
-                // rule `upload dir` uses to call a file changed: content that
-                // moved elsewhere keeps its record.
                 let scan = sync::scan(&root, &Excludes::new(&[])?)?;
                 let present: HashSet<&str> = scan.files.iter().map(|f| f.hash.as_str()).collect();
-                state.files.retain(|h, e| {
-                    let keep = e.path != rel || present.contains(h.as_str());
-                    if !keep {
-                        doc = doc.take().or(e.document_id.clone());
-                    }
-                    keep
-                });
-            }
-            if state.files.len() == before {
-                Row::new(&rel, "unchanged").note("no record to forget")
-            } else {
-                state.save(&root)?;
-                Row::new(&rel, "forgotten")
-                    .doc(doc.as_deref())
-                    .note("the next upload dir run uploads it")
+                state
+                    .stale_record_at(&rel, &present)
+                    .map(|(h, _)| h.to_string())
+            };
+            match target.and_then(|h| state.files.remove(&h)) {
+                None => Row::new(&rel, "unchanged").note("no record to forget"),
+                Some(old) => {
+                    state.save(&root)?;
+                    Row::new(&rel, "forgotten")
+                        .doc(old.document_id.as_deref())
+                        .note("the next upload dir run uploads it")
+                }
             }
         }
         Mark::Document(_) | Mark::Skip => {
