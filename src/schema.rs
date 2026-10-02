@@ -265,7 +265,7 @@ pub fn generate() -> Value {
             },
             {
                 "name": "sales invoice create",
-                "description": "Create a sales invoice in Yuki from a TOML file, a saved template, or a prepared invoice (--prepared, from prepare --out, booked exactly as prepared): a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 with invalid_input for a bad file, confirmation_required when not confirmed, outcome_unknown when the request went out without a usable answer (check Yuki before retrying), and invoice_rejected when Yuki fails or skips the invoice or does not book or email what --send asked.",
+                "description": "Create a sales invoice in Yuki from a TOML file, a saved template, or a prepared invoice (--prepared, from prepare --out, booked exactly as prepared): a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 with invalid_input for a bad file, confirmation_required when not confirmed, outcome_unknown when the request went out without a usable answer (check Yuki before retrying), invoice_rejected when Yuki fails or skips the invoice or does not book or email what --send asked, and reference_mismatch when Yuki booked it under another reference than --number.",
                 "mutating": true,
                 "args": [
                     {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file, --template or --prepared is required."},
@@ -774,6 +774,12 @@ pub fn generate() -> Value {
                 "exit_code": 1,
                 "retryable": false,
                 "description": "Yuki answered, but failed or skipped an invoice, or did not book or email it as --send asked; its message is in the output and the error."
+            },
+            {
+                "kind": "reference_mismatch",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "Yuki booked the invoice under another reference than the number sent; the number stays pending in the ledger with a note giving both. Check Sales in Yuki."
             },
             {
                 "kind": "error",

@@ -366,6 +366,12 @@ to one prepared invoice:
    amounts, and builds a Peppol invoice, from them. The PDF must start with
    `%PDF-` and be at most 3 MB (Yuki's request limit, with base64 on top).
 
+After a booking, the `Reference` Yuki returns is compared with the number
+sent (`2026-020` counts as `2026-20`). When it differs, or is missing, the
+command exits 1 with kind `reference_mismatch` and a `REFERENCE MISMATCH`
+message, even with `--quiet`; the number stays pending in the ledger with a
+note naming both, until you check Sales in Yuki and resolve it.
+
 A reservation that will not be sent is freed with
 `yuki sales invoice numbers --release <number>` (or `--resolve <number>
 rejected`); the prepared file can then no longer be booked.

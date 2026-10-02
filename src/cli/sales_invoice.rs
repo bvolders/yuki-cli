@@ -1602,11 +1602,12 @@ pub async fn submit(
 }
 
 /// [`submit`], with a number the CLI gave recorded as pending in the ledger
-/// first and settled by Yuki's answer: booked when the invoice was booked as
-/// asked, rejected (the number free again) when Yuki refused it or nothing
-/// was sent, and left pending when the outcome is unknown or partial. A
-/// prepared invoice (`prepared`: its content hash) moves its reservation to
-/// pending, refused unless the reservation is for exactly that content.
+/// first and settled by Yuki's [`Verdict`]: booked when the invoice was
+/// booked as asked, rejected (the number free again) when Yuki refused it
+/// or nothing was sent, and left pending, with a note when there is one,
+/// when the outcome is unknown, partial, or booked under another reference.
+/// A prepared invoice (`prepared`: its content hash) moves its reservation
+/// to pending, refused unless the reservation is for exactly that content.
 pub async fn submit_numbered(
     config: &Config,
     admin: Option<&str>,
@@ -1614,9 +1615,10 @@ pub async fn submit_numbered(
     prepared: Option<&str>,
     format: Option<&str>,
     quiet: bool,
-) -> Result<SalesInvoicesImport, SubmitError> {
+) -> Result<Verdict, SubmitError> {
     let Some(number) = &invoice.number else {
-        return submit(config, admin, invoice, format, quiet).await;
+        let import = submit(config, admin, invoice, format, quiet).await?;
+        return Ok(verdict(&import, invoice));
     };
     let admin_id = config.target(admin)?.admin_id;
     let mut ledger = InvoiceLedger::open()?;
@@ -1632,33 +1634,89 @@ pub async fn submit_numbered(
     }
     // The lock is not held while Yuki is called.
     drop(ledger);
-    let result = submit(config, admin, invoice, format, quiet).await;
-    let settled = match &result {
-        Ok(import) if import.failure().is_none() && unsent(import, invoice.send).is_none() => {
-            Some(true)
+    let result = submit(config, admin, invoice, format, quiet)
+        .await
+        .map(|import| verdict(&import, invoice));
+    let outcome = InvoiceLedger::open().and_then(|mut ledger| match &result {
+        Ok(Verdict::Done) => ledger.commit(admin_id, number).map(|()| true),
+        Ok(Verdict::Rejected { freed: true, .. }) | Err(SubmitError::Yuki(_)) => {
+            ledger.reject(admin_id, number).map(|()| true)
         }
-        Ok(import)
-            if !import.invoices.is_empty() && import.invoices.iter().all(|i| !i.succeeded) =>
-        {
-            Some(false)
+        Ok(Verdict::ReferenceMismatch(message)) => {
+            ledger.note(admin_id, number, message).map(|()| false)
         }
-        Err(SubmitError::Yuki(_)) => Some(false),
-        Ok(_) | Err(SubmitError::OutcomeUnknown(_)) => None,
-    };
-    let outcome = InvoiceLedger::open().and_then(|mut ledger| match settled {
-        Some(true) => ledger.commit(admin_id, number),
-        Some(false) => ledger.reject(admin_id, number),
-        None => Ok(()),
+        Ok(Verdict::Rejected { freed: false, .. }) | Err(SubmitError::OutcomeUnknown(_)) => {
+            Ok(false)
+        }
     });
-    if settled.is_none() || outcome.is_err() {
-        if let Err(e) = outcome {
-            eprintln!("warning: could not update the invoice number ledger: {e}");
-        }
-        eprintln!(
+    match outcome {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
             "invoice number {number} stays pending in the ledger: check Yuki, then `yuki sales invoice numbers --resolve {number} booked` (or `rejected`)"
-        );
+        ),
+        Err(e) => eprintln!(
+            "warning: could not update the invoice number ledger: {e}; invoice number {number} stays pending: check Yuki, then `yuki sales invoice numbers --resolve {number} booked` (or `rejected`)"
+        ),
     }
     result
+}
+
+/// What Yuki's answer means for an invoice it was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Created as a draft, or booked and sent, as asked.
+    Done,
+    /// Yuki did not create or book it as asked. `freed`: it provably did not
+    /// create it at all, so its number is free again.
+    Rejected { message: String, freed: bool },
+    /// Booked, but under another reference than the number sent.
+    ReferenceMismatch(String),
+}
+
+/// Judge Yuki's `import` of `invoice`.
+pub fn verdict(import: &SalesInvoicesImport, invoice: &Invoice) -> Verdict {
+    if let Some(failure) = import.failure() {
+        let freed = !import.invoices.is_empty() && import.invoices.iter().all(|i| !i.succeeded);
+        return Verdict::Rejected {
+            message: failure,
+            freed,
+        };
+    }
+    let Some(mode) = invoice.send else {
+        return Verdict::Done;
+    };
+    for booked in &import.invoices {
+        let name = if booked.reference.is_empty() {
+            &booked.subject
+        } else {
+            &booked.reference
+        };
+        if !booked.processed {
+            return Verdict::Rejected {
+                message: format!("Yuki saved invoice {name} but did not book it"),
+                freed: false,
+            };
+        }
+        if let Some(number) = &invoice.number
+            && !crate::cli::invoice_number::same_number(&booked.reference, number)
+        {
+            let got = if booked.reference.is_empty() {
+                "no reference".to_string()
+            } else {
+                format!("reference {}", booked.reference)
+            };
+            return Verdict::ReferenceMismatch(format!(
+                "REFERENCE MISMATCH: Yuki booked the invoice with {got}, not {number}, the number sent (and printed on the PDF and in the payment reference); check Sales in Yuki before sending or booking anything else"
+            ));
+        }
+        if mode.email() && !booked.email_sent {
+            return Verdict::Rejected {
+                message: format!("Yuki booked invoice {name} but did not email it"),
+                freed: false,
+            };
+        }
+    }
+    Verdict::Done
 }
 
 /// Why [`submit`] failed.
@@ -1711,33 +1769,6 @@ fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<
         OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
         OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
     }
-}
-
-/// Why Yuki did not do what `--send` asked of an invoice it accepted: not
-/// booked, or (when emailing) not emailed. Peppol delivery is not reported
-/// back, so it cannot be checked.
-pub fn unsent(import: &SalesInvoicesImport, send: Option<SendMode>) -> Option<String> {
-    let mode = send?;
-    let problems: Vec<String> = import
-        .invoices
-        .iter()
-        .filter(|i| i.succeeded)
-        .filter_map(|invoice| {
-            let name = if invoice.reference.is_empty() {
-                &invoice.subject
-            } else {
-                &invoice.reference
-            };
-            if !invoice.processed {
-                Some(format!("Yuki saved invoice {name} but did not book it"))
-            } else if mode.email() && !invoice.email_sent {
-                Some(format!("Yuki booked invoice {name} but did not email it"))
-            } else {
-                None
-            }
-        })
-        .collect();
-    (!problems.is_empty()).then(|| problems.join("; "))
 }
 
 /// List the saved templates, each validated as `create` would read it.

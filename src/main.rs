@@ -24,6 +24,8 @@ enum AppError {
     InvalidInput(String),
     /// A write whose request went out without a usable answer.
     OutcomeUnknown(String),
+    /// Yuki booked an invoice under another reference than the number sent.
+    ReferenceMismatch(String),
 }
 
 impl fmt::Display for AppError {
@@ -34,7 +36,8 @@ impl fmt::Display for AppError {
             Self::ConfirmationRequired(message)
             | Self::InvoiceRejected(message)
             | Self::InvalidInput(message)
-            | Self::OutcomeUnknown(message) => {
+            | Self::OutcomeUnknown(message)
+            | Self::ReferenceMismatch(message) => {
                 write!(f, "{message}")
             }
         }
@@ -61,7 +64,8 @@ impl AppError {
             Self::ConfirmationRequired(_)
             | Self::InvoiceRejected(_)
             | Self::InvalidInput(_)
-            | Self::OutcomeUnknown(_) => 1,
+            | Self::OutcomeUnknown(_)
+            | Self::ReferenceMismatch(_) => 1,
         }
     }
 
@@ -79,6 +83,7 @@ impl AppError {
             Self::InvoiceRejected(_) => "invoice_rejected",
             Self::InvalidInput(_) => "invalid_input",
             Self::OutcomeUnknown(_) => "outcome_unknown",
+            Self::ReferenceMismatch(_) => "reference_mismatch",
         }
     }
 }
@@ -562,7 +567,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                 ));
                             }
                         }
-                        let import = sales_invoice::submit_numbered(
+                        let verdict = sales_invoice::submit_numbered(
                             &config,
                             admin,
                             &invoice,
@@ -577,11 +582,14 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                 AppError::OutcomeUnknown(message)
                             }
                         })?;
-                        if let Some(failure) = import
-                            .failure()
-                            .or_else(|| sales_invoice::unsent(&import, invoice.send))
-                        {
-                            return Err(AppError::InvoiceRejected(failure));
+                        match verdict {
+                            sales_invoice::Verdict::Done => {}
+                            sales_invoice::Verdict::Rejected { message, .. } => {
+                                return Err(AppError::InvoiceRejected(message));
+                            }
+                            sales_invoice::Verdict::ReferenceMismatch(message) => {
+                                return Err(AppError::ReferenceMismatch(message));
+                            }
                         }
                     }
                     SalesInvoiceCommands::Prepare { inputs, out } => {

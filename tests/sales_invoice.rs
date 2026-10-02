@@ -1034,3 +1034,28 @@ fn an_unknown_outcome_keeps_the_number_pending_until_resolved() {
     );
     assert_eq!(bad.status.code(), Some(1));
 }
+
+#[test]
+fn a_booking_under_another_reference_is_loud_and_stays_pending() {
+    let (root, _log) = mock(import_response(true, true, false, "2026-99"));
+    let home = home(&root);
+    // Quiet: the error is still on stderr.
+    let output = book_number(&home, "2026-20");
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("\"kind\":\"reference_mismatch\""), "{err}");
+    assert!(
+        err.contains(
+            "REFERENCE MISMATCH: Yuki booked the invoice with reference 2026-99, not 2026-20"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("stays pending in the ledger"), "{err}");
+    let row = &ledger_rows(&home)[0];
+    assert_eq!(row["Status"], "pending");
+    let note = row["Note"].as_str().unwrap();
+    assert!(
+        note.contains("2026-99") && note.contains("2026-20"),
+        "{note}"
+    );
+}

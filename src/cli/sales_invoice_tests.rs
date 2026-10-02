@@ -1006,3 +1006,52 @@ iban = "BE35733070723437"
     }
     assert!(invoice(MINIMAL, None).prepared_for(None)["firm"].is_null());
 }
+
+fn import_of(reference: &str, processed: bool, email_sent: bool) -> SalesInvoicesImport {
+    SalesInvoicesImport {
+        total_succeeded: 1,
+        total_failed: 0,
+        total_skipped: 0,
+        invoices: vec![crate::client::sales::ImportedInvoice {
+            succeeded: true,
+            processed,
+            email_sent,
+            reference: reference.into(),
+            subject: "Consultancy".into(),
+            message: String::new(),
+        }],
+    }
+}
+
+#[test]
+fn the_reference_yuki_booked_must_be_the_number_sent() {
+    let number = NumberRequest::Given("2026-20".into());
+    let overrides = Overrides {
+        number: Some(&number),
+        ..Default::default()
+    };
+    let inv = parse(&bookable(), "t", &overrides, Some(SendMode::Book)).unwrap();
+    assert_eq!(
+        verdict(&import_of("2026-20", true, false), &inv),
+        Verdict::Done
+    );
+    // Padding aside, it is the same number.
+    assert_eq!(
+        verdict(&import_of("2026-020", true, false), &inv),
+        Verdict::Done
+    );
+    for (reference, shown) in [("2026-21", "reference 2026-21"), ("", "no reference")] {
+        match verdict(&import_of(reference, true, false), &inv) {
+            Verdict::ReferenceMismatch(m) => {
+                assert!(m.contains(&format!("with {shown}, not 2026-20")), "{m}")
+            }
+            other => panic!("{reference}: {other:?}"),
+        }
+    }
+    // Yuki numbers an invoice sent without one: nothing to compare.
+    let yuki_numbered = invoice(&bookable(), Some(SendMode::Book));
+    assert_eq!(
+        verdict(&import_of("2026-21", true, false), &yuki_numbered),
+        Verdict::Done
+    );
+}
