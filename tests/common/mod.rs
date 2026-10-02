@@ -113,6 +113,8 @@ pub struct Request {
     pub path: String,
     /// The SOAP action's operation, e.g. `Authenticate`.
     pub action: String,
+    /// The `SOAPAction` header as sent, quotes included.
+    pub soap_action: String,
     pub body: String,
 }
 
@@ -180,7 +182,7 @@ fn serve(mut stream: TcpStream, log: &RequestLog, handler: &dyn Fn(&Request) -> 
         .nth(1)
         .unwrap_or_default()
         .to_string();
-    let (mut action, mut length) = (String::new(), 0usize);
+    let (mut soap_action, mut length) = (String::new(), 0usize);
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
@@ -190,20 +192,21 @@ fn serve(mut stream: TcpStream, log: &RequestLog, handler: &dyn Fn(&Request) -> 
         if let Some(v) = lower.strip_prefix("content-length:") {
             length = v.trim().parse().unwrap_or(0);
         } else if lower.starts_with("soapaction:") {
-            action = header["soapaction:".len()..]
-                .trim()
-                .trim_matches('"')
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-                .to_string();
+            soap_action = header["soapaction:".len()..].trim().to_string();
         }
     }
+    let action = soap_action
+        .trim_matches('"')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
     let mut body = vec![0; length];
     reader.read_exact(&mut body).ok();
     let request = Request {
         path,
         action,
+        soap_action,
         body: String::from_utf8_lossy(&body).into_owned(),
     };
     log.lock().expect("log").push(request.clone());

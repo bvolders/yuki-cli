@@ -48,17 +48,24 @@ fn init_with_region_be_stores_it_and_later_commands_use_the_belgian_host() {
         String::from_utf8_lossy(&init.stderr)
     );
 
+    // The full SOAPAction header: namespace and quotes.
     let requests: Vec<(String, String)> = seen
         .lock()
         .expect("log")
         .iter()
-        .map(|r| (r.path.clone(), r.action.clone()))
+        .map(|r| (r.path.clone(), r.soap_action.clone()))
         .collect();
     assert_eq!(
         requests,
         [
-            ("/ws/Accounting.asmx".into(), "Authenticate".into()),
-            ("/ws/Accounting.asmx".into(), "Administrations".into()),
+            (
+                "/ws/Accounting.asmx".into(),
+                "\"http://www.theyukicompany.com/Authenticate\"".into()
+            ),
+            (
+                "/ws/Accounting.asmx".into(),
+                "\"http://www.theyukicompany.com/Administrations\"".into()
+            ),
         ]
     );
 

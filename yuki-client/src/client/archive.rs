@@ -184,6 +184,17 @@ impl ArchiveClient {
         folder_id: i32,
     ) -> Result<Vec<ArchiveDocument>, YukiError> {
         let (start, end) = ALL_DATES;
+        self.documents_in_folder_strict(folder_id, start, end).await
+    }
+
+    /// [`documents_in_folder_all`](Self::documents_in_folder_all), for the
+    /// documents dated `start` to `end` (inclusive, `YYYY-MM-DD`).
+    pub async fn documents_in_folder_strict(
+        &self,
+        folder_id: i32,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<ArchiveDocument>, YukiError> {
         let mut docs: Vec<ArchiveDocument> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..ALL_MAX_PAGES {

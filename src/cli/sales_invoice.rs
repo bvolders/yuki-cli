@@ -16,7 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::Deserialize;
 
-use crate::cli::invoice_ledger::InvoiceLedger;
+use crate::cli::invoice_ledger::{Claim, InvoiceLedger};
 use crate::cli::invoice_number::{NumberRequest, dutch_date, structured_reference};
 use crate::client::escape_text;
 use crate::client::sales::{SalesClient, SalesInvoicesImport};
@@ -1331,12 +1331,14 @@ pub async fn submit_numbered(
     let Some(number) = &invoice.number else {
         return submit(config, admin, invoice, format, quiet).await;
     };
-    InvoiceLedger::open()?.reserve(
+    let admin_id = config.target(admin)?.admin_id;
+    InvoiceLedger::open()?.reserve(&Claim {
+        admin: admin_id,
         number,
-        &invoice.date,
-        &invoice.contact.label(),
-        &invoice.gross().to_string(),
-    )?;
+        date: &invoice.date,
+        customer: &invoice.contact.label(),
+        gross: &invoice.gross().to_string(),
+    })?;
     let result = submit(config, admin, invoice, format, quiet).await;
     let settled = match &result {
         Ok(import) if import.failure().is_none() && unsent(import, invoice.send).is_none() => {
@@ -1351,8 +1353,8 @@ pub async fn submit_numbered(
         Ok(_) | Err(SubmitError::OutcomeUnknown(_)) => None,
     };
     let outcome = InvoiceLedger::open().and_then(|mut ledger| match settled {
-        Some(true) => ledger.commit(number),
-        Some(false) => ledger.reject(number),
+        Some(true) => ledger.commit(admin_id, number),
+        Some(false) => ledger.reject(admin_id, number),
         None => Ok(()),
     });
     if settled.is_none() || outcome.is_err() {

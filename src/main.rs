@@ -571,7 +571,9 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             }
                             _ => None,
                         };
+                        let config = load()?;
                         invoice_ledger::numbers(
+                            config.target(admin)?.admin_id,
                             resolve.as_ref().map(|(n, s)| (n.as_str(), *s)),
                             format,
                         )?;

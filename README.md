@@ -355,7 +355,8 @@ called, then `booked`, or `rejected` (free again) when Yuki refuses it. When no
 answer comes back it stays pending and taken: check "To be sent" or Sales in
 Yuki, then `yuki sales invoice numbers --resolve <number> booked` (or
 `rejected`). Even with `--quiet --yes`, a booking prints one line to stderr:
-`BOOKS IMMEDIATELY: <number> <customer> <gross>`.
+`BOOKS IMMEDIATELY: <number> <customer> <gross>`. The ledger keeps each
+administration's numbers apart, and `2026-01` is the same number as `2026-1`.
 
 To send a PDF rendered elsewhere:
 

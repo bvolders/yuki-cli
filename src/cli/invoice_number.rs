@@ -100,16 +100,19 @@ pub fn next_number(numbers: &[String], year: u32) -> String {
     format!("{year}-{seq:0width$}")
 }
 
-/// Whether `numbers` holds `number`: the same year and sequence for a
-/// `<year>-<seq>` number (`2026-019` is `2026-19`), else the same text.
-pub fn taken(numbers: &[String], number: &str) -> bool {
-    match year_number(number) {
-        Some(wanted) => numbers
-            .iter()
-            .filter_map(|n| year_number(n))
-            .any(|n| n.year == wanted.year && n.seq == wanted.seq),
-        None => numbers.iter().any(|n| n == number),
+/// Whether `a` and `b` are the same invoice number: the same year and
+/// sequence for `<year>-<seq>` numbers (`2026-019` is `2026-19`), else the
+/// same text.
+pub fn same_number(a: &str, b: &str) -> bool {
+    match (year_number(a), year_number(b)) {
+        (Some(a), Some(b)) => a.year == b.year && a.seq == b.seq,
+        _ => a == b,
     }
+}
+
+/// Whether `numbers` holds `number`, compared as [`same_number`].
+pub fn taken(numbers: &[String], number: &str) -> bool {
+    numbers.iter().any(|n| same_number(n, number))
 }
 
 /// The invoice numbers in the sales (`verkoop`) archive for `years`, each
@@ -127,7 +130,7 @@ async fn archive_numbers(
     let mut files = Vec::new();
     for year in years {
         let documents = client
-            .documents_in_folder(
+            .documents_in_folder_strict(
                 folder_id("verkoop")?,
                 &format!("{year}-01-01"),
                 &format!("{year}-12-31"),
@@ -156,8 +159,9 @@ pub async fn resolve(
     {
         years.push(n.year);
     }
+    let admin_id = config.target(admin)?.admin_id;
     let archive = archive_numbers(config, admin, &years).await?;
-    choose(request, year, &archive, &InvoiceLedger::peek()?)
+    choose(request, year, &archive, &InvoiceLedger::peek()?, admin_id)
 }
 
 /// [`resolve`] once the archive's numbers are known.
@@ -166,8 +170,9 @@ pub fn choose(
     year: u32,
     archive: &[String],
     ledger: &Numbers,
+    admin: &str,
 ) -> Result<String, YukiError> {
-    let held: Vec<String> = ledger.taken_numbers().map(str::to_string).collect();
+    let held: Vec<String> = ledger.taken_numbers(admin).map(str::to_string).collect();
     let number = match request {
         NumberRequest::Auto => {
             let all: Vec<String> = archive.iter().chain(&held).cloned().collect();
@@ -181,7 +186,7 @@ pub fn choose(
         )));
     }
     if taken(&held, &number) {
-        let status = ledger.holder(&number).map_or("taken", |e| match e.status {
+        let status = ledger.holder(admin, &number).map_or("taken", |e| match e.status {
             crate::cli::invoice_ledger::Status::Pending => {
                 "pending (outcome unknown: check Yuki, then `yuki sales invoice numbers --resolve`)"
             }
@@ -308,11 +313,17 @@ mod tests {
         let archive = numbers_in_file_names(&archive());
         let mut ledger = Numbers::default();
         ledger
-            .reserve("2026-20", "2026-10-31", "Example BV", "121.00")
+            .reserve(&crate::cli::invoice_ledger::Claim {
+                admin: "a1",
+                number: "2026-20",
+                date: "2026-10-31",
+                customer: "Example BV",
+                gross: "121.00",
+            })
             .unwrap();
         // auto skips the pending number; giving it is refused.
         assert_eq!(
-            choose(&NumberRequest::Auto, 2026, &archive, &ledger).unwrap(),
+            choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a1").unwrap(),
             "2026-21"
         );
         let err = choose(
@@ -320,6 +331,7 @@ mod tests {
             2026,
             &archive,
             &ledger,
+            "a1",
         )
         .unwrap_err()
         .to_string();
@@ -329,17 +341,40 @@ mod tests {
             2026,
             &archive,
             &ledger,
+            "a1",
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("already in the sales archive"), "{err}");
         // A rejected number is free again.
         ledger
-            .settle("2026-20", crate::cli::invoice_ledger::Status::Rejected)
+            .settle(
+                "a1",
+                "2026-20",
+                crate::cli::invoice_ledger::Status::Rejected,
+            )
             .unwrap();
         assert_eq!(
-            choose(&NumberRequest::Auto, 2026, &archive, &ledger).unwrap(),
+            choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a1").unwrap(),
             "2026-20"
+        );
+        // Another administration's numbers do not count.
+        ledger
+            .reserve(&crate::cli::invoice_ledger::Claim {
+                admin: "a2",
+                number: "2026-20",
+                date: "2026-10-31",
+                customer: "Other BV",
+                gross: "1.00",
+            })
+            .unwrap();
+        assert_eq!(
+            choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a1").unwrap(),
+            "2026-20"
+        );
+        assert_eq!(
+            choose(&NumberRequest::Auto, 2026, &archive, &ledger, "a2").unwrap(),
+            "2026-21"
         );
     }
 

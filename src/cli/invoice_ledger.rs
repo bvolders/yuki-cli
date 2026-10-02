@@ -10,9 +10,15 @@
 //! `sales invoice numbers --resolve` settles it. Only a rejected number may
 //! be given out again.
 //!
+//! Numbers belong to an administration (its `admin_id`): each administration
+//! numbers its invoices on its own. Entries written before the ledger
+//! recorded the administration count for every administration. Numbers
+//! compare as [`same_number`]: `2026-01` is `2026-1`.
+//!
 //! The file is a [`Ledger`]: written atomically, and locked by an OS lock on
 //! `.invoice-numbers.json.lock` only for each short read-and-write, never
-//! while Yuki is called, so a crash cannot leave it locked.
+//! while Yuki is called, so a crash cannot leave it locked. A second run
+//! waits for that lock rather than failing.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +26,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cli::invoice_number::same_number;
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::ledger::{Ledger, LedgerFormat};
@@ -27,11 +34,10 @@ use crate::output::{OutputFormat, format_json, format_table, is_tty};
 use crate::period::date_from_epoch_days;
 
 /// What happened to a number given out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     /// Sent, or about to be, with no answer yet: still taken.
-    #[value(skip)]
     Pending,
     /// Yuki booked it.
     Booked,
@@ -40,7 +46,7 @@ pub enum Status {
 }
 
 impl Status {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Booked => "booked",
@@ -52,6 +58,10 @@ impl Status {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub number: String,
+    /// The administration (`admin_id`) the number belongs to; absent in
+    /// entries written before it was recorded, which count for every one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<String>,
     /// Invoice date.
     pub date: String,
     pub customer: String,
@@ -65,6 +75,24 @@ pub struct Entry {
     /// Fields this version does not know, kept as they are.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl Entry {
+    /// Whether the entry counts for administration `admin`.
+    fn of(&self, admin: &str) -> bool {
+        self.admin.as_deref().is_none_or(|a| a == admin)
+    }
+}
+
+/// A number about to be given out, and what it is for.
+#[derive(Debug, Clone, Copy)]
+pub struct Claim<'a> {
+    /// The administration's `admin_id`.
+    pub admin: &'a str,
+    pub number: &'a str,
+    pub date: &'a str,
+    pub customer: &'a str,
+    pub gross: &'a str,
 }
 
 /// The ledger's entries, in memory.
@@ -87,45 +115,42 @@ impl LedgerFormat for Numbers {
 }
 
 impl Numbers {
-    /// The entry still holding `number` (pending or booked), if any.
-    pub fn holder(&self, number: &str) -> Option<&Entry> {
+    /// The entry of `admin` still holding `number` (not rejected), if any.
+    pub fn holder(&self, admin: &str, number: &str) -> Option<&Entry> {
         self.entries
             .iter()
             .rev()
-            .find(|e| e.number == number && e.status != Status::Rejected)
+            .find(|e| e.of(admin) && e.status != Status::Rejected && same_number(&e.number, number))
     }
 
-    /// The numbers still taken: every entry not rejected.
-    pub fn taken_numbers(&self) -> impl Iterator<Item = &str> {
+    /// The numbers `admin` still holds: every entry not rejected.
+    pub fn taken_numbers<'a>(&'a self, admin: &'a str) -> impl Iterator<Item = &'a str> {
         self.entries
             .iter()
-            .filter(|e| e.status != Status::Rejected)
+            .filter(move |e| e.of(admin) && e.status != Status::Rejected)
             .map(|e| e.number.as_str())
     }
 
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
+    /// The entries of `admin`, oldest first.
+    pub fn entries_of<'a>(&'a self, admin: &'a str) -> impl Iterator<Item = &'a Entry> {
+        self.entries.iter().filter(move |e| e.of(admin))
     }
 
-    /// Record `number` as pending; refused while an entry holds it.
-    pub fn reserve(
-        &mut self,
-        number: &str,
-        date: &str,
-        customer: &str,
-        gross: &str,
-    ) -> Result<(), YukiError> {
-        if let Some(held) = self.holder(number) {
+    /// Record the claim as pending; refused while an entry holds the number.
+    pub fn reserve(&mut self, claim: &Claim<'_>) -> Result<(), YukiError> {
+        if let Some(held) = self.holder(claim.admin, claim.number) {
             return Err(YukiError::Config(format!(
-                "invoice number {number} was already given out: {}",
+                "invoice number {} was already given out: {}",
+                claim.number,
                 held.status.label()
             )));
         }
         self.entries.push(Entry {
-            number: number.to_string(),
-            date: date.to_string(),
-            customer: customer.to_string(),
-            gross: gross.to_string(),
+            number: claim.number.to_string(),
+            admin: Some(claim.admin.to_string()),
+            date: claim.date.to_string(),
+            customer: claim.customer.to_string(),
+            gross: claim.gross.to_string(),
             status: Status::Pending,
             recorded_at: now_utc(),
             booked_at: None,
@@ -134,13 +159,18 @@ impl Numbers {
         Ok(())
     }
 
-    /// Settle the latest pending entry for `number` as `status`.
-    pub(crate) fn settle(&mut self, number: &str, status: Status) -> Result<(), YukiError> {
+    /// Settle the latest pending entry of `admin` for `number` as `status`.
+    pub(crate) fn settle(
+        &mut self,
+        admin: &str,
+        number: &str,
+        status: Status,
+    ) -> Result<(), YukiError> {
         let entry = self
             .entries
             .iter_mut()
             .rev()
-            .find(|e| e.number == number && e.status == Status::Pending)
+            .find(|e| e.of(admin) && e.status == Status::Pending && same_number(&e.number, number))
             .ok_or_else(|| YukiError::NotFound(format!("no pending invoice number {number}")))?;
         entry.status = status;
         if status == Status::Booked {
@@ -159,9 +189,10 @@ impl InvoiceLedger {
         Self::open_at(&ledger_path())
     }
 
-    /// Lock and load the ledger at `path`; a missing file is an empty ledger.
+    /// Lock and load the ledger at `path`, waiting while another run holds
+    /// the lock; a missing file is an empty ledger.
     pub fn open_at(path: &Path) -> Result<Self, YukiError> {
-        Ledger::open(path).map(Self)
+        Ledger::open_wait(path).map(Self)
     }
 
     /// The numbers in the ledger at its default path, read without the lock.
@@ -173,35 +204,29 @@ impl InvoiceLedger {
         self.0.state()
     }
 
-    /// Write-ahead: record `number` as pending before it is sent.
-    pub fn reserve(
-        &mut self,
-        number: &str,
-        date: &str,
-        customer: &str,
-        gross: &str,
-    ) -> Result<(), YukiError> {
-        self.0.state_mut().reserve(number, date, customer, gross)?;
+    /// Write-ahead: record the claimed number as pending before it is sent.
+    pub fn reserve(&mut self, claim: &Claim<'_>) -> Result<(), YukiError> {
+        self.0.state_mut().reserve(claim)?;
         self.0.save()
     }
 
     /// Yuki booked `number`.
-    pub fn commit(&mut self, number: &str) -> Result<(), YukiError> {
-        self.0.state_mut().settle(number, Status::Booked)?;
+    pub fn commit(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
+        self.0.state_mut().settle(admin, number, Status::Booked)?;
         self.0.save()
     }
 
     /// Yuki did not create `number`: free it again.
-    pub fn reject(&mut self, number: &str) -> Result<(), YukiError> {
-        self.0.state_mut().settle(number, Status::Rejected)?;
+    pub fn reject(&mut self, admin: &str, number: &str) -> Result<(), YukiError> {
+        self.0.state_mut().settle(admin, number, Status::Rejected)?;
         self.0.save()
     }
 
     /// Settle a pending `number` by hand, after checking Yuki.
-    pub fn resolve(&mut self, number: &str, status: Status) -> Result<(), YukiError> {
+    pub fn resolve(&mut self, admin: &str, number: &str, status: Status) -> Result<(), YukiError> {
         match status {
-            Status::Booked => self.commit(number),
-            Status::Rejected => self.reject(number),
+            Status::Booked => self.commit(admin, number),
+            Status::Rejected => self.reject(admin, number),
             Status::Pending => Err(YukiError::Config(
                 "resolve a number as booked or rejected".into(),
             )),
@@ -232,13 +257,17 @@ fn now_utc() -> String {
     )
 }
 
-/// `sales invoice numbers`: list the ledger, after settling a pending
-/// number by hand when `resolve` is given.
-pub fn numbers(resolve: Option<(&str, Status)>, format: Option<&str>) -> Result<(), YukiError> {
+/// `sales invoice numbers`: list the numbers of administration `admin`,
+/// after settling a pending number by hand when `resolve` is given.
+pub fn numbers(
+    admin: &str,
+    resolve: Option<(&str, Status)>,
+    format: Option<&str>,
+) -> Result<(), YukiError> {
     let numbers = match resolve {
         Some((number, status)) => {
             let mut ledger = InvoiceLedger::open()?;
-            ledger.resolve(number, status)?;
+            ledger.resolve(admin, number, status)?;
             ledger.list().clone()
         }
         None => InvoiceLedger::peek()?,
@@ -249,8 +278,7 @@ pub fn numbers(resolve: Option<(&str, Status)>, format: Option<&str>) -> Result<
     .map(String::from)
     .to_vec();
     let rows: Vec<Vec<String>> = numbers
-        .entries()
-        .iter()
+        .entries_of(admin)
         .map(|e| {
             vec![
                 e.number.clone(),
@@ -274,44 +302,45 @@ pub fn numbers(resolve: Option<(&str, Status)>, format: Option<&str>) -> Result<
 mod tests {
     use super::*;
 
+    fn claim<'a>(admin: &'a str, number: &'a str) -> Claim<'a> {
+        Claim {
+            admin,
+            number,
+            date: "2026-10-31",
+            customer: "Example BV",
+            gross: "121.00",
+        }
+    }
+
     #[test]
     fn a_number_stays_taken_until_rejected_and_survives_a_reopen() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("invoice-numbers.json");
-        {
-            let mut ledger = InvoiceLedger::open_at(&path).unwrap();
-            ledger
-                .reserve("2026-20", "2026-10-31", "Example BV", "121.00")
-                .unwrap();
-            // While open, a second run cannot open it.
-            let err = InvoiceLedger::open_at(&path).err().unwrap().to_string();
-            assert!(err.contains("another yuki run"), "{err}");
-        }
+        InvoiceLedger::open_at(&path)
+            .unwrap()
+            .reserve(&claim("a1", "2026-20"))
+            .unwrap();
         let mut ledger = InvoiceLedger::open_at(&path).unwrap();
         assert_eq!(
-            ledger.list().holder("2026-20").unwrap().status,
+            ledger.list().holder("a1", "2026-20").unwrap().status,
             Status::Pending
         );
-        let err = ledger
-            .reserve("2026-20", "2026-10-31", "Other", "1.00")
-            .unwrap_err();
+        let err = ledger.reserve(&claim("a1", "2026-20")).unwrap_err();
         assert!(err.to_string().contains("already given out: pending"));
-        ledger.reject("2026-20").unwrap();
-        assert!(ledger.list().holder("2026-20").is_none());
+        ledger.reject("a1", "2026-20").unwrap();
+        assert!(ledger.list().holder("a1", "2026-20").is_none());
         // A rejected number can be given out again, and booked.
-        ledger
-            .reserve("2026-20", "2026-10-31", "Example BV", "121.00")
-            .unwrap();
-        ledger.commit("2026-20").unwrap();
-        let booked = ledger.list().holder("2026-20").unwrap();
+        ledger.reserve(&claim("a1", "2026-20")).unwrap();
+        ledger.commit("a1", "2026-20").unwrap();
+        let booked = ledger.list().holder("a1", "2026-20").unwrap();
         assert_eq!(booked.status, Status::Booked);
         assert!(booked.booked_at.is_some());
         assert!(
-            ledger.resolve("2026-20", Status::Rejected).is_err(),
+            ledger.resolve("a1", "2026-20", Status::Rejected).is_err(),
             "nothing pending"
         );
         assert_eq!(
-            ledger.list().taken_numbers().collect::<Vec<_>>(),
+            ledger.list().taken_numbers("a1").collect::<Vec<_>>(),
             ["2026-20"]
         );
         drop(ledger);
@@ -325,7 +354,42 @@ mod tests {
             names,
             [".invoice-numbers.json.lock", "invoice-numbers.json"]
         );
+    }
+
+    #[test]
+    fn numbers_belong_to_an_administration_and_compare_by_value() {
+        let mut numbers = Numbers::default();
+        numbers.reserve(&claim("a1", "2026-01")).unwrap();
+        // 2026-1 is 2026-01, in the same administration only.
+        let err = numbers.reserve(&claim("a1", "2026-1")).unwrap_err();
+        assert!(err.to_string().contains("already given out"), "{err}");
+        assert!(numbers.holder("a1", "2026-001").is_some());
+        numbers.reserve(&claim("a2", "2026-1")).unwrap();
+        assert_eq!(numbers.taken_numbers("a2").collect::<Vec<_>>(), ["2026-1"]);
+        numbers.settle("a2", "2026-01", Status::Booked).unwrap();
+        assert_eq!(
+            numbers.holder("a1", "2026-1").unwrap().status,
+            Status::Pending
+        );
+        assert_eq!(
+            numbers.holder("a2", "2026-1").unwrap().status,
+            Status::Booked
+        );
+    }
+
+    #[test]
+    fn a_second_opener_waits_for_the_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("invoice-numbers.json");
+        let held = InvoiceLedger::open_at(&path).unwrap();
+        let start = std::time::Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(held);
+        });
         InvoiceLedger::open_at(&path).unwrap();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(150));
+        release.join().unwrap();
     }
 
     #[test]
@@ -340,13 +404,12 @@ mod tests {
         )
         .unwrap();
         let mut ledger = InvoiceLedger::open_at(&path).unwrap();
+        // An entry without an administration counts for every one.
         assert_eq!(
-            ledger.list().taken_numbers().collect::<Vec<_>>(),
+            ledger.list().taken_numbers("any").collect::<Vec<_>>(),
             ["2026-19"]
         );
-        ledger
-            .reserve("2026-20", "2026-10-31", "X", "1.00")
-            .unwrap();
+        ledger.reserve(&claim("a1", "2026-20")).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"version\": 1"), "{text}");
         assert!(text.contains("\"invoice_pdf\": \"kept\""), "{text}");

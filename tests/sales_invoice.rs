@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{RequestLog, actions, bodies, fault, json, response, stderr, yuki};
+use common::{Request, RequestLog, actions, bodies, fault, json, response, stderr, yuki};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -63,12 +63,22 @@ const SALES_ARCHIVE: &str = r#"<Documents xmlns="">
 <Document ID="d-t"><FileName>uren januari 2026.xlsx</FileName></Document>
 </Documents>"#;
 
+/// One page of the sales archive, for the year asked: the documents on the
+/// first page, then an empty page that ends the listing.
+fn archive_page(r: &Request) -> String {
+    let inner = match (r.param("startRecord"), r.param("startDate")) {
+        ("0", start) if start.starts_with("2026") => SALES_ARCHIVE,
+        _ => "<Documents xmlns=\"\"></Documents>",
+    };
+    response("DocumentsInFolder", inner)
+}
+
 fn mock(result: String) -> (String, RequestLog) {
     common::mock(move |r| match r.action.as_str() {
         "Authenticate" => (200, response("Authenticate", "session-1")),
         "ProcessSalesInvoices" => (200, response("ProcessSalesInvoices", &result)),
         "SetCurrentDomain" => (200, response("SetCurrentDomain", "")),
-        "DocumentsInFolder" => (200, response("DocumentsInFolder", SALES_ARCHIVE)),
+        "DocumentsInFolder" => (200, archive_page(r)),
         other => panic!("unexpected call {other}"),
     })
 }
@@ -528,11 +538,30 @@ fn number_auto_takes_the_next_number_from_the_sales_archive() {
             "Authenticate",
             "SetCurrentDomain",
             "DocumentsInFolder",
+            "DocumentsInFolder",
             "Authenticate",
             "ProcessSalesInvoices"
         ]
     );
-    // Only the invoice year is read from the archive.
+    // Only the invoice year is read, strictly: pages until an empty one.
+    let starts: Vec<String> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.action == "DocumentsInFolder")
+        .map(|r| {
+            format!(
+                "{} {} {}",
+                r.param("startDate"),
+                r.param("endDate"),
+                r.param("startRecord")
+            )
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        ["2026-01-01 2026-12-31 0", "2026-01-01 2026-12-31 3"]
+    );
     let list = log.lock().unwrap()[2].body.clone();
     assert!(
         list.contains("<yuki:startDate>2026-01-01</yuki:startDate>")
@@ -633,7 +662,12 @@ fn prepare_and_create_agree_on_every_figure() {
     // Only the archive was read.
     assert_eq!(
         actions(&log),
-        ["Authenticate", "SetCurrentDomain", "DocumentsInFolder"]
+        [
+            "Authenticate",
+            "SetCurrentDomain",
+            "DocumentsInFolder",
+            "DocumentsInFolder"
+        ]
     );
 
     // create with the same inputs and the prepared number books the same.
@@ -762,7 +796,7 @@ fn failing(status: u16, reply: String) -> (String, RequestLog) {
     common::mock(move |r| match r.action.as_str() {
         "Authenticate" => (200, response("Authenticate", "session-1")),
         "ProcessSalesInvoices" => (status, reply.clone()),
-        "DocumentsInFolder" => (200, response("DocumentsInFolder", SALES_ARCHIVE)),
+        "DocumentsInFolder" => (200, archive_page(r)),
         other => (200, response(other, "")),
     })
 }
@@ -789,7 +823,7 @@ fn an_unknown_outcome_keeps_the_number_pending_until_resolved() {
     let (root, _log) = common::mock(|r| match r.action.as_str() {
         "Authenticate" => (200, response("Authenticate", "session-1")),
         "SetCurrentDomain" => (200, response("SetCurrentDomain", "")),
-        "DocumentsInFolder" => (200, response("DocumentsInFolder", SALES_ARCHIVE)),
+        "DocumentsInFolder" => (200, archive_page(r)),
         _ => (0, String::new()),
     });
     let home = home(&root);

@@ -53,7 +53,16 @@ impl<S: LedgerFormat> Ledger<S> {
     /// Lock and load the ledger at `path`; a missing file is an empty state.
     /// Refused while another process holds the lock.
     pub fn open(path: &Path) -> Result<Self, YukiError> {
-        let lock = lock(path)?;
+        Self::locked(path, lock(path, false)?)
+    }
+
+    /// [`open`](Self::open), waiting for another process's lock instead of
+    /// refusing: for ledgers locked only for milliseconds at a time.
+    pub fn open_wait(path: &Path) -> Result<Self, YukiError> {
+        Self::locked(path, lock(path, true)?)
+    }
+
+    fn locked(path: &Path, lock: fs::File) -> Result<Self, YukiError> {
         Ok(Self {
             lock: Some(lock),
             ..Self::peek(path)?
@@ -150,7 +159,7 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{dot}{name}.{suffix}"))
 }
 
-fn lock(path: &Path) -> Result<fs::File, YukiError> {
+fn lock(path: &Path, wait: bool) -> Result<fs::File, YukiError> {
     let lock = sibling(path, "lock");
     let io = |e: std::io::Error| YukiError::Config(format!("{}: {e}", lock.display()));
     if let Some(dir) = lock.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -162,6 +171,9 @@ fn lock(path: &Path) -> Result<fs::File, YukiError> {
         .write(true)
         .open(&lock)
         .map_err(io)?;
+    if wait {
+        return file.lock().map(|()| file).map_err(io);
+    }
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(fs::TryLockError::WouldBlock) => Err(YukiError::Config(format!(
