@@ -12,7 +12,7 @@ fn warn_if_cut_short(count: usize) {
     }
 }
 
-fn yes_no(value: bool) -> String {
+pub(crate) fn yes_no(value: bool) -> String {
     if value { "Yes" } else { "No" }.to_string()
 }
 

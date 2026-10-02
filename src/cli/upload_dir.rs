@@ -289,7 +289,7 @@ fn print_plan(plan: &Plan, opts: &DirOptions<'_>) {
         } else {
             ""
         };
-        eprintln!("    {}  {:.1} KB{over}", f.rel, f.size as f64 / 1024.0);
+        eprintln!("    {}  {}{over}", f.rel, crate::output::human_size(f.size));
     }
 }
 

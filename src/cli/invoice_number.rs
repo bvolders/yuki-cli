@@ -15,6 +15,7 @@ use crate::client::archive::ArchiveClient;
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::folders::folder_id;
+use crate::period::parse_period;
 
 /// `--number`: a given invoice number, or `auto`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,12 +146,9 @@ async fn archive_numbers(
         .with_session(session);
     let mut files = Vec::new();
     for year in years {
+        let (start, end) = parse_period(&year.to_string())?;
         let documents = client
-            .documents_in_folder_strict(
-                folder_id("verkoop")?,
-                &format!("{year}-01-01"),
-                &format!("{year}-12-31"),
-            )
+            .documents_in_folder_strict(folder_id("verkoop")?, &start, &end)
             .await?;
         files.extend(documents.into_iter().map(|d| d.file_name));
     }

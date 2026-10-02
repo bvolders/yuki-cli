@@ -15,6 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cli::contacts::yes_no;
 use crate::cli::invoice_ledger::{Claim, InvoiceLedger};
 use crate::cli::invoice_number::{dutch_date, structured_reference};
 use crate::client::escape_text;
@@ -22,7 +23,7 @@ use crate::client::sales::{SalesClient, SalesInvoicesImport};
 use crate::config::{Config, Seller};
 use crate::error::{Delivery, YukiError};
 use crate::money::{Cents, div_round, format_scaled, parse_scaled};
-use crate::output::{OutputFormat, format_json, format_table, is_tty};
+use crate::output::{OutputFormat, format_json, format_table, human_size, is_tty};
 use crate::period::{date_from_epoch_days, epoch_days, today};
 
 /// Namespace of the `SalesInvoices` document; Yuki rejects one without it.
@@ -310,15 +311,6 @@ impl Pdf {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         Ok(Self { name, bytes })
-    }
-}
-
-/// `2048` → `2.0 KB`, for the preview.
-fn human_size(bytes: u64) -> String {
-    match bytes {
-        b if b < 1024 => format!("{b} bytes"),
-        b if b < 1024 * 1024 => format!("{:.1} KB", b as f64 / 1024.0),
-        b => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
     }
 }
 
@@ -1369,9 +1361,8 @@ fn validate_line(
 /// The content hash of a prepared invoice: the sha256 of its JSON written
 /// compactly, so reformatting the file does not change it but any edit does.
 pub fn content_hash(prepared: &serde_json::Value) -> String {
-    use sha2::{Digest, Sha256};
     let text = serde_json::to_string(prepared).expect("serialize prepared invoice");
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    crate::sync::sha256_hex(text.as_bytes())
 }
 
 /// The refusal when `[seller]` is missing from the config.
@@ -1831,7 +1822,6 @@ impl Verdict {
 }
 
 fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<&str>) {
-    let yes_no = |b: bool| if b { "Yes" } else { "No" }.to_string();
     let headers: Vec<String> = [
         "Succeeded",
         "Processed",

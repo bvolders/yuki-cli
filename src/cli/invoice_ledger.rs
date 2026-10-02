@@ -35,7 +35,8 @@ use crate::config::Config;
 use crate::error::YukiError;
 use crate::ledger::{Ledger, LedgerFormat};
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
-use crate::period::{date_from_epoch_days, epoch_days};
+use crate::period::{epoch_days, today};
+use crate::sync::now_utc;
 
 /// What `numbers --resolve <number> --as …` settles a number as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -224,10 +225,7 @@ impl InvoiceLedger {
 
     /// Print [`warnings`](Self::warnings) for today to stderr.
     pub fn warn(&self) {
-        let today = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64)
-            .div_euclid(86_400);
+        let today = epoch_days(&today()).unwrap_or_default();
         for warning in self.warnings(today) {
             eprintln!("warning: {warning}");
         }
@@ -368,21 +366,6 @@ pub fn ledger_path() -> PathBuf {
     Config::default_path().parent().map_or_else(
         || PathBuf::from("invoice-numbers.json"),
         |dir| dir.join("invoice-numbers.json"),
-    )
-}
-
-/// Now, UTC, as `YYYY-MM-DDTHH:MM:SSZ`.
-fn now_utc() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    format!(
-        "{}T{:02}:{:02}:{:02}Z",
-        date_from_epoch_days(days),
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60
     )
 }
 
@@ -587,12 +570,5 @@ mod tests {
             "{warnings:?}"
         );
         assert!(dir.open_other("a2").warnings(day + 30).is_empty());
-    }
-
-    #[test]
-    fn timestamps_are_utc_iso() {
-        let now = now_utc();
-        assert_eq!(now.len(), 20, "{now}");
-        assert!(now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
     }
 }
