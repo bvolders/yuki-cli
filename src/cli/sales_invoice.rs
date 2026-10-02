@@ -158,7 +158,6 @@ struct InvoiceSpec {
     remarks: Option<String>,
     notes: Option<String>,
     vat_mention: Option<String>,
-    pdf: Option<String>,
     contact: Option<ContactSpec>,
     #[serde(default)]
     lines: Vec<LineSpec>,
@@ -272,7 +271,7 @@ pub struct VatRate {
 /// A custom invoice PDF, read and checked when the invoice is loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pdf {
-    /// File name sent as `DocumentFileName`.
+    /// The local file name, for the preview; Yuki stores it as `Invoice <number>.pdf`.
     pub name: String,
     pub bytes: Vec<u8>,
 }
@@ -295,14 +294,10 @@ impl Pdf {
         if !bytes.starts_with(b"%PDF-") {
             return Err(format!("{shown} is not a PDF (no %PDF- header)"));
         }
-        let mut name = path
+        let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // Yuki names the stored document after DocumentFileName.
-        if !name.to_ascii_lowercase().ends_with(".pdf") {
-            name.push_str(".pdf");
-        }
         Ok(Self { name, bytes })
     }
 }
@@ -667,11 +662,8 @@ impl Invoice {
     /// The file name Yuki stores a custom PDF under: `Invoice <number>.pdf`,
     /// so the sales archive shows the number whatever the local file is called.
     pub fn document_file_name(&self) -> Option<String> {
-        let pdf = self.pdf.as_ref()?;
-        Some(match &self.number {
-            Some(number) => format!("Invoice {number}.pdf"),
-            None => pdf.name.clone(),
-        })
+        self.pdf.as_ref()?;
+        Some(format!("Invoice {}.pdf", self.number.as_deref()?))
     }
 
     /// VAT rounded per line instead of per rate: the other way Yuki may
@@ -1104,13 +1096,6 @@ fn validate(
         p.push("--send email needs contact.email for a contact without a code");
     }
 
-    // A custom PDF is bound to the prepared invoice it was rendered from;
-    // `prepare` runs before it exists and ignores the key.
-    if p.text("pdf", spec.pdf).is_some() && !overrides.preparing {
-        p.push(
-            "`pdf` in an invoice file is not sent: prepare the invoice with `sales invoice prepare --out <file.json>`, render the PDF from it, then `sales invoice create --prepared <file.json> --pdf <pdf>`",
-        );
-    }
     if overrides.number.is_some() && send.is_none() && !overrides.preparing {
         p.push(
             "--number numbers a booked invoice: add --send or --book (Yuki numbers a draft itself when it is booked)",

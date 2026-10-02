@@ -681,16 +681,6 @@ fn a_pdf_that_is_missing_not_a_pdf_or_too_large_is_rejected() {
 }
 
 #[test]
-fn a_pdf_name_without_the_extension_gets_one() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("factuur-2026-10");
-    std::fs::write(&path, b"%PDF-1.7").unwrap();
-    assert_eq!(Pdf::read(&path).unwrap().name, "factuur-2026-10.pdf");
-    let upper = dir.path().join("INVOICE.PDF");
-    std::fs::write(&upper, b"%PDF-1.7").unwrap();
-    assert_eq!(Pdf::read(&upper).unwrap().name, "INVOICE.PDF");
-}
-#[test]
 fn book_books_without_sending_and_the_number_is_the_reference() {
     let number = NumberRequest::Given("2026-20".into());
     let overrides = Overrides {
@@ -777,24 +767,13 @@ fn a_numbered_draft_is_refused() {
 }
 
 #[test]
-fn prepare_reads_no_pdf_and_create_refuses_one_in_the_file() {
-    // The file names a PDF that does not exist yet: prepare does not care.
-    let text = format!("pdf = \"not-rendered-yet.pdf\"\n{MINIMAL}");
-    let overrides = Overrides {
-        preparing: true,
-        ..Default::default()
-    };
-    let inv = parse(&text, "t", &overrides, None).unwrap();
-    assert!(inv.pdf.is_none());
-    // create takes a PDF only with the prepared invoice it was rendered from.
+fn an_invoice_file_takes_no_pdf() {
+    // A PDF is bound to the prepared invoice it was rendered from.
+    let text = format!("pdf = \"rendered.pdf\"\n{MINIMAL}");
     let err = parse(&text, "t", &Overrides::default(), None)
         .unwrap_err()
         .to_string();
-    assert!(
-        err.contains("`pdf` in an invoice file is not sent"),
-        "{err}"
-    );
-    assert!(err.contains("--prepared <file.json> --pdf <pdf>"), "{err}");
+    assert!(err.contains("unknown field `pdf`"), "{err}");
 }
 #[test]
 fn a_line_remark_goes_under_the_line_and_into_prepare() {
