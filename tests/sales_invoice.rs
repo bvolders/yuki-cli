@@ -605,7 +605,15 @@ fn a_prepared_file_that_changed_or_lost_its_reservation_is_refused() {
     std::fs::write(&file, &original).unwrap();
     let release = yuki(
         &home,
-        &["sales", "invoice", "numbers", "--release", "2026-20"],
+        &[
+            "sales",
+            "invoice",
+            "numbers",
+            "--resolve",
+            "2026-20",
+            "--as",
+            "rejected",
+        ],
     );
     assert!(release.status.success(), "{}", stderr(&release));
     assert_eq!(status_of(&home, "2026-20"), "rejected");
@@ -617,10 +625,18 @@ fn a_prepared_file_that_changed_or_lost_its_reservation_is_refused() {
         stderr(&released)
     );
     assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
-    // --release is for reservations only.
+    // Nothing is left to settle.
     let bad = yuki(
         &home,
-        &["sales", "invoice", "numbers", "--release", "2026-20"],
+        &[
+            "sales",
+            "invoice",
+            "numbers",
+            "--resolve",
+            "2026-20",
+            "--as",
+            "rejected",
+        ],
     );
     assert_eq!(bad.status.code(), Some(3), "{}", stderr(&bad));
 }
@@ -875,6 +891,7 @@ fn an_unknown_outcome_keeps_the_number_pending_until_resolved() {
             "numbers",
             "--resolve",
             "2026-20",
+            "--as",
             "rejected",
         ],
     );
@@ -888,6 +905,7 @@ fn an_unknown_outcome_keeps_the_number_pending_until_resolved() {
             "numbers",
             "--resolve",
             "2026-20",
+            "--as",
             "maybe",
         ],
     );
@@ -995,7 +1013,15 @@ fn a_released_number_is_given_out_again_rather_than_skipped() {
     assert!(prepare_out(&home, "support", &b).status.success());
     let release = yuki(
         &home,
-        &["sales", "invoice", "numbers", "--release", "2026-20"],
+        &[
+            "sales",
+            "invoice",
+            "numbers",
+            "--resolve",
+            "2026-20",
+            "--as",
+            "rejected",
+        ],
     );
     assert!(release.status.success(), "{}", stderr(&release));
     let out = prepare_out(&home, "hosting", &c);

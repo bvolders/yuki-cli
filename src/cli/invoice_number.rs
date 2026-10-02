@@ -203,7 +203,7 @@ pub fn choose(
                 "pending (outcome unknown: check Yuki, then `yuki sales invoice numbers --resolve`)"
             }
             crate::cli::invoice_ledger::Status::Reserved => {
-                "reserved by `prepare --out` (free it with `yuki sales invoice numbers --release`)"
+                "reserved by `prepare --out` (free it with `yuki sales invoice numbers --resolve <number> --as rejected`)"
             }
             _ => "booked",
         });

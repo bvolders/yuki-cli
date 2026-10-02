@@ -524,17 +524,18 @@ pub enum SalesInvoiceCommands {
     /// `prepare --out` reserves a number; it is pending from just before Yuki
     /// is called until its answer marks it booked or rejected. One left
     /// pending (no answer came back) stays taken: check "To be sent"/Sales in
-    /// Yuki, then settle it with --resolve <NUMBER> booked|rejected. A
-    /// reservation that will not be sent is freed with --release <NUMBER>
-    /// (or --resolve <NUMBER> rejected). A rejected number can be used again.
+    /// Yuki, then settle it with --resolve <NUMBER> --as booked|rejected. A
+    /// reservation that will not be sent is freed with --resolve <NUMBER>
+    /// --as rejected. A rejected number is given out again.
     Numbers {
-        /// Settle a pending number: --resolve 2026-20 booked (or rejected).
-        #[arg(long, num_args = 2, value_names = ["NUMBER", "STATUS"])]
-        resolve: Option<Vec<String>>,
+        /// Settle this number by hand, as --as says.
+        #[arg(long, value_name = "NUMBER", requires = "resolution")]
+        resolve: Option<String>,
 
-        /// Free a reserved number that will not be sent.
-        #[arg(long, value_name = "NUMBER", conflicts_with = "resolve")]
-        release: Option<String>,
+        /// What --resolve settles the number as: booked (pending only) or
+        /// rejected (pending or reserved).
+        #[arg(long = "as", id = "resolution", value_enum, requires = "resolve")]
+        resolution: Option<invoice_ledger::Resolution>,
     },
 
     /// List saved invoice templates (~/.config/yuki/invoices/*.toml).

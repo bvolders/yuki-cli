@@ -1688,10 +1688,10 @@ pub async fn submit_numbered(
     match outcome {
         Ok(true) => {}
         Ok(false) => eprintln!(
-            "invoice number {number} stays pending in the ledger: check Yuki, then `yuki sales invoice numbers --resolve {number} booked` (or `rejected`)"
+            "invoice number {number} stays pending in the ledger: check Yuki, then `yuki sales invoice numbers --resolve {number} --as booked` (or `--as rejected`)"
         ),
         Err(e) => eprintln!(
-            "warning: could not update the invoice number ledger: {e}; invoice number {number} stays pending: check Yuki, then `yuki sales invoice numbers --resolve {number} booked` (or `rejected`)"
+            "warning: could not update the invoice number ledger: {e}; invoice number {number} stays pending: check Yuki, then `yuki sales invoice numbers --resolve {number} --as booked` (or `--as rejected`)"
         ),
     }
     result
@@ -1751,7 +1751,7 @@ pub fn verdict(import: &SalesInvoicesImport, invoice: &Invoice) -> Verdict {
             };
             let peppol = invoice.peppol_label();
             return Verdict::ReferenceMismatch(format!(
-                "REFERENCE MISMATCH: Yuki booked the invoice with {got}, not {number}, the number sent (and printed on the PDF and in the payment reference). Email: {email}. Peppol: {peppol}. {number} stays pending in the ledger. Check the invoice in Sales in Yuki and correct its number there. If the customer may have it as {number} (emailed, or sent over Peppol), {number} is used: `yuki sales invoice numbers --resolve {number} booked`; if nothing reached the customer, free it: `yuki sales invoice numbers --resolve {number} rejected`"
+                "REFERENCE MISMATCH: Yuki booked the invoice with {got}, not {number}, the number sent (and printed on the PDF and in the payment reference). Email: {email}. Peppol: {peppol}. {number} stays pending in the ledger. Check the invoice in Sales in Yuki and correct its number there. If the customer may have it as {number} (emailed, or sent over Peppol), {number} is used: `yuki sales invoice numbers --resolve {number} --as booked`; if nothing reached the customer, free it: `yuki sales invoice numbers --resolve {number} --as rejected`"
             ));
         }
         if mode.email() && !booked.email_sent {

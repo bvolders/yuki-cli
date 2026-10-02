@@ -311,11 +311,11 @@ pub fn generate() -> Value {
             },
             {
                 "name": "sales invoice numbers",
-                "description": "List the selected administration's invoice numbers, from the local ledger (invoice-numbers.json next to the config): reserved by prepare --out, pending from just before Yuki is called, then booked or rejected. --resolve settles a pending number by hand after checking Yuki (rejected also frees a reservation); --release frees a reservation; makes no API call.",
+                "description": "List the selected administration's invoice numbers, from the local ledger (invoice-numbers.json next to the config): reserved by prepare --out, pending from just before Yuki is called, then booked or rejected. --resolve <number> --as booked|rejected settles a pending number by hand after checking Yuki; --as rejected also frees a reservation, which can never be booked; makes no API call.",
                 "mutating": false,
                 "args": [
-                    {"name": "--resolve", "type": "string[]", "required": false, "description": "NUMBER STATUS: settle a pending number as booked or rejected (a local write)."},
-                    {"name": "--release", "type": "string", "required": false, "description": "NUMBER: free a reserved number that will not be sent (a local write)."}
+                    {"name": "--resolve", "type": "string", "required": false, "description": "NUMBER to settle by hand, with --as (a local write)."},
+                    {"name": "--as", "type": "string", "required": false, "enum": ["booked", "rejected"], "description": "What --resolve settles the number as: booked (pending only) or rejected (pending or reserved)."}
                 ],
                 "output_fields": [
                     {"name": "Number", "type": "string"},

@@ -653,30 +653,16 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             serde_json::to_string_pretty(&json).expect("serialize invoice")
                         );
                     }
-                    SalesInvoiceCommands::Numbers { resolve, release } => {
-                        use yuki_cli::cli::invoice_ledger::{self, Settle, Status};
-                        let resolve = match resolve.as_deref() {
-                            Some([number, status]) => {
-                                let status = match status.to_ascii_lowercase().as_str() {
-                                    "booked" => Status::Booked,
-                                    "rejected" => Status::Rejected,
-                                    other => {
-                                        return Err(AppError::InvalidInput(format!(
-                                            "--resolve takes booked or rejected, not {other}"
-                                        )));
-                                    }
-                                };
-                                Some((number.clone(), status))
-                            }
-                            _ => None,
-                        };
-                        let settle = match (&resolve, &release) {
-                            (Some((number, status)), _) => Some(Settle::Resolve(number, *status)),
-                            (None, Some(number)) => Some(Settle::Release(number)),
-                            (None, None) => None,
-                        };
+                    SalesInvoiceCommands::Numbers {
+                        resolve,
+                        resolution,
+                    } => {
                         let config = load()?;
-                        invoice_ledger::numbers(config.target(admin)?.admin_id, settle, format)?;
+                        yuki_cli::cli::invoice_ledger::numbers(
+                            config.target(admin)?.admin_id,
+                            resolve.as_deref().zip(resolution),
+                            format,
+                        )?;
                     }
                     SalesInvoiceCommands::Templates => {
                         yuki_cli::cli::sales_invoice::templates(format)?;

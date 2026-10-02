@@ -34,6 +34,15 @@ use crate::ledger::{Ledger, LedgerFormat};
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
 use crate::period::{date_from_epoch_days, epoch_days};
 
+/// What `numbers --resolve <number> --as …` settles a number as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Resolution {
+    /// Yuki booked it: the number is used.
+    Booked,
+    /// Yuki did not create it, or a reservation will not be sent: free.
+    Rejected,
+}
+
 /// What happened to a number given out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -133,10 +142,10 @@ impl Numbers {
             .filter(|e| epoch_days(&e.recorded_at).is_some_and(|d| today - d > STALE_DAYS))
             .map(|e| {
                 format!(
-                    "{} reserved since {} for {}: book it or --release it (under continuous numbering, a number never booked is a gap)",
-                    e.number,
+                    "{n} reserved since {} for {}: book it or release it (--resolve {n} --as rejected); under continuous numbering, a number never booked is a gap",
                     &e.recorded_at[..10],
-                    e.customer
+                    e.customer,
+                    n = e.number,
                 )
             })
             .collect()
@@ -326,23 +335,23 @@ impl InvoiceLedger {
         self.0.save()
     }
 
-    /// Settle a pending `number` by hand, after checking Yuki; `rejected`
-    /// also releases a reservation.
-    pub fn resolve(&mut self, admin: &str, number: &str, status: Status) -> Result<(), YukiError> {
-        match status {
-            Status::Booked => self.commit(admin, number),
-            Status::Rejected => {
-                let reserved =
-                    self.list().holder(admin, number).map(|e| e.status) == Some(Status::Reserved);
-                if reserved {
-                    self.release(admin, number)
-                } else {
-                    self.reject(admin, number)
-                }
-            }
-            Status::Pending | Status::Reserved => Err(YukiError::Config(
-                "resolve a number as booked or rejected".into(),
-            )),
+    /// Settle `number` by hand, after checking Yuki: a pending number as
+    /// booked or rejected; a reservation, never sent, only as rejected.
+    pub fn resolve(
+        &mut self,
+        admin: &str,
+        number: &str,
+        resolution: Resolution,
+    ) -> Result<(), YukiError> {
+        let reserved =
+            self.list().holder(admin, number).map(|e| e.status) == Some(Status::Reserved);
+        match (resolution, reserved) {
+            (Resolution::Rejected, true) => self.release(admin, number),
+            (Resolution::Rejected, false) => self.reject(admin, number),
+            (Resolution::Booked, true) => Err(YukiError::Config(format!(
+                "invoice number {number} is reserved, never sent: it can only be released (--as rejected)"
+            ))),
+            (Resolution::Booked, false) => self.commit(admin, number),
         }
     }
 
@@ -389,29 +398,17 @@ fn now_utc() -> String {
     )
 }
 
-/// What `sales invoice numbers` changes before listing.
-#[derive(Debug, Clone, Copy)]
-pub enum Settle<'a> {
-    /// `--resolve <number> booked|rejected`.
-    Resolve(&'a str, Status),
-    /// `--release <number>`: a reservation only.
-    Release(&'a str),
-}
-
 /// `sales invoice numbers`: list the numbers of administration `admin`,
-/// after settling one by hand when `settle` is given.
+/// after settling one by hand when `resolve` is given.
 pub fn numbers(
     admin: &str,
-    settle: Option<Settle<'_>>,
+    resolve: Option<(&str, Resolution)>,
     format: Option<&str>,
 ) -> Result<(), YukiError> {
-    let numbers = match settle {
-        Some(settle) => {
+    let numbers = match resolve {
+        Some((number, resolution)) => {
             let mut ledger = InvoiceLedger::open()?;
-            match settle {
-                Settle::Resolve(number, status) => ledger.resolve(admin, number, status)?,
-                Settle::Release(number) => ledger.release(admin, number)?,
-            }
+            ledger.resolve(admin, number, resolution)?;
             ledger.list().clone()
         }
         None => InvoiceLedger::peek()?,
@@ -485,7 +482,9 @@ mod tests {
         assert_eq!(booked.status, Status::Booked);
         assert!(booked.booked_at.is_some());
         assert!(
-            ledger.resolve("a1", "2026-20", Status::Rejected).is_err(),
+            ledger
+                .resolve("a1", "2026-20", Resolution::Rejected)
+                .is_err(),
             "nothing pending"
         );
         assert_eq!(
@@ -576,8 +575,16 @@ mod tests {
         ledger
             .reserve_prepared(&claim("a1", "2026-22"), "h")
             .unwrap();
-        ledger.release("a1", "2026-21").unwrap();
-        ledger.resolve("a1", "2026-22", Status::Rejected).unwrap();
+        ledger
+            .resolve("a1", "2026-21", Resolution::Rejected)
+            .unwrap();
+        assert!(
+            ledger.resolve("a1", "2026-22", Resolution::Booked).is_err(),
+            "never sent"
+        );
+        ledger
+            .resolve("a1", "2026-22", Resolution::Rejected)
+            .unwrap();
         assert!(ledger.list().holder("a1", "2026-21").is_none());
         assert!(ledger.list().holder("a1", "2026-22").is_none());
     }
@@ -596,7 +603,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].starts_with(
-                "2026-20 reserved since 2026-10-01 for Buuurt: book it or --release it"
+                "2026-20 reserved since 2026-10-01 for Buuurt: book it or release it (--resolve 2026-20 --as rejected)"
             ),
             "{warnings:?}"
         );

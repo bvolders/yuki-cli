@@ -306,8 +306,8 @@ yuki sales invoice create --prepared 2026-10-acme.json \
 yuki sales invoice create --prepared 2026-10-acme.json \
   --pdf 2026-10-acme.pdf --send email --yes --confirm 2026-20  # The same, unattended
 yuki sales invoice numbers                              # Invoice numbers given out (local ledger)
-yuki sales invoice numbers --release 2026-20            # Free a reservation that will not be sent
-yuki sales invoice numbers --resolve 2026-20 booked     # Settle a number left pending
+yuki sales invoice numbers --resolve 2026-20 --as rejected  # Free a reservation, or a number Yuki did not create
+yuki sales invoice numbers --resolve 2026-20 --as booked    # Settle a pending number Yuki booked
 yuki sales invoice templates                            # List saved templates, each validated
 ```
 
@@ -384,26 +384,26 @@ command exits 1 with kind `reference_mismatch` and a `REFERENCE MISMATCH`
 message, even with `--quiet`, which says whether an email was requested and
 reported sent and whether Peppol was requested. The number stays pending in
 the ledger with a note naming both numbers. Correct the booking in Sales in
-Yuki, then settle ours: `--resolve <number> booked` if the customer may have
-the invoice under it (emailed, or sent over Peppol), else `--resolve <number>
-rejected` to free it.
+Yuki, then settle ours: `--resolve <number> --as booked` if the customer may
+have the invoice under it (emailed, or sent over Peppol), else
+`--resolve <number> --as rejected` to free it.
 
 A reservation that will not be sent is freed with
-`yuki sales invoice numbers --release <number>` (or `--resolve <number>
-rejected`); the prepared file can then no longer be booked, and the next
+`yuki sales invoice numbers --resolve <number> --as rejected`; the prepared file can then no longer be booked, and the next
 `auto` gives the number out again. A booking that never reached Yuki (no
 connection, or refused unprocessed with HTTP 401, 403 or 429) puts its number
 back to reserved for the same file, so the same `create --prepared` can simply
 be run again. `prepare`, `create` and `numbers` warn about a reservation older
 than 7 days (`2026-20 reserved since 2026-10-01 for Buuurt: book it or
---release it`): with continuous numbering, a number never booked is a gap.
+release it`): with continuous numbering, a number never booked is a gap.
 
 The ledger, `~/.config/yuki/invoice-numbers.json`, covers the time before the
 archive shows an invoice: a number is `reserved` by `prepare --out`, `pending`
 from just before Yuki is called, then `booked`, or `rejected` (free again)
 when Yuki refuses it. When no answer comes back it stays pending and taken:
 check "To be sent" or Sales in Yuki, then
-`yuki sales invoice numbers --resolve <number> booked` (or `rejected`). Even
+`yuki sales invoice numbers --resolve <number> --as booked` (or `--as
+rejected`). Even
 with `--quiet --yes`, a booking prints one line to stderr:
 `BOOKS IMMEDIATELY: <number> <customer> <gross>`. The ledger keeps each
 administration's numbers apart, and `2026-01` is the same number as `2026-1`.

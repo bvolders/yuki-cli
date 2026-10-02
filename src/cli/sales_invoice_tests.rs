@@ -982,8 +982,8 @@ fn the_reference_yuki_booked_must_be_the_number_sent() {
                     m.contains("Email: not requested. Peppol: not requested."),
                     "{m}"
                 );
-                assert!(m.contains("--resolve 2026-20 booked"), "{m}");
-                assert!(m.contains("--resolve 2026-20 rejected"), "{m}");
+                assert!(m.contains("--resolve 2026-20 --as booked"), "{m}");
+                assert!(m.contains("--resolve 2026-20 --as rejected"), "{m}");
             }
             other => panic!("{reference}: {other:?}"),
         }
