@@ -458,6 +458,12 @@ pub enum SalesInvoiceCommands {
         #[arg(long)]
         subject: Option<String>,
 
+        /// Custom invoice PDF, replacing the file's `pdf`. Yuki stores it
+        /// instead of the invoice it would generate; the lines still set
+        /// the booked amounts.
+        #[arg(long, value_name = "PATH")]
+        pdf: Option<String>,
+
         /// Book the invoice and send it: email, peppol, or both. Without it,
         /// the invoice is created as a draft in "To be sent".
         #[arg(long, value_enum)]

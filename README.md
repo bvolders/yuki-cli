@@ -251,6 +251,7 @@ yuki sales invoice create --template acme-consulting \
 yuki sales invoice create --template acme-hosting \
   --send email                                          # Book it and email it to the customer
 yuki sales invoice create --file invoice.toml --dry-run # Preview and xmlDoc only; no API call
+yuki sales invoice create --file invoice.toml --pdf invoice-2026-10.pdf  # Store your own PDF
 yuki sales invoice templates                            # List saved templates, each validated
 ```
 
@@ -266,6 +267,12 @@ contacts nothing, not even to authenticate. The command exits 1 with kind
 email it as `--send` asked, after printing Yuki's answer; `invalid_input` lists
 every problem in the file; `confirmation_required` means nothing was sent.
 Totals must be positive: credit notes are not supported.
+
+With `pdf` (or `--pdf <PATH>`, which replaces it), Yuki stores your PDF instead
+of the invoice it would generate from its layout. The lines are still required:
+Yuki books the amounts, and builds a Peppol invoice, from them, so the amounts
+in the PDF must match. The file must start with `%PDF-` and be at most 10 MB.
+`--dry-run` shows a size comment in place of the PDF's base64.
 
 Recurring invoices are templates you run yourself: one file per customer in
 `~/.config/yuki/invoices/<name>.toml`, created each month with `--template`
@@ -283,6 +290,7 @@ due_days = 30                     # or: due_date = 2026-11-01
 # currency = "EUR"                # Yuki's default
 # notes = "Thank you for your business."   # printed on the invoice, max 500 characters
 # remarks = "internal"            # stored, not printed
+# pdf = "acme-hosting.pdf"        # your own invoice PDF, relative to this file (max 10 MB)
 
 [contact]
 code = "C0042"                    # an existing Yuki contact

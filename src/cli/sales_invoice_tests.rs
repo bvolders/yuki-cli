@@ -263,6 +263,7 @@ fn command_line_overrides_replace_the_file_values() {
         price: Some(parse_price("80").unwrap()),
         date: Some("2026-11-01"),
         subject: Some("November"),
+        pdf: None,
     };
     let text = format!("subject = \"October\"\ndue_days = 14\n{MINIMAL}");
     let inv = parse(&text, "t", &overrides, None).unwrap();
@@ -522,4 +523,86 @@ fn emailing_a_new_contact_needs_its_address() {
         .to_string();
     assert!(err.contains("--send email needs contact.email"), "{err}");
     assert!(parse(&text, "t", &Overrides::default(), None).is_ok());
+}
+
+/// Write `invoice.toml` naming `pdf = "doc.pdf"`, and `doc.pdf` with `bytes`.
+fn invoice_with_pdf(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("doc.pdf"), bytes).unwrap();
+    let file = dir.path().join("invoice.toml");
+    std::fs::write(&file, format!("pdf = \"doc.pdf\"\n{MINIMAL}")).unwrap();
+    (dir, file)
+}
+
+#[test]
+fn a_custom_pdf_is_read_relative_to_the_file_and_embedded_before_the_contact() {
+    let (_dir, file) = invoice_with_pdf(b"%PDF-1.7 hello");
+    let inv = load(&Source::File(file), &Overrides::default(), None).unwrap();
+    let xml = inv.to_xml();
+    assert!(
+        xml.contains("<DocumentFileName>doc.pdf</DocumentFileName>"),
+        "{xml}"
+    );
+    let base64 = BASE64.encode(b"%PDF-1.7 hello");
+    assert!(
+        xml.contains(&format!("<DocumentBase64>{base64}</DocumentBase64>")),
+        "{xml}"
+    );
+    assert_in_order(
+        &xml,
+        &["Date", "DocumentFileName", "DocumentBase64", "Contact"],
+    );
+    // The lines stay: Yuki books from them.
+    assert!(xml.contains("<InvoiceLines>"));
+
+    let display = inv.to_display_xml();
+    assert!(!display.contains(&base64), "{display}");
+    assert!(
+        display.contains("<DocumentBase64><!-- 20 bytes base64 (14-byte PDF) --></DocumentBase64>"),
+        "{display}"
+    );
+    let preview = inv.preview(None);
+    assert!(
+        preview.contains(
+            "custom PDF doc.pdf (14 bytes) replaces Yuki's layout; amounts in the PDF must match the lines"
+        ),
+        "{preview}"
+    );
+}
+
+#[test]
+fn the_pdf_flag_replaces_the_file_value() {
+    let (dir, file) = invoice_with_pdf(b"%PDF-1.4");
+    let other = dir.path().join("other.pdf");
+    std::fs::write(&other, b"%PDF-1.4 other").unwrap();
+    let overrides = Overrides {
+        pdf: Some(&other),
+        ..Default::default()
+    };
+    let inv = load(&Source::File(file), &overrides, None).unwrap();
+    assert_eq!(inv.pdf.unwrap().name, "other.pdf");
+}
+
+#[test]
+fn a_pdf_that_is_missing_not_a_pdf_or_too_large_is_rejected() {
+    let (_dir, file) = invoice_with_pdf(b"PK\x03\x04 a zip");
+    let err = load(&Source::File(file), &Overrides::default(), None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("is not a PDF (no %PDF- header)"), "{err}");
+
+    let (dir, file) = invoice_with_pdf(b"%PDF-1.7");
+    std::fs::remove_file(dir.path().join("doc.pdf")).unwrap();
+    let err = load(&Source::File(file), &Overrides::default(), None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("pdf: ") && err.contains("doc.pdf"), "{err}");
+
+    let mut big = b"%PDF-1.7".to_vec();
+    big.resize(PDF_MAX_BYTES + 1, b' ');
+    let (_dir, file) = invoice_with_pdf(&big);
+    let err = load(&Source::File(file), &Overrides::default(), None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("over the 10.0 MB limit"), "{err}");
 }

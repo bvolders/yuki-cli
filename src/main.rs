@@ -438,6 +438,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         price,
                         date,
                         subject,
+                        pdf,
                         send,
                         dry_run,
                     } => {
@@ -452,6 +453,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             price,
                             date: date.as_deref(),
                             subject: subject.as_deref(),
+                            pdf: pdf.as_deref().map(std::path::Path::new),
                         };
                         let invoice = sales_invoice::load(&source, &overrides, send).map_err(
                             |e| match e {
@@ -465,7 +467,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                 eprintln!("{}\n", invoice.preview(None));
                                 eprintln!("Dry run: nothing was sent to Yuki. xmlDoc:");
                             }
-                            println!("{}", invoice.to_xml());
+                            println!("{}", invoice.to_display_xml());
                             return Ok(());
                         }
                         let config = load()?;

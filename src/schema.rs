@@ -266,6 +266,7 @@ pub fn generate() -> Value {
                     {"name": "--price", "type": "number", "required": false, "description": "Unit price excluding VAT of the invoice's only line, up to 2 decimals."},
                     {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD. Default: the file's date, else today."},
                     {"name": "--subject", "type": "string", "required": false, "description": "Subject (title) of the invoice, replacing the file's."},
+                    {"name": "--pdf", "type": "path", "required": false, "description": "Custom invoice PDF (max 10 MB), stored in Yuki instead of the generated invoice; replaces the file's pdf."},
                     {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it, the invoice is a draft."},
                     {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."}
                 ],

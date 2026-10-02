@@ -9,7 +9,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::Deserialize;
 
@@ -35,6 +38,9 @@ const PAYMENT_METHOD_MAX: usize = 60;
 const QTY_MAX: i64 = 10_i64.pow(10 + QTY_DECIMALS);
 const PRICE_MAX: i64 = 10_i64.pow(12);
 const LINE_AMOUNT_MAX: i128 = 10_i128.pow(12);
+/// The largest custom PDF accepted. Yuki documents no limit; this keeps the
+/// request (the PDF grows by a third as base64) to a size a SOAP call carries.
+pub const PDF_MAX_BYTES: usize = 10 * 1024 * 1024;
 /// The longest payment term accepted, in days.
 const DUE_DAYS_MAX: i64 = 3_650;
 
@@ -121,6 +127,8 @@ pub struct Overrides<'a> {
     pub price: Option<Cents>,
     pub date: Option<&'a str>,
     pub subject: Option<&'a str>,
+    /// A custom PDF, replacing the file's `pdf`.
+    pub pdf: Option<&'a Path>,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +146,7 @@ struct InvoiceSpec {
     payment_method: Option<String>,
     remarks: Option<String>,
     notes: Option<String>,
+    pdf: Option<String>,
     contact: Option<ContactSpec>,
     #[serde(default)]
     lines: Vec<LineSpec>,
@@ -242,6 +251,49 @@ pub struct VatRate {
     pub vat: Cents,
 }
 
+/// A custom invoice PDF, read and checked when the invoice is loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pdf {
+    /// File name sent as `DocumentFileName`.
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+impl Pdf {
+    /// Read `path`, which must be a PDF of at most [`PDF_MAX_BYTES`].
+    fn read(path: &Path) -> Result<Self, String> {
+        let shown = path.display();
+        let size = std::fs::metadata(path)
+            .map_err(|e| format!("{shown}: {e}"))?
+            .len();
+        if size > PDF_MAX_BYTES as u64 {
+            return Err(format!(
+                "{shown} is {}, over the {} limit",
+                human_size(size),
+                human_size(PDF_MAX_BYTES as u64)
+            ));
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("{shown}: {e}"))?;
+        if !bytes.starts_with(b"%PDF-") {
+            return Err(format!("{shown} is not a PDF (no %PDF- header)"));
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(Self { name, bytes })
+    }
+}
+
+/// `2048` → `2.0 KB`, for the preview.
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} bytes"),
+        b if b < 1024 * 1024 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invoice {
     /// Where it came from, e.g. `template "acme"` or `invoice.toml`.
@@ -254,6 +306,8 @@ pub struct Invoice {
     pub payment_method: Option<String>,
     pub remarks: Option<String>,
     pub notes: Option<String>,
+    /// Stored in Yuki instead of the invoice Yuki would generate.
+    pub pdf: Option<Pdf>,
     pub contact: Contact,
     pub lines: Vec<Line>,
     /// `None` is a draft.
@@ -369,6 +423,16 @@ impl Invoice {
                 row(label, value);
             }
         }
+        if let Some(pdf) = &self.pdf {
+            row(
+                "PDF",
+                &format!(
+                    "custom PDF {} ({}) replaces Yuki's layout; amounts in the PDF must match the lines",
+                    pdf.name,
+                    human_size(pdf.bytes.len() as u64)
+                ),
+            );
+        }
 
         let headers: Vec<String> = [
             "Description",
@@ -435,6 +499,16 @@ impl Invoice {
     /// element order `SalesInvoices.xsd` requires, every value escaped, and
     /// empty optional elements left out (several must not be empty).
     pub fn to_xml(&self) -> String {
+        self.render(true)
+    }
+
+    /// [`to_xml`](Self::to_xml) for a human: a custom PDF's base64 is
+    /// replaced by a comment giving its size.
+    pub fn to_display_xml(&self) -> String {
+        self.render(false)
+    }
+
+    fn render(&self, embed_pdf: bool) -> String {
         let mut x = XmlWriter::default();
         let _ = writeln!(
             x.out,
@@ -461,6 +535,21 @@ impl Invoice {
         x.opt("DueDate", &self.due_date);
         x.opt("Currency", &self.currency);
         x.opt("Remarks", &self.remarks);
+        if let Some(pdf) = &self.pdf {
+            x.leaf("DocumentFileName", &pdf.name);
+            let encoded = BASE64.encode(&pdf.bytes);
+            if embed_pdf {
+                x.leaf("DocumentBase64", &encoded);
+            } else {
+                x.indent();
+                let _ = writeln!(
+                    x.out,
+                    "<DocumentBase64><!-- {} bytes base64 ({}-byte PDF) --></DocumentBase64>",
+                    encoded.len(),
+                    pdf.bytes.len()
+                );
+            }
+        }
 
         let c = &self.contact;
         x.open("Contact");
@@ -606,19 +695,33 @@ pub fn load(
         };
         YukiError::Config(format!("{}: {e}{hint}", path.display()))
     })?;
-    parse(&text, &origin, overrides, send)
+    let base = path.parent().unwrap_or(Path::new("."));
+    parse_at(&text, &origin, base, overrides, send)
 }
 
-/// Parse and validate invoice TOML; `origin` names it in errors.
+/// Parse and validate invoice TOML; `origin` names it in errors, and a
+/// relative `pdf` is read from the working directory.
 pub fn parse(
     text: &str,
     origin: &str,
     overrides: &Overrides<'_>,
     send: Option<SendMode>,
 ) -> Result<Invoice, YukiError> {
+    parse_at(text, origin, Path::new("."), overrides, send)
+}
+
+/// [`parse`], with a relative `pdf` resolved against `base`, the directory
+/// of the invoice file.
+fn parse_at(
+    text: &str,
+    origin: &str,
+    base: &Path,
+    overrides: &Overrides<'_>,
+    send: Option<SendMode>,
+) -> Result<Invoice, YukiError> {
     let spec: InvoiceSpec = toml::from_str(text)
         .map_err(|e| YukiError::Config(format!("invalid invoice {origin}: {e}")))?;
-    validate(spec, origin, overrides, send).map_err(|problems| {
+    validate(spec, origin, base, overrides, send).map_err(|problems| {
         YukiError::Config(format!(
             "invalid invoice {origin}:\n  - {}",
             problems.join("\n  - ")
@@ -687,6 +790,7 @@ impl Problems {
 fn validate(
     spec: InvoiceSpec,
     origin: &str,
+    base: &Path,
     overrides: &Overrides<'_>,
     send: Option<SendMode>,
 ) -> Result<Invoice, Vec<String>> {
@@ -795,6 +899,16 @@ fn validate(
         p.push("--send email needs contact.email for a contact without a code");
     }
 
+    let pdf_path = match overrides.pdf {
+        Some(path) => Some(path.to_path_buf()),
+        None => p.text("pdf", spec.pdf).map(|pdf| base.join(pdf)),
+    };
+    let pdf = pdf_path.and_then(|path| {
+        Pdf::read(&path)
+            .map_err(|e| p.push(format!("pdf: {e}")))
+            .ok()
+    });
+
     if !p.0.is_empty() {
         return Err(p.0);
     }
@@ -808,6 +922,7 @@ fn validate(
         payment_method,
         remarks,
         notes,
+        pdf,
         contact,
         lines,
         send,

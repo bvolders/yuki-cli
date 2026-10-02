@@ -390,3 +390,58 @@ fn templates_lists_valid_and_invalid_templates() {
     assert_eq!(items[1]["Net"], "100.00");
     assert_eq!(items[1]["Status"], "ok");
 }
+
+#[test]
+fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
+    let (root, log) = mock(import_response(true, false, false, ""));
+    let home = home_with_config(&root);
+    let dir = home.path().join(".config/yuki/invoices");
+    let pdf = b"%PDF-1.7\nmade-up invoice body\n%%EOF\n";
+    std::fs::write(dir.join("hosting.pdf"), pdf).expect("write pdf");
+    let template = format!("pdf = \"hosting.pdf\"\n{TEMPLATE}");
+    std::fs::write(dir.join("hosting.toml"), template).expect("write template");
+    let base64 = "JVBERi0xLjcKbWFkZS11cCBpbnZvaWNlIGJvZHkKJSVFT0YK";
+
+    let dry = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "hosting",
+            "--dry-run",
+        ],
+    );
+    assert!(dry.status.success(), "{}", stderr(&dry));
+    let xml = String::from_utf8_lossy(&dry.stdout);
+    assert!(!xml.contains(base64), "{xml}");
+    assert!(
+        xml.contains("<!-- 48 bytes base64 (36-byte PDF) -->"),
+        "{xml}"
+    );
+    assert!(stderr(&dry).contains("custom PDF hosting.pdf (36 bytes) replaces Yuki's layout"));
+    assert!(actions(&log).is_empty());
+
+    let output = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "hosting",
+            "--yes",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let body = sent_body(&log);
+    assert!(
+        body.contains("<DocumentFileName>hosting.pdf</DocumentFileName>"),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!("<DocumentBase64>{base64}</DocumentBase64>")),
+        "{body}"
+    );
+}
