@@ -30,7 +30,14 @@ src/config.rs            TOML config (~/.config/yuki/config.toml)
 src/error.rs             YukiError enum with exit codes (0/1/2/3/4)
 src/output.rs            TTY-aware table (comfy-table) / JSON output
 src/period.rs            Period string → (start_date, end_date) conversion
+src/money.rs             Exact decimal amounts (Cents) for invoice totals
+src/ledger.rs            Ledger<S: LedgerFormat>: local JSON record, OS lock, versioned load, atomic write, write-ahead
+src/sync.rs              upload dir's .yuki-sync.json (a Ledger) + scan/excludes/hashing
+src/cli/sales_invoice.rs   sales invoice create/prepare: TOML → xmlDoc for ProcessSalesInvoices
+src/cli/invoice_ledger.rs  invoice-numbers.json (a Ledger), locked only per read-write
 ```
+
+Local records go through `ledger::Ledger`: `open` (lock + load), `peek` (read only), `save`, and `write_ahead` → `commit`/`undo`. Record a call as pending before making it. A failed call is classified by `YukiError::delivery()`: `NotSent` (never left) and `Refused` (401/403/429) may be retried or freed; `Unknown` (timeout, fault, 5xx) stays pending until the user resolves it. Requests time out after 15s connect / 60s total; one carrying a file uses `call_with_timeout` with `payload_timeout` (60s + 30s/MB, max 10 min).
 
 ### SOAP Client Pattern
 
