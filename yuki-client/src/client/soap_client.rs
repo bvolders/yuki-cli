@@ -12,7 +12,6 @@ const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 /// Builder for SOAP XML request envelopes.
 pub struct SoapEnvelope {
     operation: String,
-    session_id: Option<String>,
     params: Vec<(String, String)>,
 }
 
@@ -20,31 +19,26 @@ impl SoapEnvelope {
     pub fn new(operation: &str) -> Self {
         Self {
             operation: operation.to_string(),
-            session_id: None,
             params: Vec::new(),
         }
     }
 
+    /// Add the session ID, which Yuki expects as the first parameter.
     pub fn session(mut self, session_id: &str) -> Self {
-        self.session_id = Some(session_id.to_string());
+        self.params
+            .insert(0, ("sessionID".into(), escape_text(session_id)));
         self
     }
 
     /// Add a text parameter. `value` is XML-escaped, so a file name such as
     /// `Tom & Jerry <x>.pdf` reaches Yuki unchanged.
     pub fn param(mut self, name: &str, value: &str) -> Self {
-        self.params.push((name.to_string(), escape_xml(value)));
+        self.params.push((name.to_string(), escape_text(value)));
         self
     }
 
     pub fn build(self) -> String {
         let mut body = String::new();
-
-        if let Some(sid) = &self.session_id {
-            let sid = escape_xml(sid);
-            body.push_str(&format!("      <yuki:sessionID>{sid}</yuki:sessionID>\n"));
-        }
-
         for (name, value) in &self.params {
             body.push_str(&format!("      <yuki:{name}>{value}</yuki:{name}>\n"));
         }
@@ -64,7 +58,7 @@ impl SoapEnvelope {
 }
 
 /// Escape the five XML special characters for use in element text.
-fn escape_xml(value: &str) -> String {
+pub fn escape_text(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
