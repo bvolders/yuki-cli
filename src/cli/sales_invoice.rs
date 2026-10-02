@@ -436,7 +436,8 @@ impl Invoice {
             "subject": self.subject,
             "date": date(&self.date),
             "due_date": self.due_date.as_deref().map(date),
-            "currency": self.currency.as_deref().unwrap_or("EUR"),
+            // Absent when the invoice names none: Yuki uses its default (EUR).
+            "currency": self.currency,
             "payment_method": self.payment_method,
             "notes": self.notes,
             "remarks": self.remarks,
@@ -1070,11 +1071,17 @@ fn validate(
         .filter_map(|(i, line)| validate_line(line, i + 1, overrides, &mut p))
         .collect();
     // The text of a monthly template, for this invoice's date and amounts.
-    let subject = subject.and_then(|s| {
-        fill(&s, &date, None)
-            .map_err(|e| p.push(format!("subject: {e}")))
-            .ok()
-    });
+    let mut filled = |field: &str, text: Option<String>| {
+        text.and_then(|t| {
+            fill(&t, &date, None)
+                .map_err(|e| p.push(format!("{field}: {e}")))
+                .ok()
+        })
+    };
+    let subject = filled("subject", subject);
+    let notes = filled("notes", notes);
+    let remarks = filled("remarks", remarks);
+    let vat_mention = filled("vat_mention", vat_mention);
     for (i, line) in lines.iter_mut().enumerate() {
         let net = Some(line.net());
         let mut filled = |field: &str, text: &str| {
@@ -1140,16 +1147,27 @@ fn validate(
 /// `{month}` (the Dutch month name), `{year}`, `{month_num}` (two digits)
 /// and, in a line whose net is `net`, `{pct_of_net:P}`: P percent (up to
 /// two decimals) of the net, rounded to the cent, in Belgian notation
-/// (`4.312,50`). Anything else between braces is an error.
+/// (`4.312,50`). `{{` and `}}` are literal braces; anything else between
+/// braces, or a brace on its own, is an error.
 pub fn fill(text: &str, date: &str, net: Option<Cents>) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 1..];
-        let close = after
-            .find('}')
-            .ok_or_else(|| format!("'{{' without '}}' in {text:?}"))?;
+    while let Some(at) = rest.find(['{', '}']) {
+        out.push_str(&rest[..at]);
+        let (brace, after) = (&rest[at..at + 1], &rest[at + 1..]);
+        if let Some(tail) = after.strip_prefix(brace) {
+            out.push_str(brace);
+            rest = tail;
+            continue;
+        }
+        if brace == "}" {
+            return Err(format!(
+                "'}}' without '{{' in {text:?} (write }}}} for a literal brace)"
+            ));
+        }
+        let close = after.find('}').ok_or_else(|| {
+            format!("'{{' without '}}' in {text:?} (write {{{{ for a literal brace)")
+        })?;
         let name = &after[..close];
         let month: usize = date[5..7].parse().unwrap_or(1);
         match name {
@@ -1173,7 +1191,7 @@ pub fn fill(text: &str, date: &str, net: Option<Cents>) -> Result<String, String
                 }
                 None => {
                     return Err(format!(
-                        "unknown placeholder {{{name}}} (known: {{month}}, {{year}}, {{month_num}}, {{pct_of_net:25}})"
+                        "unknown placeholder {{{name}}} (known: {{month}}, {{year}}, {{month_num}}, {{pct_of_net:25}}; {{{{ and }}}} for literal braces)"
                     ));
                 }
             },

@@ -440,7 +440,7 @@ due_days = 30                     # or: due_date = 2026-11-01; required to book
 # date = 2026-10-01               # default: today
 # payment_method = "ElectronicTransfer"
 # layout = "Standard"             # a layout name from Yuki; default layout if unknown
-# currency = "EUR"                # Yuki's default
+# currency = "EUR"                # without it, none is sent (prepared files too): Yuki's default
 # notes = "Thank you for your business."   # printed on the invoice, max 500 characters
 # remarks = "internal"            # stored, not printed
 
@@ -470,12 +470,13 @@ gl_account = "700000"             # optional revenue account
 # unit = "u"                      # unit of qty, for prepare's JSON (a rendered PDF) only
 ```
 
-The subject and each line's description and remarks may hold placeholders,
-filled in for the invoice date when the invoice is read (so `prepare` already
-shows the final text): `{month}` (the Dutch month name, `oktober`), `{year}`
-(`2026`), `{month_num}` (`10`) and, in a line, `{pct_of_net:25}`: 25% of that
-line's net, rounded to the cent, in Belgian notation (`4.312,50`). Any other
-text between braces is an error.
+The `subject`, `notes`, `remarks` and `vat_mention`, and each line's
+`description` and `remarks`, may hold placeholders, filled in for the invoice
+date when the invoice is read (so `prepare` already shows the final text):
+`{month}` (the Dutch month name, `oktober`), `{year}` (`2026`), `{month_num}`
+(`10`) and, in a line only, `{pct_of_net:25}`: 25% of that line's net, rounded
+to the cent, in Belgian notation (`4.312,50`). `{{` and `}}` are literal
+braces; any other text between braces, or a brace on its own, is an error.
 
 A rendered invoice also prints the firm that issues it. `prepare` gives it as
 `firm`, from a `[seller]` table in `~/.config/yuki/config.toml` (`bic`,

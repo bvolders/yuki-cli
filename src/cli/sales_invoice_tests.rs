@@ -1084,3 +1084,47 @@ fn a_booking_without_the_prompt_names_its_number() {
         "Book invoice 2026-20 in Yuki and send it by email?"
     );
 }
+
+#[test]
+fn doubled_braces_are_literal() {
+    let date = "2026-10-31";
+    assert_eq!(
+        fill("{{month}} is {month}", date, None).unwrap(),
+        "{month} is oktober"
+    );
+    assert_eq!(fill("a }} b {{", date, None).unwrap(), "a } b {");
+    assert_eq!(fill("{{{year}}}", date, None).unwrap(), "{2026}");
+    let err = fill("a } b", date, None).unwrap_err();
+    assert!(
+        err.contains("'}' without '{'") && err.contains("}}"),
+        "{err}"
+    );
+}
+
+#[test]
+fn notes_remarks_and_the_vat_mention_take_placeholders_too() {
+    let text = format!(
+        "notes = \"Prestaties {{month}} {{year}}\"\nremarks = \"run {{month_num}}\"\nvat_mention = \"Btw verlegd ({{year}})\"\n{MINIMAL}"
+    );
+    let inv = invoice(&text, None);
+    assert_eq!(inv.notes.as_deref(), Some("Prestaties oktober 2026"));
+    assert_eq!(inv.remarks.as_deref(), Some("run 10"));
+    assert_eq!(inv.vat_mention.as_deref(), Some("Btw verlegd (2026)"));
+    let err = problems(
+        &format!("notes = \"{{pct_of_net:25}}\"\n{MINIMAL}"),
+        &Overrides::default(),
+    );
+    assert!(
+        err.contains("notes: {pct_of_net:…} only works in a line"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_prepared_invoice_without_a_currency_sends_none() {
+    let (json, original) = prepared(&bookable(), SendMode::Book);
+    assert!(json["currency"].is_null());
+    let (back, _) = Invoice::from_prepared(&json, "p.json", SendMode::Book).unwrap();
+    assert!(!back.to_xml().contains("<Currency>"), "{}", back.to_xml());
+    assert_eq!(back.to_xml(), original.to_xml());
+}
