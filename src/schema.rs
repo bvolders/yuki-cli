@@ -275,7 +275,9 @@ pub fn generate() -> Value {
                     {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD. Default: the file's date, else today."},
                     {"name": "--subject", "type": "string", "required": false, "description": "Subject (title) of the invoice, replacing the file's."},
                     {"name": "--pdf", "type": "path", "required": false, "description": "Custom invoice PDF (max 3 MB; not allowed in a template), stored in Yuki instead of the generated invoice; replaces the file's pdf."},
-                    {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it, the invoice is a draft."},
+                    {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it (or --book), the invoice is a draft."},
+                    {"name": "--book", "type": "boolean", "required": false, "description": "Book the invoice without sending it."},
+                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number (Reference), or auto: one past the highest <year>-<seq> in the sales archive for the invoice date's year. Refused when the archive has it. Required with --pdf."},
                     {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."}
                 ],
                 "output_fields": [
@@ -287,6 +289,22 @@ pub fn generate() -> Value {
                     {"name": "PDF", "type": "string"},
                     {"name": "Message", "type": "string"}
                 ]
+            },
+            {
+                "name": "sales invoice prepare",
+                "description": "Print the fully resolved invoice as JSON (number, ISO and Dutch dates, customer, lines, totals per VAT rate, Belgian structured payment reference) for rendering a PDF; create books the same figures for the same inputs. Writes nothing; reads the sales archive with --number.",
+                "mutating": false,
+                "args": [
+                    {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file or --template is required."},
+                    {"name": "--template", "type": "string", "required": false, "description": "Saved template name."},
+                    {"name": "--qty", "type": "number", "required": false, "description": "Quantity of the invoice's only line."},
+                    {"name": "--price", "type": "number", "required": false, "description": "Unit price excluding VAT of the invoice's only line."},
+                    {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD."},
+                    {"name": "--subject", "type": "string", "required": false, "description": "Subject of the invoice."},
+                    {"name": "--number", "type": "string", "required": false, "description": "Invoice number, or auto."}
+                ],
+                "output_kind": "data",
+                "stdout_schema": {"type": "object", "required": ["number", "date", "customer", "lines", "totals", "payment_reference"]}
             },
             {
                 "name": "sales invoice templates",

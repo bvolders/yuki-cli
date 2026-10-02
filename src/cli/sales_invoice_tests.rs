@@ -264,6 +264,7 @@ fn command_line_overrides_replace_the_file_values() {
         date: Some("2026-11-01"),
         subject: Some("November"),
         pdf: None,
+        number: None,
     };
     let text = format!("subject = \"October\"\ndue_days = 14\n{MINIMAL}");
     let inv = parse(&text, "t", &overrides, None).unwrap();
@@ -525,6 +526,16 @@ fn emailing_a_new_contact_needs_its_address() {
     assert!(parse(&text, "t", &Overrides::default(), None).is_ok());
 }
 
+/// Load `file` booked without sending and numbered 2026-20, as a PDF needs.
+fn load_booked(file: PathBuf, overrides: Overrides<'_>) -> Result<Invoice, YukiError> {
+    let number = NumberRequest::Given("2026-20".into());
+    let overrides = Overrides {
+        number: Some(&number),
+        ..overrides
+    };
+    load(&Source::File(file), &overrides, Some(SendMode::Book))
+}
+
 /// Write `invoice.toml` (the FULL invoice) naming `pdf = "doc.pdf"`, and
 /// `doc.pdf` with `bytes`.
 fn invoice_with_pdf(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
@@ -538,7 +549,7 @@ fn invoice_with_pdf(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
 #[test]
 fn a_custom_pdf_is_read_relative_to_the_file_and_embedded_before_the_contact() {
     let (_dir, file) = invoice_with_pdf(b"%PDF-1.7 hello");
-    let inv = load(&Source::File(file), &Overrides::default(), None).unwrap();
+    let inv = load_booked(file, Overrides::default()).unwrap();
     let xml = inv.to_xml();
     assert!(
         xml.contains("<DocumentFileName>doc.pdf</DocumentFileName>"),
@@ -586,21 +597,21 @@ fn the_pdf_flag_replaces_the_file_value() {
         pdf: Some(&other),
         ..Default::default()
     };
-    let inv = load(&Source::File(file), &overrides, None).unwrap();
+    let inv = load_booked(file, overrides).unwrap();
     assert_eq!(inv.pdf.unwrap().name, "other.pdf");
 }
 
 #[test]
 fn a_pdf_that_is_missing_not_a_pdf_or_too_large_is_rejected() {
     let (_dir, file) = invoice_with_pdf(b"PK\x03\x04 a zip");
-    let err = load(&Source::File(file), &Overrides::default(), None)
+    let err = load_booked(file, Overrides::default())
         .unwrap_err()
         .to_string();
     assert!(err.contains("is not a PDF (no %PDF- header)"), "{err}");
 
     let (dir, file) = invoice_with_pdf(b"%PDF-1.7");
     std::fs::remove_file(dir.path().join("doc.pdf")).unwrap();
-    let err = load(&Source::File(file), &Overrides::default(), None)
+    let err = load_booked(file, Overrides::default())
         .unwrap_err()
         .to_string();
     assert!(err.contains("pdf: ") && err.contains("doc.pdf"), "{err}");
@@ -608,7 +619,7 @@ fn a_pdf_that_is_missing_not_a_pdf_or_too_large_is_rejected() {
     let mut big = b"%PDF-1.7".to_vec();
     big.resize(PDF_MAX_BYTES + 1, b' ');
     let (_dir, file) = invoice_with_pdf(&big);
-    let err = load(&Source::File(file), &Overrides::default(), None)
+    let err = load_booked(file, Overrides::default())
         .unwrap_err()
         .to_string();
     assert!(err.contains("over the 3.0 MB limit"), "{err}");
@@ -642,4 +653,82 @@ fn a_template_cannot_carry_a_pdf_but_an_invoice_file_can() {
         err.contains("a template can't carry a PDF; pass --pdf per invoice"),
         "{err}"
     );
+}
+
+#[test]
+fn a_pdf_needs_a_booked_and_numbered_invoice() {
+    let (dir, file) = invoice_with_pdf(b"%PDF-1.7");
+    let err = load(&Source::File(file), &Overrides::default(), None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(
+            "Yuki only accepts a custom PDF on a booked invoice: add --send email|peppol|both (or --book)"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("a custom PDF needs --number"), "{err}");
+    drop(dir);
+}
+
+#[test]
+fn book_books_without_sending_and_the_number_is_the_reference() {
+    let number = NumberRequest::Given("2026-20".into());
+    let overrides = Overrides {
+        number: Some(&number),
+        ..Default::default()
+    };
+    let inv = parse(MINIMAL, "t", &overrides, Some(SendMode::Book)).unwrap();
+    let xml = inv.to_xml();
+    for fragment in [
+        "<Process>true</Process>",
+        "<EmailToCustomer>false</EmailToCustomer>",
+        "<SentToPeppol>false</SentToPeppol>",
+    ] {
+        assert!(xml.contains(fragment), "{fragment}: {xml}");
+    }
+    assert_in_order(&xml, &["SalesInvoice", "Reference", "Process"]);
+    assert!(xml.contains("<Reference>2026-20</Reference>"));
+    let preview = inv.preview(None);
+    assert!(preview.contains("BOOK WITHOUT SENDING"), "{preview}");
+    assert!(
+        preview.contains(
+            "BOOKS IMMEDIATELY and fixes the invoice number: there is no draft to review in Yuki"
+        ),
+        "{preview}"
+    );
+    assert!(preview.contains("Number         2026-20"), "{preview}");
+    // A draft says it has no number yet, and has no warning.
+    let draft = invoice(MINIMAL, None).preview(None);
+    assert!(!draft.contains("BOOKS IMMEDIATELY"), "{draft}");
+    assert!(draft.contains("none yet"), "{draft}");
+}
+
+#[test]
+fn prepared_json_carries_the_figures_create_sends() {
+    let number = NumberRequest::Given("2026-20".into());
+    let overrides = Overrides {
+        number: Some(&number),
+        ..Default::default()
+    };
+    let inv = parse(FULL, "t", &overrides, None).unwrap();
+    let json = inv.prepared();
+    assert_eq!(json["number"], "2026-20");
+    assert_eq!(json["date"]["iso"], "2026-10-01");
+    assert_eq!(json["date"]["text"], "1 oktober 2026");
+    assert_eq!(json["due_date"]["text"], "31 oktober 2026");
+    assert_eq!(json["customer"]["vat_number"], "BE0123456789");
+    assert_eq!(json["customer"]["city"], "Gent");
+    assert_eq!(json["lines"][1]["qty"], "3");
+    assert_eq!(json["lines"][1]["unit_price"], "12.35");
+    assert_eq!(json["lines"][1]["net"], "37.05");
+    assert_eq!(json["totals"]["net"], inv.net().to_string());
+    assert_eq!(json["totals"]["vat"], inv.vat().to_string());
+    assert_eq!(json["totals"]["gross"], inv.gross().to_string());
+    assert_eq!(json["totals"]["by_rate"][0]["vat_percentage"], "6");
+    assert_eq!(json["totals"]["by_rate"][0]["vat"], "2.22");
+    assert_eq!(json["payment_reference"], "+++202/6000/02014+++");
+    // Without a number there is no reference either.
+    let unnumbered = invoice(FULL, None).prepared();
+    assert!(unnumbered["number"].is_null() && unnumbered["payment_reference"].is_null());
 }

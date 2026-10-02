@@ -16,6 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::Deserialize;
 
+use crate::cli::invoice_number::{NumberRequest, dutch_date, structured_reference};
 use crate::client::sales::{SalesClient, SalesInvoicesImport};
 use crate::config::Config;
 use crate::error::YukiError;
@@ -54,6 +55,9 @@ pub enum SendMode {
     Peppol,
     /// Book it, email it and send it over Peppol.
     Both,
+    /// Book it and send nothing (`--book`): you send it yourself.
+    #[value(skip)]
+    Book,
 }
 
 impl SendMode {
@@ -70,6 +74,7 @@ impl SendMode {
             Self::Email => "by email",
             Self::Peppol => "over Peppol",
             Self::Both => "by email and over Peppol",
+            Self::Book => "nowhere (you send it yourself)",
         }
     }
 }
@@ -130,6 +135,8 @@ pub struct Overrides<'a> {
     pub subject: Option<&'a str>,
     /// A custom PDF, replacing the file's `pdf`.
     pub pdf: Option<&'a Path>,
+    /// `--number`: given here, or resolved later for `auto`.
+    pub number: Option<&'a NumberRequest>,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +320,8 @@ pub struct Invoice {
     pub notes: Option<String>,
     /// Stored in Yuki instead of the invoice Yuki would generate.
     pub pdf: Option<Pdf>,
+    /// `Reference`: the invoice number, when the CLI gives it.
+    pub number: Option<String>,
     pub contact: Contact,
     pub lines: Vec<Line>,
     /// `None` is a draft.
@@ -361,8 +370,70 @@ impl Invoice {
     pub fn question(&self) -> String {
         match self.send {
             None => "Create this draft invoice in Yuki?".into(),
+            Some(SendMode::Book) => "Book this invoice in Yuki now, without sending it?".into(),
             Some(mode) => format!("Book this invoice in Yuki and send it {}?", mode.label()),
         }
+    }
+
+    /// The number shown for the invoice: given, or Yuki's to assign.
+    fn number_label(&self) -> String {
+        match (&self.number, self.send) {
+            (Some(number), _) => number.clone(),
+            (None, None) => "none yet: Yuki numbers the draft when it is booked".into(),
+            (None, Some(_)) => "assigned by Yuki when it books the invoice".into(),
+        }
+    }
+
+    /// The fully resolved invoice as JSON, for rendering a PDF of it: the
+    /// same figures `create` sends for the same inputs. Amounts are strings
+    /// with two decimals and a dot.
+    pub fn prepared(&self) -> serde_json::Value {
+        use serde_json::json;
+        let date = |iso: &str| json!({"iso": iso, "text": dutch_date(iso)});
+        let c = &self.contact;
+        let rates = self.vat_rates();
+        let vat: Cents = rates.iter().map(|r| r.vat).sum();
+        json!({
+            "number": self.number,
+            "subject": self.subject,
+            "date": date(&self.date),
+            "due_date": self.due_date.as_deref().map(date),
+            "currency": self.currency.as_deref().unwrap_or("EUR"),
+            "payment_method": self.payment_method,
+            "notes": self.notes,
+            "customer": {
+                "code": c.code,
+                "name": c.name,
+                "address": c.address,
+                "address_2": c.address_2,
+                "zipcode": c.zipcode,
+                "city": c.city,
+                "country": c.country,
+                "vat_number": c.vat_number,
+                "email": c.email,
+                "type": c.kind,
+            },
+            "lines": self.lines.iter().map(|l| json!({
+                "description": l.description,
+                "qty": format_scaled(l.qty.0, QTY_DECIMALS),
+                "unit_price": l.price.to_string(),
+                "net": l.net().to_string(),
+                "vat_percentage": format_scaled(l.vat_percentage, PCT_DECIMALS),
+                "vat_type": l.vat_type,
+                "gl_account": l.gl_account,
+            })).collect::<Vec<_>>(),
+            "totals": {
+                "net": self.net().to_string(),
+                "vat": vat.to_string(),
+                "gross": (self.net() + vat).to_string(),
+                "by_rate": rates.iter().map(|r| json!({
+                    "vat_percentage": format_scaled(r.percentage, PCT_DECIMALS),
+                    "net": r.base.to_string(),
+                    "vat": r.vat.to_string(),
+                })).collect::<Vec<_>>(),
+            },
+            "payment_reference": self.number.as_deref().and_then(|n| structured_reference(n).ok()),
+        })
     }
 
     /// What will happen, for humans: customer, lines, totals and send mode.
@@ -379,14 +450,22 @@ impl Invoice {
                 "DRAFT (Process=false): lands in \"To be sent\" in Yuki; nothing is booked or sent"
                     .to_string()
             }
+            Some(SendMode::Book) => "BOOK WITHOUT SENDING (Process=true, EmailToCustomer=false, SentToPeppol=false): books the invoice; you send it yourself".to_string(),
             Some(mode) => format!(
-                "BOOK AND SEND {} (Process=true, EmailToCustomer={}, SentToPeppol={}): books the invoice, Yuki numbers it and sends it",
+                "BOOK AND SEND {} (Process=true, EmailToCustomer={}, SentToPeppol={}): books the invoice and sends it",
                 mode.label().to_uppercase(),
                 mode.email(),
                 mode.peppol()
             ),
         };
         row("Mode", &mode);
+        if self.send.is_some() {
+            row(
+                "!!",
+                "BOOKS IMMEDIATELY and fixes the invoice number: there is no draft to review in Yuki",
+            );
+        }
+        row("Number", &self.number_label());
         row("Customer", &self.contact.label());
         let c = &self.contact;
         let details: Vec<&str> = [
@@ -521,7 +600,8 @@ impl Invoice {
         );
         x.depth = 1;
         x.open("SalesInvoice");
-        // No Reference: Yuki numbers the invoice.
+        // Without a number, no Reference: Yuki numbers the invoice.
+        x.opt("Reference", &self.number);
         x.opt("Subject", &self.subject);
         x.opt("PaymentMethod", &self.payment_method);
         let send = self.send;
@@ -922,6 +1002,18 @@ fn validate(
             .map_err(|e| p.push(format!("pdf: {e}")))
             .ok()
     });
+    if pdf.is_some() && send.is_none() {
+        p.push(
+            "Yuki only accepts a custom PDF on a booked invoice: add --send email|peppol|both (or --book)",
+        );
+    }
+    if pdf.is_some() && overrides.number.is_none() {
+        p.push("a custom PDF needs --number: the number printed on it");
+    }
+    let number = match overrides.number {
+        Some(NumberRequest::Given(number)) => Some(number.clone()),
+        _ => None,
+    };
 
     if !p.0.is_empty() {
         return Err(p.0);
@@ -937,6 +1029,7 @@ fn validate(
         remarks,
         notes,
         pdf,
+        number,
         contact,
         lines,
         send,

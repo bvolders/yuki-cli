@@ -253,13 +253,18 @@ yuki sales invoice create --template acme-consulting \
 yuki sales invoice create --template acme-hosting \
   --send email                                          # Book it and email it to the customer
 yuki sales invoice create --file invoice.toml --dry-run # Preview and xmlDoc only; no API call
-yuki sales invoice create --file invoice.toml --pdf invoice-2026-10.pdf  # Store your own PDF
+yuki sales invoice create --template acme-hosting --book  # Book it now; you send it yourself
+yuki sales invoice prepare --template acme-hosting --number auto  # Resolved invoice as JSON
+yuki sales invoice create --template acme-hosting \
+  --number 2026-20 --pdf "Invoice 2026-20.pdf" --send email  # Book your own PDF and email it
 yuki sales invoice templates                            # List saved templates, each validated
 ```
 
 `create` makes a **draft** by default: it lands in Yuki's "To be sent" list,
 unbooked and without an invoice number, so you can still check or edit it in
-Yuki. `--send email|peppol|both` books it instead (Yuki numbers it) and sends it.
+Yuki. `--send email|peppol|both` books it instead and sends it; `--book` books
+it without sending, for invoices you send yourself. Booking is immediate and
+fixes the number: there is no draft to review, and the preview says so.
 Before any write, the command prints a preview to stderr (customer, lines, net,
 VAT, gross total, and whether it creates a draft or books and sends) and asks
 for confirmation, which declines unless you answer `y`. `--yes` skips the prompt
@@ -272,12 +277,41 @@ Totals must be positive: credit notes are not supported.
 
 With `--pdf <PATH>` (or `pdf = "..."` in an invoice file, not a template),
 Yuki stores your PDF instead of the invoice it would generate from its layout.
+Yuki takes a custom PDF only on a booked invoice, so `--pdf` needs `--send` or
+`--book`, and `--number`: the number printed on the PDF.
 The lines are still required: Yuki books the amounts, and builds a Peppol
 invoice, from them, so the amounts in the PDF must match. The file must start
 with `%PDF-` and be at most 3 MB (Yuki's request limit, with base64 on top).
 A template can't carry a PDF, since it is reused every month; pass `--pdf` per
 invoice. `--dry-run` shows a size comment in place of the PDF's base64, and the
 result has a `PDF` column naming the file sent.
+
+#### Your own PDF with your own number
+
+`--number <REF>` sets the invoice number (Yuki's `Reference`); `--number auto`
+reads the sales (`verkoop`) archive, where Yuki names each invoice PDF after its
+number (`Invoice 2026-19.pdf`), and takes one past the highest `<year>-<seq>`
+of the invoice date's year (`2026-20`), padded like the existing numbers. A
+number the archive already has is refused. Yuki's own counter does not learn
+about numbers given this way, so once you start, number every invoice here.
+
+To send a PDF rendered elsewhere:
+
+1. `yuki sales invoice prepare --template acme-hosting --number auto` prints the
+   fully resolved invoice as JSON and writes nothing: the number, the dates in
+   ISO and Dutch (`30 september 2026`), the customer with address and VAT number,
+   the lines, the totals per VAT rate, and the Belgian structured payment
+   reference.
+2. Render the PDF from that JSON.
+3. `yuki sales invoice create --template acme-hosting --number 2026-20 --pdf
+   invoice.pdf --send email` books the same figures, since it reads the same
+   inputs the same way.
+
+The structured reference (`+++DDD/DDDD/DDDCC+++`) has ten base digits: the
+year, then the sequence padded to six digits, for a `<year>-<seq>` number
+(`2026-20` → `2026000020`), or else every digit of the number, left-padded with
+zeros. `CC` is the base modulo 97, or 97 when that is 0: `2026-20` gives
+`+++202/6000/02014+++`.
 
 If the request goes out but no answer comes back (a timeout or a dropped
 connection), the command exits 1 with kind `outcome_unknown`: the invoice may

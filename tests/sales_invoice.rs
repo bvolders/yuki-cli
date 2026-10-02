@@ -56,10 +56,18 @@ fn import_response(succeeded: bool, processed: bool, email_sent: bool, reference
 }
 
 /// A mock answering Authenticate and, with `result`, ProcessSalesInvoices.
+/// The sales archive: Yuki's own invoice PDFs and a timesheet.
+const SALES_ARCHIVE: &str = r#"<Documents xmlns="">
+<Document ID="d-19"><FileName>Invoice 2026-19.pdf</FileName></Document>
+<Document ID="d-9"><FileName>Invoice 2026-9.pdf</FileName></Document>
+<Document ID="d-t"><FileName>uren januari 2026.xlsx</FileName></Document>
+</Documents>"#;
+
 fn mock(result: String) -> (String, RequestLog) {
     mock_yuki(move |action, _| match action {
         "Authenticate" => soap_response("Authenticate", "session-1"),
         "ProcessSalesInvoices" => soap_response("ProcessSalesInvoices", &result),
+        "DocumentsInFolder" => soap_response("DocumentsInFolder", SALES_ARCHIVE),
         other => panic!("unexpected call {other}"),
     })
 }
@@ -393,7 +401,7 @@ fn templates_lists_valid_and_invalid_templates() {
 
 #[test]
 fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
-    let (root, log) = mock(import_response(true, false, false, ""));
+    let (root, log) = mock(import_response(true, true, false, "2026-20"));
     let home = home_with_config(&root);
     let dir = home.path().join(".config/yuki/invoices");
     let pdf = b"%PDF-1.7\nmade-up invoice body\n%%EOF\n";
@@ -412,6 +420,9 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
             "hosting",
             "--pdf",
             pdf_arg,
+            "--book",
+            "--number",
+            "2026-20",
             "--dry-run",
         ],
     );
@@ -435,6 +446,9 @@ fn a_custom_pdf_goes_into_the_envelope_but_not_into_the_dry_run_output() {
             "hosting",
             "--pdf",
             pdf_arg,
+            "--book",
+            "--number",
+            "2026-20",
             "--yes",
             "--output",
             "json",
@@ -507,4 +521,168 @@ fn a_lost_answer_warns_that_the_invoice_may_exist() {
         "{err}"
     );
     assert_eq!(actions(&log), ["Authenticate", "ProcessSalesInvoices"]);
+}
+
+#[test]
+fn number_auto_takes_the_next_number_from_the_sales_archive() {
+    let (root, log) = mock(import_response(true, true, false, "2026-20"));
+    let home = home_with_config(&root);
+    let output = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "hosting",
+            "--date",
+            "2026-10-02",
+            "--number",
+            "auto",
+            "--book",
+            "--yes",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        actions(&log),
+        [
+            "Authenticate",
+            "DocumentsInFolder",
+            "Authenticate",
+            "ProcessSalesInvoices"
+        ]
+    );
+    let body = sent_body(&log);
+    assert!(body.contains("<Reference>2026-20</Reference>"), "{body}");
+    assert!(body.contains("<Process>true</Process>"), "{body}");
+    assert!(
+        body.contains("<EmailToCustomer>false</EmailToCustomer>"),
+        "{body}"
+    );
+    let err = stderr(&output);
+    assert!(err.contains("BOOKS IMMEDIATELY"), "{err}");
+    assert!(err.contains("Number         2026-20"), "{err}");
+}
+
+#[test]
+fn a_number_already_in_the_archive_is_refused_before_any_write() {
+    let (root, log) = mock(String::new());
+    let home = home_with_config(&root);
+    let output = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "hosting",
+            "--number",
+            "2026-19",
+            "--yes",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(
+        err.contains("invoice number 2026-19 is already in the sales archive"),
+        "{err}"
+    );
+    assert!(err.contains("\"kind\":\"invalid_input\""), "{err}");
+    assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
+}
+
+#[test]
+fn a_dry_run_cannot_pick_an_automatic_number() {
+    let home = TempDir::new().expect("temp home");
+    let file = home.path().join("adhoc.toml");
+    std::fs::write(&file, AD_HOC).expect("write invoice");
+    let output = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--file",
+            file.to_str().unwrap(),
+            "--number",
+            "auto",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("run `sales invoice prepare --number auto`"));
+}
+
+#[test]
+fn prepare_and_create_agree_on_every_figure() {
+    let (root, log) = mock(String::new());
+    let home = home_with_config(&root);
+    let args = [
+        "--template",
+        "hosting",
+        "--qty",
+        "2.5",
+        "--price",
+        "85.10",
+        "--date",
+        "2026-09-30",
+        "--number",
+        "auto",
+    ];
+    let mut prepare = vec!["sales", "invoice", "prepare"];
+    prepare.extend_from_slice(&args);
+    let output = yuki(&home, &prepare);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let json: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    assert_eq!(json["number"], "2026-20");
+    assert_eq!(json["date"]["text"], "30 september 2026");
+    assert_eq!(json["due_date"]["iso"], "2026-10-30");
+    assert_eq!(json["totals"]["net"], "212.75");
+    assert_eq!(json["totals"]["vat"], "44.68");
+    assert_eq!(json["totals"]["gross"], "257.43");
+    assert_eq!(json["payment_reference"], "+++202/6000/02014+++");
+    // Only the archive was read.
+    assert_eq!(actions(&log), ["Authenticate", "DocumentsInFolder"]);
+
+    // create with the same inputs and the prepared number books the same.
+    let number = json["number"].as_str().unwrap();
+    let mut create = vec!["sales", "invoice", "create", "--dry-run", "--book"];
+    create.extend_from_slice(&args[..args.len() - 2]);
+    create.extend_from_slice(&["--number", number]);
+    let output = yuki(&home, &create);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let xml = String::from_utf8_lossy(&output.stdout);
+    let line = &json["lines"][0];
+    for fragment in [
+        format!("<Reference>{number}</Reference>"),
+        format!("<Date>{}</Date>", json["date"]["iso"].as_str().unwrap()),
+        format!(
+            "<DueDate>{}</DueDate>",
+            json["due_date"]["iso"].as_str().unwrap()
+        ),
+        format!(
+            "<ProductQuantity>{}</ProductQuantity>",
+            line["qty"].as_str().unwrap()
+        ),
+        format!(
+            "<SalesPrice>{}</SalesPrice>",
+            line["unit_price"].as_str().unwrap()
+        ),
+        format!(
+            "<VATPercentage>{}</VATPercentage>",
+            line["vat_percentage"].as_str().unwrap()
+        ),
+    ] {
+        assert!(xml.contains(&fragment), "{fragment} missing from {xml}");
+    }
+    let preview = stderr(&output);
+    for total in ["net", "gross"] {
+        let amount = json["totals"][total].as_str().unwrap();
+        assert!(
+            preview.contains(&format!("{amount} EUR")),
+            "{total} {amount}: {preview}"
+        );
+    }
+    assert!(preview.contains("44.68 EUR  (21% on 212.75)"), "{preview}");
 }

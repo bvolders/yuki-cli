@@ -83,6 +83,14 @@ impl AppError {
     }
 }
 
+/// A configuration error from reading an invoice is a problem with the input.
+fn invalid_input(e: YukiError) -> AppError {
+    match e {
+        YukiError::Config(message) => AppError::InvalidInput(message),
+        other => other.into(),
+    }
+}
+
 /// Print a usage error the way clap does, plus the structured envelope, and exit.
 fn exit_with_usage_error(e: clap::Error) -> ! {
     use clap::error::ErrorKind;
@@ -447,39 +455,33 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                 }
                 SalesCommands::Invoice { command } => match command {
                     SalesInvoiceCommands::Create {
-                        file,
-                        template,
-                        qty,
-                        price,
-                        date,
-                        subject,
+                        inputs,
                         pdf,
                         send,
+                        book,
                         dry_run,
                     } => {
-                        use yuki_cli::cli::sales_invoice::{self, Overrides, Source};
-                        let source = match (file, template) {
-                            (Some(file), _) => Source::File(file.into()),
-                            (None, Some(name)) => Source::Template(name),
-                            (None, None) => unreachable!("clap requires --file or --template"),
-                        };
-                        let overrides = Overrides {
-                            qty,
-                            price,
-                            date: date.as_deref(),
-                            subject: subject.as_deref(),
-                            pdf: pdf.as_deref().map(std::path::Path::new),
-                        };
-                        let invoice = sales_invoice::load(&source, &overrides, send).map_err(
-                            |e| match e {
-                                YukiError::Config(message) => AppError::InvalidInput(message),
-                                other => other.into(),
-                            },
-                        )?;
+                        use yuki_cli::cli::invoice_number::{self, NumberRequest};
+                        use yuki_cli::cli::sales_invoice::{self, SendMode};
+                        let send = if book { Some(SendMode::Book) } else { send };
+                        let mut overrides = inputs.overrides();
+                        overrides.pdf = pdf.as_deref().map(std::path::Path::new);
+                        let mut invoice = sales_invoice::load(&inputs.source(), &overrides, send)
+                            .map_err(invalid_input)?;
                         // A dry run needs no configuration and makes no API call.
                         if dry_run {
+                            if inputs.number == Some(NumberRequest::Auto) {
+                                return Err(AppError::InvalidInput(
+                                    "--number auto reads the sales archive, which a dry run does not: run `sales invoice prepare --number auto` for the number, then pass it".into(),
+                                ));
+                            }
                             if !cli.quiet {
                                 eprintln!("{}\n", invoice.preview(None));
+                                if let Some(number) = &invoice.number {
+                                    eprintln!(
+                                        "Dry run: number {number} was not checked against the sales archive."
+                                    );
+                                }
                                 eprintln!("Dry run: nothing was sent to Yuki. xmlDoc:");
                             }
                             println!("{}", invoice.to_display_xml());
@@ -487,6 +489,13 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         }
                         let config = load()?;
                         let target = config.target(admin)?;
+                        if let Some(request) = &inputs.number {
+                            invoice.number = Some(
+                                invoice_number::resolve(&config, admin, request, &invoice.date)
+                                    .await
+                                    .map_err(invalid_input)?,
+                            );
+                        }
                         if !(cli.quiet && cli.yes) {
                             eprintln!("{}\n", invoice.preview(Some(target.config_name)));
                         }
@@ -517,6 +526,26 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         {
                             return Err(AppError::InvoiceRejected(failure));
                         }
+                    }
+                    SalesInvoiceCommands::Prepare { inputs } => {
+                        use yuki_cli::cli::{invoice_number, sales_invoice};
+                        let mut invoice =
+                            sales_invoice::load(&inputs.source(), &inputs.overrides(), None)
+                                .map_err(invalid_input)?;
+                        if let Some(request) = &inputs.number {
+                            let config = load()?;
+                            config.target(admin)?;
+                            invoice.number = Some(
+                                invoice_number::resolve(&config, admin, request, &invoice.date)
+                                    .await
+                                    .map_err(invalid_input)?,
+                            );
+                        }
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&invoice.prepared())
+                                .expect("serialize invoice")
+                        );
                     }
                     SalesInvoiceCommands::Templates => {
                         yuki_cli::cli::sales_invoice::templates(format)?;
