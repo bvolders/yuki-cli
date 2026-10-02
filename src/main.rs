@@ -471,6 +471,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         send,
                         book,
                         dry_run,
+                        confirm,
                     } => {
                         use yuki_cli::cli::invoice_ledger::InvoiceLedger;
                         use yuki_cli::cli::invoice_number::{self, NumberRequest};
@@ -553,6 +554,15 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                     .await
                                     .map_err(invalid_input)?,
                             );
+                        }
+                        // A booking without a prompt names the number it books.
+                        if invoice.send.is_some() {
+                            sales_invoice::check_confirm(
+                                invoice.number.as_deref(),
+                                confirm.as_deref(),
+                                cli.yes,
+                            )
+                            .map_err(AppError::ConfirmationRequired)?;
                         }
                         if !(cli.quiet && cli.yes) {
                             eprintln!("{}\n", invoice.preview(Some(target.config_name)));

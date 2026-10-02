@@ -304,6 +304,8 @@ yuki sales invoice prepare --template acme-hosting --number auto \
   --date 2026-10-31 --out 2026-10-acme.json             # Reserve the number for this content
 yuki sales invoice create --prepared 2026-10-acme.json \
   --pdf 2026-10-acme.pdf --send email                   # Book exactly that, with your PDF
+yuki sales invoice create --prepared 2026-10-acme.json \
+  --pdf 2026-10-acme.pdf --send email --yes --confirm 2026-20  # The same, unattended
 yuki sales invoice numbers                              # Invoice numbers given out (local ledger)
 yuki sales invoice numbers --release 2026-20            # Free a reservation that will not be sent
 yuki sales invoice numbers --resolve 2026-20 booked     # Settle a number left pending
@@ -318,8 +320,12 @@ fixes the number: there is no draft to review, and the preview says so. A
 booking needs a due date (`due_days` or `due_date`).
 Before any write, the command prints a preview to stderr (customer, lines, net,
 VAT, gross total, and whether it creates a draft or books and sends) and asks
-for confirmation, which declines unless you answer `y`. `--yes` skips the prompt
-and is required when stdin or stderr is not a terminal. `--dry-run` prints the
+for confirmation, which declines unless you answer `y`; the question names the
+invoice number. `--yes` skips the prompt and is required when stdin or stderr
+is not a terminal. A booking (`--send`, `--book`) without the prompt also needs
+`--confirm <number>`, the invoice number repeated, so an unattended run books
+only the number it meant to; a booking Yuki numbers itself can only be
+confirmed at the prompt. `--dry-run` prints the
 preview, then the exact `xmlDoc` on stdout, and makes no API call. The command
 exits 1 with kind `invoice_rejected` when Yuki fails or skips the invoice, or
 does not book it as `--send` asked, after printing Yuki's answer, and with

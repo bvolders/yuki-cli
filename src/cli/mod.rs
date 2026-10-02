@@ -481,6 +481,12 @@ pub enum SalesInvoiceCommands {
         /// Print the preview and the xmlDoc XML; make no API call at all.
         #[arg(long)]
         dry_run: bool,
+
+        /// The invoice number being booked, repeated: required with --yes
+        /// when booking (--send or --book), so an unattended run books only
+        /// the number it meant to.
+        #[arg(long, value_name = "NUMBER")]
+        confirm: Option<String>,
     },
 
     /// Print the fully resolved invoice as JSON, for rendering its PDF.

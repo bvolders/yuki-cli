@@ -279,7 +279,8 @@ pub fn generate() -> Value {
                     {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it (or --book), the invoice is a draft."},
                     {"name": "--book", "type": "boolean", "required": false, "description": "Book the invoice without sending it."},
                     {"name": "--number", "type": "string", "required": false, "description": "Invoice number (Reference) of a booked invoice (needs --send or --book), or auto: one past the highest <year>-<seq> in the sales archive (Invoice/Factuur <year>-<seq>.pdf) and the local ledger for the invoice date's year. Refused when either has it."},
-                    {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."}
+                    {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."},
+                    {"name": "--confirm", "type": "string", "required": false, "description": "The invoice number being booked, repeated: required with --yes when booking (--send or --book), and must equal the number. A booking Yuki numbers itself can only be confirmed at the prompt."}
                 ],
                 "output_fields": [
                     {"name": "Succeeded", "type": "string"},

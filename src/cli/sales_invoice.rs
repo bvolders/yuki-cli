@@ -383,8 +383,23 @@ impl Invoice {
     pub fn question(&self) -> String {
         match self.send {
             None => "Create this draft invoice in Yuki?".into(),
-            Some(SendMode::Book) => "Book this invoice in Yuki now, without sending it?".into(),
-            Some(mode) => format!("Book this invoice in Yuki and send it {}?", mode.label()),
+            Some(SendMode::Book) => format!(
+                "Book {} in Yuki now, without sending it?",
+                self.invoice_label()
+            ),
+            Some(mode) => format!(
+                "Book {} in Yuki and send it {}?",
+                self.invoice_label(),
+                mode.label()
+            ),
+        }
+    }
+
+    /// `invoice 2026-20`, or `this invoice` when Yuki numbers it.
+    fn invoice_label(&self) -> String {
+        match &self.number {
+            Some(number) => format!("invoice {number}"),
+            None => "this invoice".into(),
         }
     }
 
@@ -1548,6 +1563,26 @@ pub fn write_prepared(
         return Err(YukiError::Config(format!("{}: {e}", out.display())));
     }
     Ok(json)
+}
+
+/// The `--confirm` of a booking: required when `--yes` skips the prompt,
+/// and equal to the invoice number whenever given. The error says why
+/// nothing was sent.
+pub fn check_confirm(number: Option<&str>, confirm: Option<&str>, yes: bool) -> Result<(), String> {
+    match (number, confirm) {
+        (Some(number), Some(confirm)) if number == confirm => Ok(()),
+        (Some(number), Some(confirm)) => Err(format!(
+            "--confirm {confirm} is not the invoice number {number}: nothing was sent to Yuki"
+        )),
+        (_, None) if !yes => Ok(()),
+        (Some(number), None) => Err(format!(
+            "booking without a prompt needs --confirm <number>: pass --confirm {number} to book invoice {number}; nothing was sent to Yuki"
+        )),
+        (None, _) => Err(
+            "booking without a prompt needs --confirm <number>, so the invoice needs a number: give --number (or book a --prepared invoice); one Yuki numbers itself can only be booked at the prompt. Nothing was sent to Yuki"
+                .into(),
+        ),
+    }
 }
 
 /// Whether a confirmation prompt can be asked and answered.

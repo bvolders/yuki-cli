@@ -167,7 +167,11 @@ fn send_email_books_and_emails_the_invoice() {
             file.to_str().unwrap(),
             "--send",
             "email",
+            "--number",
+            "2026-0042",
             "--yes",
+            "--confirm",
+            "2026-0042",
             "--output",
             "json",
         ],
@@ -221,7 +225,11 @@ fn a_send_yuki_did_not_carry_out_fails_even_when_quiet() {
                 "hosting",
                 "--send",
                 "email",
+                "--number",
+                "2026-0043",
                 "--yes",
+                "--confirm",
+                "2026-0043",
                 "--quiet",
             ],
         );
@@ -495,7 +503,16 @@ fn two_prepared_invoices_get_distinct_numbers_and_book_as_prepared() {
     let booked = create_prepared(
         &home,
         &first,
-        &["--pdf", pdf_arg, "--book", "--yes", "--output", "json"],
+        &[
+            "--pdf",
+            pdf_arg,
+            "--book",
+            "--yes",
+            "--confirm",
+            "2026-20",
+            "--output",
+            "json",
+        ],
     );
     assert!(booked.status.success(), "{}", stderr(&booked));
     assert_eq!(json(&booked)["items"][0]["PDF"], "Invoice 2026-20.pdf");
@@ -697,6 +714,8 @@ fn number_auto_takes_the_next_number_from_the_sales_archive() {
             "auto",
             "--book",
             "--yes",
+            "--confirm",
+            "2026-20",
         ],
     );
     assert!(output.status.success(), "{}", stderr(&output));
@@ -886,6 +905,8 @@ fn book_number(home: &TempDir, number: &str) -> std::process::Output {
             number,
             "--book",
             "--yes",
+            "--confirm",
+            number,
             "--quiet",
         ],
     )
@@ -1077,6 +1098,8 @@ fn a_booked_invoice_that_was_not_emailed_is_booked_but_incomplete() {
             "--send",
             "email",
             "--yes",
+            "--confirm",
+            "2026-20",
             "--quiet",
         ],
     );
@@ -1105,6 +1128,8 @@ fn peppol_is_reported_as_requested_never_as_delivered() {
             "--send",
             "peppol",
             "--yes",
+            "--confirm",
+            "2026-20",
             "--output",
             "json",
         ],
@@ -1116,4 +1141,49 @@ fn peppol_is_reported_as_requested_never_as_delivered() {
     );
     assert!(stderr(&output).contains("Peppol         requested (Yuki does not report delivery)"));
     assert_eq!(ledger_rows(&home)[0]["Status"], "booked");
+}
+
+#[test]
+fn an_unattended_booking_must_name_the_number_it_books() {
+    let (root, log) = mock(import_response(true, true, false, "2026-20"));
+    let home = home_with_seller(&root);
+    let file = home.path().join("prepared.json");
+    assert!(prepare_out(&home, "hosting", &file).status.success());
+    for (extra, expect) in [
+        (
+            vec!["--book", "--yes"],
+            "booking without a prompt needs --confirm <number>: pass --confirm 2026-20",
+        ),
+        (
+            vec!["--book", "--yes", "--confirm", "2026-21"],
+            "--confirm 2026-21 is not the invoice number 2026-20",
+        ),
+    ] {
+        let out = create_prepared(&home, &file, &extra);
+        assert_eq!(out.status.code(), Some(1), "{extra:?}");
+        let err = stderr(&out);
+        assert!(err.contains("\"kind\":\"confirmation_required\""), "{err}");
+        assert!(err.contains(expect), "{err}");
+    }
+    // A booking Yuki numbers itself cannot be confirmed without the prompt.
+    let unnumbered = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "create",
+            "--template",
+            "hosting",
+            "--book",
+            "--yes",
+        ],
+    );
+    assert_eq!(unnumbered.status.code(), Some(1));
+    assert!(stderr(&unnumbered).contains("so the invoice needs a number"));
+    assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
+    assert_eq!(status_of(&home, "2026-20"), "reserved");
+    // The reservation is untouched, and the right number books it.
+    let ok = create_prepared(&home, &file, &["--book", "--yes", "--confirm", "2026-20"]);
+    assert!(ok.status.success(), "{}", stderr(&ok));
+    assert_eq!(status_of(&home, "2026-20"), "booked");
 }
