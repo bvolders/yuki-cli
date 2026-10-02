@@ -10,11 +10,13 @@ use super::{ElementText, local_name, service_url};
 
 const YUKI_NS: &str = "http://www.theyukicompany.com/";
 const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 /// Builder for SOAP XML request envelopes.
 pub struct SoapEnvelope {
     operation: String,
-    params: Vec<(String, String)>,
+    /// Name and value of each parameter; `None` is an explicit `xsi:nil`.
+    params: Vec<(String, Option<String>)>,
 }
 
 impl SoapEnvelope {
@@ -28,21 +30,46 @@ impl SoapEnvelope {
     /// Add the session ID, which Yuki expects as the first parameter.
     pub fn session(mut self, session_id: &str) -> Self {
         self.params
-            .insert(0, ("sessionID".into(), escape_text(session_id)));
+            .insert(0, ("sessionID".into(), Some(escape_text(session_id))));
         self
     }
 
     /// Add a text parameter. `value` is XML-escaped, so a file name such as
     /// `Tom & Jerry <x>.pdf` reaches Yuki unchanged.
     pub fn param(mut self, name: &str, value: &str) -> Self {
-        self.params.push((name.to_string(), escape_text(value)));
+        self.params
+            .push((name.to_string(), Some(escape_text(value))));
+        self
+    }
+
+    /// Add a nillable parameter sent as `xsi:nil="true"`: for elements the
+    /// schema requires (`minOccurs="1"`) but that may carry no value, such as
+    /// `modifiedAfter` of `SearchContacts`.
+    pub fn nil_param(mut self, name: &str) -> Self {
+        self.params.push((name.to_string(), None));
+        self
+    }
+
+    /// Add a parameter whose value is raw XML, inserted unescaped as child
+    /// elements: for `s:any` parameters such as the `xmlDoc` of
+    /// `ProcessSalesInvoices`, which take a document rather than text. The
+    /// caller guarantees the fragment is well-formed and escaped inside.
+    pub fn param_xml(mut self, name: &str, xml: &str) -> Self {
+        self.params.push((name.to_string(), Some(xml.to_string())));
         self
     }
 
     pub fn build(self) -> String {
         let mut body = String::new();
         for (name, value) in &self.params {
-            body.push_str(&format!("      <yuki:{name}>{value}</yuki:{name}>\n"));
+            match value {
+                Some(value) => {
+                    body.push_str(&format!("      <yuki:{name}>{value}</yuki:{name}>\n"));
+                }
+                None => body.push_str(&format!(
+                    "      <yuki:{name} xsi:nil=\"true\" xmlns:xsi=\"{XSI_NS}\" />\n"
+                )),
+            }
         }
 
         format!(

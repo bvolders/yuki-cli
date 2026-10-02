@@ -7,7 +7,7 @@ use yuki_cli::cli::Commands;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
     DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, SalesCommands,
-    UploadCommands, VatCommands,
+    SalesInvoiceCommands, UploadCommands, VatCommands,
 };
 use yuki_cli::cli::{Cli, RunEndpoint};
 use yuki_cli::config::Config;
@@ -18,6 +18,12 @@ enum AppError {
     Yuki(YukiError),
     Other(anyhow::Error),
     ConfirmationRequired(String),
+    /// Yuki answered, but did not accept every invoice.
+    InvoiceRejected(String),
+    /// An invoice file or template that cannot be read or is invalid.
+    InvalidInput(String),
+    /// A write whose request went out without a usable answer.
+    OutcomeUnknown(String),
 }
 
 impl fmt::Display for AppError {
@@ -25,7 +31,12 @@ impl fmt::Display for AppError {
         match self {
             Self::Yuki(e) => write!(f, "{e}"),
             Self::Other(e) => write!(f, "{e}"),
-            Self::ConfirmationRequired(message) => write!(f, "{message}"),
+            Self::ConfirmationRequired(message)
+            | Self::InvoiceRejected(message)
+            | Self::InvalidInput(message)
+            | Self::OutcomeUnknown(message) => {
+                write!(f, "{message}")
+            }
         }
     }
 }
@@ -47,7 +58,10 @@ impl AppError {
         match self {
             Self::Yuki(e) => e.exit_code(),
             Self::Other(_) => 1,
-            Self::ConfirmationRequired(_) => 1,
+            Self::ConfirmationRequired(_)
+            | Self::InvoiceRejected(_)
+            | Self::InvalidInput(_)
+            | Self::OutcomeUnknown(_) => 1,
         }
     }
 
@@ -62,7 +76,18 @@ impl AppError {
             },
             Self::Other(_) => "error",
             Self::ConfirmationRequired(_) => "confirmation_required",
+            Self::InvoiceRejected(_) => "invoice_rejected",
+            Self::InvalidInput(_) => "invalid_input",
+            Self::OutcomeUnknown(_) => "outcome_unknown",
         }
+    }
+}
+
+/// A configuration error from reading an invoice is a problem with the input.
+fn invalid_input(e: YukiError) -> AppError {
+    match e {
+        YukiError::Config(message) => AppError::InvalidInput(message),
+        other => other.into(),
     }
 }
 
@@ -254,8 +279,8 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
             let config = load()?;
             let admin = cli.admin.as_deref();
             match command {
-                ContactCommands::Search { query } => {
-                    yuki_cli::cli::contacts::search(&config, admin, &query, format).await?;
+                ContactCommands::Search { query, by } => {
+                    yuki_cli::cli::contacts::search(&config, admin, &query, &by, format).await?;
                 }
                 ContactCommands::List {
                     contact_type,
@@ -393,14 +418,21 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?;
                 }
-                InvoiceCommands::Document { id } => {
-                    yuki_cli::cli::invoices::document(&config, admin, &id, format).await?;
+                InvoiceCommands::Document { id, out } => {
+                    yuki_cli::cli::invoices::document(
+                        &config,
+                        admin,
+                        &id,
+                        out.as_deref(),
+                        format,
+                        cli.quiet,
+                    )
+                    .await?;
                 }
             }
         }
 
         Commands::Sales { command } => {
-            let config = Config::load()?;
             let admin = cli.admin.as_deref();
             match command {
                 SalesCommands::Items {
@@ -408,6 +440,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     offset,
                     fields,
                 } => {
+                    let config = load()?;
                     yuki_cli::cli::sales::items(
                         &config,
                         admin,
@@ -420,6 +453,133 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?;
                 }
+                SalesCommands::Invoice { command } => match command {
+                    SalesInvoiceCommands::Create {
+                        inputs,
+                        pdf,
+                        send,
+                        book,
+                        dry_run,
+                    } => {
+                        use yuki_cli::cli::invoice_number::{self, NumberRequest};
+                        use yuki_cli::cli::sales_invoice::{self, SendMode};
+                        let send = if book { Some(SendMode::Book) } else { send };
+                        let mut overrides = inputs.overrides();
+                        overrides.pdf = pdf.as_deref().map(std::path::Path::new);
+                        let mut invoice = sales_invoice::load(&inputs.source(), &overrides, send)
+                            .map_err(invalid_input)?;
+                        // A dry run needs no configuration and makes no API call.
+                        if dry_run {
+                            if inputs.number == Some(NumberRequest::Auto) {
+                                return Err(AppError::InvalidInput(
+                                    "--number auto reads the sales archive, which a dry run does not: run `sales invoice prepare --number auto` for the number, then pass it".into(),
+                                ));
+                            }
+                            if !cli.quiet {
+                                eprintln!("{}\n", invoice.preview(None));
+                                if let Some(number) = &invoice.number {
+                                    eprintln!(
+                                        "Dry run: number {number} was not checked against the sales archive."
+                                    );
+                                }
+                                eprintln!("Dry run: nothing was sent to Yuki. xmlDoc:");
+                            }
+                            println!("{}", invoice.to_display_xml());
+                            return Ok(());
+                        }
+                        let config = load()?;
+                        let target = config.target(admin)?;
+                        if let Some(request) = &inputs.number {
+                            invoice.number = Some(
+                                invoice_number::resolve(&config, admin, request, &invoice.date)
+                                    .await
+                                    .map_err(invalid_input)?,
+                            );
+                        }
+                        if !(cli.quiet && cli.yes) {
+                            eprintln!("{}\n", invoice.preview(Some(target.config_name)));
+                        } else if let Some(line) = invoice.booking_line() {
+                            // Even quiet, a booking is announced.
+                            eprintln!("{line}");
+                        }
+                        if !cli.yes {
+                            if !sales_invoice::can_prompt() {
+                                return Err(AppError::ConfirmationRequired(
+                                    "sales invoice create writes to Yuki; pass --yes to confirm in non-interactive mode, or --dry-run to preview only".into(),
+                                ));
+                            }
+                            if !sales_invoice::confirm(&invoice.question())? {
+                                return Err(AppError::ConfirmationRequired(
+                                    "not confirmed: nothing was sent to Yuki".into(),
+                                ));
+                            }
+                        }
+                        let import = sales_invoice::submit_numbered(
+                            &config, admin, &invoice, format, cli.quiet,
+                        )
+                        .await
+                        .map_err(|e| match e {
+                            sales_invoice::SubmitError::Yuki(e) => AppError::from(e),
+                            sales_invoice::SubmitError::OutcomeUnknown(message) => {
+                                AppError::OutcomeUnknown(message)
+                            }
+                        })?;
+                        if let Some(failure) = import
+                            .failure()
+                            .or_else(|| sales_invoice::unsent(&import, invoice.send))
+                        {
+                            return Err(AppError::InvoiceRejected(failure));
+                        }
+                    }
+                    SalesInvoiceCommands::Prepare { inputs } => {
+                        use yuki_cli::cli::{invoice_number, sales_invoice};
+                        let overrides = sales_invoice::Overrides {
+                            preparing: true,
+                            ..inputs.overrides()
+                        };
+                        let mut invoice = sales_invoice::load(&inputs.source(), &overrides, None)
+                            .map_err(invalid_input)?;
+                        if let Some(request) = &inputs.number {
+                            let config = load()?;
+                            config.target(admin)?;
+                            invoice.number = Some(
+                                invoice_number::resolve(&config, admin, request, &invoice.date)
+                                    .await
+                                    .map_err(invalid_input)?,
+                            );
+                        }
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&invoice.prepared())
+                                .expect("serialize invoice")
+                        );
+                    }
+                    SalesInvoiceCommands::Numbers { resolve } => {
+                        use yuki_cli::cli::invoice_ledger::{self, Status};
+                        let resolve = match resolve.as_deref() {
+                            Some([number, status]) => {
+                                let status = match status.to_ascii_lowercase().as_str() {
+                                    "booked" => Status::Booked,
+                                    "rejected" => Status::Rejected,
+                                    other => {
+                                        return Err(AppError::InvalidInput(format!(
+                                            "--resolve takes booked or rejected, not {other}"
+                                        )));
+                                    }
+                                };
+                                Some((number.clone(), status))
+                            }
+                            _ => None,
+                        };
+                        invoice_ledger::numbers(
+                            resolve.as_ref().map(|(n, s)| (n.as_str(), *s)),
+                            format,
+                        )?;
+                    }
+                    SalesInvoiceCommands::Templates => {
+                        yuki_cli::cli::sales_invoice::templates(format)?;
+                    }
+                },
             }
         }
 
@@ -450,6 +610,17 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                 }
                 DocumentCommands::Search { query } => {
                     yuki_cli::cli::documents::search(&config, admin, &query, format).await?;
+                }
+                DocumentCommands::Download { id, out } => {
+                    yuki_cli::cli::documents::download(
+                        &config,
+                        admin,
+                        &id,
+                        out.as_deref(),
+                        format,
+                        cli.quiet,
+                    )
+                    .await?;
                 }
                 DocumentCommands::Exists {
                     amount,

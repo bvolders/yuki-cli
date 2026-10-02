@@ -5,9 +5,12 @@ pub mod check;
 pub mod contacts;
 pub mod documents;
 pub mod init;
+pub mod invoice_ledger;
+pub mod invoice_number;
 pub mod invoices;
 pub mod projects;
 pub mod sales;
+pub mod sales_invoice;
 pub mod upload;
 pub mod upload_dir;
 pub mod vat;
@@ -396,10 +399,18 @@ pub enum InvoiceCommands {
         period: Option<String>,
     },
 
-    /// Show the document linked to a transaction.
+    /// Save the document linked to a transaction.
+    ///
+    /// Written under the document's own file name in the working directory,
+    /// or to --out (a file, or a directory to put it in); never over an
+    /// existing file.
     Document {
         /// Transaction ID.
         id: String,
+
+        /// File or directory to write to.
+        #[arg(long, value_name = "PATH")]
+        out: Option<String>,
     },
 }
 
@@ -419,6 +430,147 @@ pub enum SalesCommands {
         #[arg(long)]
         fields: Option<String>,
     },
+
+    /// Create sales invoices from a file or a saved template.
+    Invoice {
+        #[command(subcommand)]
+        command: SalesInvoiceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SalesInvoiceCommands {
+    /// Create a sales invoice in Yuki: a draft, unless --send or --book books it.
+    ///
+    /// The invoice comes from a TOML file (--file) or a saved template
+    /// (--template, read from ~/.config/yuki/invoices/<name>.toml). A preview
+    /// of the customer, lines and totals is printed first, then confirmed on a
+    /// terminal; --yes skips the prompt and is required when not on a terminal.
+    /// --dry-run prints the preview and the exact xmlDoc without contacting Yuki.
+    ///
+    /// A custom --pdf needs --send or --book (Yuki takes a PDF only on a booked
+    /// invoice) and --number (the number printed on it). Booking is immediate:
+    /// there is no draft to review.
+    #[command(group(
+        clap::ArgGroup::new("source").required(true).args(["file", "template"])
+    ))]
+    Create {
+        #[command(flatten)]
+        inputs: InvoiceInputs,
+
+        /// Custom invoice PDF (max 3 MB), replacing an invoice file's `pdf`;
+        /// a template takes one only this way. Yuki stores it, as
+        /// `Invoice <number>.pdf`, instead of the invoice it would generate;
+        /// the lines still set the booked amounts. Needs --send or --book,
+        /// and the --number and --date `prepare` printed.
+        #[arg(long, value_name = "PATH")]
+        pdf: Option<String>,
+
+        /// Book the invoice and send it: email, peppol, or both. Without it
+        /// (or --book), the invoice is created as a draft in "To be sent".
+        #[arg(long, value_enum)]
+        send: Option<sales_invoice::SendMode>,
+
+        /// Book the invoice without sending it, for invoices you send yourself.
+        #[arg(long, conflicts_with = "send")]
+        book: bool,
+
+        /// Print the preview and the xmlDoc XML; make no API call at all.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Print the fully resolved invoice as JSON, writing nothing.
+    ///
+    /// The same inputs as `create`, which sends the same number, dates,
+    /// customer and lines for them. The totals per VAT rate are the CLI's
+    /// computation; Yuki books its own. Dates come as ISO and Dutch text, with
+    /// the Belgian structured payment reference. Any `pdf` is ignored, as the
+    /// PDF does not exist yet. With --number it reads the sales archive and
+    /// the local number ledger; pass the number and date it prints to
+    /// `create --pdf`.
+    #[command(group(
+        clap::ArgGroup::new("source").required(true).args(["file", "template"])
+    ))]
+    Prepare {
+        #[command(flatten)]
+        inputs: InvoiceInputs,
+    },
+
+    /// List the invoice numbers given out, from the local ledger.
+    ///
+    /// A number is pending from just before Yuki is called until its answer
+    /// marks it booked or rejected. One left pending (no answer came back)
+    /// stays taken: check "To be sent"/Sales in Yuki, then settle it with
+    /// --resolve <NUMBER> booked|rejected. A rejected number can be used again.
+    Numbers {
+        /// Settle a pending number: --resolve 2026-20 booked (or rejected).
+        #[arg(long, num_args = 2, value_names = ["NUMBER", "STATUS"])]
+        resolve: Option<Vec<String>>,
+    },
+
+    /// List saved invoice templates (~/.config/yuki/invoices/*.toml).
+    Templates,
+}
+
+/// What an invoice is made of: `create` and `prepare` take the same.
+#[derive(clap::Args)]
+pub struct InvoiceInputs {
+    /// Invoice described in a TOML file.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<String>,
+
+    /// Saved template name (see `sales invoice templates`).
+    #[arg(long, value_name = "NAME")]
+    pub template: Option<String>,
+
+    /// Quantity of the invoice's only line, e.g. 7.5.
+    #[arg(long, value_parser = sales_invoice::parse_quantity)]
+    pub qty: Option<sales_invoice::Quantity>,
+
+    /// Unit price excluding VAT of the invoice's only line, e.g. 1250.00.
+    #[arg(long, value_parser = sales_invoice::parse_price)]
+    pub price: Option<crate::money::Cents>,
+
+    /// Invoice date, YYYY-MM-DD. Default: the file's date, else today.
+    #[arg(long, value_parser = sales_invoice::parse_date)]
+    pub date: Option<String>,
+
+    /// Subject (title) of the invoice, replacing the file's.
+    #[arg(long)]
+    pub subject: Option<String>,
+
+    /// Invoice number (Yuki's Reference) for a booked invoice (--send or
+    /// --book), or `auto`: one past the highest <year>-<seq> among the
+    /// sales archive's `Invoice <n>.pdf` files of the invoice date's year and
+    /// the numbers the local ledger holds. Refused when either has it.
+    /// Yuki's own counter does not learn numbers given here, so once you
+    /// start, number every invoice this way. Without it, Yuki numbers the
+    /// invoice. With --pdf, give the number `prepare` printed, not auto.
+    #[arg(long, value_name = "REF|auto", value_parser = invoice_number::parse_number_request)]
+    pub number: Option<invoice_number::NumberRequest>,
+}
+
+impl InvoiceInputs {
+    pub fn source(&self) -> sales_invoice::Source {
+        match (&self.file, &self.template) {
+            (Some(file), _) => sales_invoice::Source::File(file.into()),
+            (None, Some(name)) => sales_invoice::Source::Template(name.clone()),
+            (None, None) => unreachable!("clap requires --file or --template"),
+        }
+    }
+
+    pub fn overrides(&self) -> sales_invoice::Overrides<'_> {
+        sales_invoice::Overrides {
+            qty: self.qty,
+            price: self.price,
+            date: self.date.as_deref(),
+            subject: self.subject.as_deref(),
+            pdf: None,
+            number: self.number.as_ref(),
+            preparing: false,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -453,6 +605,20 @@ pub enum DocumentCommands {
         query: String,
     },
 
+    /// Save an archive document's file.
+    ///
+    /// Written under the document's own file name in the working directory,
+    /// or to --out (a file, or a directory to put it in); never over an
+    /// existing file.
+    Download {
+        /// Document ID (as shown by `documents list`).
+        id: String,
+
+        /// File or directory to write to.
+        #[arg(long, value_name = "PATH")]
+        out: Option<String>,
+    },
+
     /// Check if an invoice exists in the archive (by amount, date, and optional contact).
     Exists {
         /// Invoice amount to search for.
@@ -469,10 +635,20 @@ pub enum DocumentCommands {
 
 #[derive(Subcommand)]
 pub enum ContactCommands {
-    /// Search contacts by name or other criteria.
+    /// Search contacts, active or not, by any field or by one (--by).
     Search {
-        /// Search query.
+        /// Search value.
         query: String,
+
+        /// Field to search: All (default) or one of Yuki's search options,
+        /// e.g. Name, City, VATNumber, Code, HID. Case-insensitive.
+        #[arg(
+            long,
+            default_value = "All",
+            ignore_case = true,
+            value_parser = PossibleValuesParser::new(crate::client::contact::SEARCH_OPTIONS),
+        )]
+        by: String,
     },
 
     /// List contacts filtered by type.

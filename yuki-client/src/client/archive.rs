@@ -209,6 +209,43 @@ impl ArchiveClient {
         )))
     }
 
+    /// The metadata of one archive document, `None` when Yuki returns none.
+    pub async fn find_document(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<ArchiveDocument>, YukiError> {
+        let session = self.require_session()?;
+        let envelope = SoapEnvelope::new("FindDocument")
+            .session(session)
+            .param("documentID", document_id)
+            .build();
+        let body = self.soap.call("FindDocument", envelope).await?;
+        Ok(Self::parse_archive_documents(&body)?.into_iter().next())
+    }
+
+    /// The file of one archive document, base64-encoded as Yuki sends it.
+    pub async fn document_binary_data(&self, document_id: &str) -> Result<String, YukiError> {
+        let session = self.require_session()?;
+        let envelope = SoapEnvelope::new("DocumentBinaryData")
+            .session(session)
+            .param("documentID", document_id)
+            .build();
+        let body = self.soap.call("DocumentBinaryData", envelope).await?;
+        Self::parse_document_binary_data(&body, document_id)
+    }
+
+    /// The base64 text of a `DocumentBinaryData` response; an empty or
+    /// missing result means the document has no file.
+    pub fn parse_document_binary_data(xml: &str, document_id: &str) -> Result<String, YukiError> {
+        match SoapClient::parse_single_result(xml, "DocumentBinaryDataResult") {
+            Ok(data) => Ok(data),
+            Err(YukiError::Xml(_)) => Err(YukiError::NotFound(format!(
+                "document {document_id} has no file in the archive"
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
     /// List all documents of a given document type.
     pub async fn documents_by_type(&self, doc_type: i32) -> Result<String, YukiError> {
         let session = self.require_session()?;

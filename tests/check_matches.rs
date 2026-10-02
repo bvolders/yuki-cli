@@ -2,28 +2,11 @@
 //! answers the four operations the command uses, keyed on the SOAP action and,
 //! for GL lines, the requested account. Names and amounts are made up.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
-
 mod common;
 
-use common::yuki;
+use common::{RequestLog, mock_yuki, soap_response as response, yuki};
 use serde_json::Value;
 use tempfile::TempDir;
-
-fn envelope(body: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>{body}</soap:Body></soap:Envelope>"#
-    )
-}
-
-fn response(op: &str, inner: &str) -> String {
-    envelope(&format!(
-        r#"<{op}Response xmlns="http://www.theyukicompany.com/"><{op}Result>{inner}</{op}Result></{op}Response>"#
-    ))
-}
 
 fn item(contact: &str, date: &str, open: &str, country: &str, method: &str) -> String {
     format!(
@@ -124,64 +107,22 @@ fn outstanding() -> String {
     response("OutstandingCreditorItems", &items.concat())
 }
 
-/// Serve the mock on a random port; returns the API root and the SOAP actions seen.
-fn mock_yuki() -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
-    let root = format!("http://{}/ws", listener.local_addr().expect("addr"));
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let log = Arc::clone(&seen);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let mut request_line = String::new();
-            reader.read_line(&mut request_line).ok();
-            let (mut action, mut length) = (String::new(), 0usize);
-            loop {
-                let mut header = String::new();
-                if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
-                    break;
-                }
-                let lower = header.to_ascii_lowercase();
-                if let Some(v) = lower.strip_prefix("content-length:") {
-                    length = v.trim().parse().unwrap_or(0);
-                } else if lower.starts_with("soapaction:") {
-                    action = header["soapaction:".len()..]
-                        .trim()
-                        .trim_matches('"')
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or_default()
-                        .to_string();
-                }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).ok();
-            let body = String::from_utf8_lossy(&body);
-            let reply = match action.as_str() {
-                "Authenticate" => response("Authenticate", "session-1"),
-                "SetCurrentDomain" => response("SetCurrentDomain", ""),
-                "OutstandingCreditorItems" => outstanding(),
-                "GLAccountTransactionsAndContact" => {
-                    let account = body
-                        .split("<yuki:GLAccountCode>")
-                        .nth(1)
-                        .and_then(|rest| rest.split('<').next())
-                        .unwrap_or_default();
-                    gl(account)
-                }
-                _ => response(&action, ""),
-            };
-            log.lock().expect("log").push(action);
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-                reply.len()
-            )
-            .ok();
+/// Serve the mock on a random port; returns the API root and the request log.
+fn mock() -> (String, RequestLog) {
+    mock_yuki(|action, body| match action {
+        "Authenticate" => response("Authenticate", "session-1"),
+        "SetCurrentDomain" => response("SetCurrentDomain", ""),
+        "OutstandingCreditorItems" => outstanding(),
+        "GLAccountTransactionsAndContact" => {
+            let account = body
+                .split("<yuki:GLAccountCode>")
+                .nth(1)
+                .and_then(|rest| rest.split('<').next())
+                .unwrap_or_default();
+            gl(account)
         }
-    });
-    (root, seen)
+        other => response(other, ""),
+    })
 }
 
 fn home_with_config(root: &str) -> TempDir {
@@ -210,7 +151,7 @@ bank_accounts = ["550000"]
 
 #[test]
 fn check_matches_labels_every_open_item_from_the_mocked_ledger() {
-    let (root, seen) = mock_yuki();
+    let (root, seen) = mock();
     let home = home_with_config(&root);
     let output = yuki(&home, &["check", "matches", "--output", "json"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -252,7 +193,12 @@ fn check_matches_labels_every_open_item_from_the_mocked_ledger() {
     assert_eq!(rows.len(), 7);
 
     assert!(stderr.contains("API calls made: 6"), "{stderr}");
-    let actions = seen.lock().expect("log").clone();
+    let actions: Vec<String> = seen
+        .lock()
+        .expect("log")
+        .iter()
+        .map(|r| r.action.clone())
+        .collect();
     assert_eq!(
         actions
             .iter()

@@ -6,19 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Added
-
-- **upload**: `upload dir <path>` uploads the receipts in a directory that are not in Yuki yet, tracked by content hash in `<path>/.yuki-sync.json`. Each upload is recorded as `pending` before it is sent, so an uncertain outcome is never retried silently. `--seed-from-yuki` records files Yuki already has; `upload mark` records one by hand.
-
-### Fixed
-
-- **yuki-client**: `SoapEnvelope::param` XML-escapes its value (`escape_text`). Requests time out (connect 15s, total 60s; uploads longer by size), `YukiError::delivery()` says whether a failed request may have been processed, and `ArchiveClient::documents_in_folder_all` reads a whole folder strictly.
-
 ### Breaking Changes
 
 - **accounts**: `accounts balance` now reports the balance at the end of `--period` (or today, if the period is still running) instead of at its start, and adds an `As Of` column with that date. Scripts reading the old start-of-period figure, or indexing columns, must adjust.
 - **yuki-client**: HTTP 401/403 is now `YukiError::Unauthorized(status)` instead of `AuthFailed("HTTP …")`; `AuthFailed` remains for authentication faults.
+- **contacts**: `contacts search` shows `HID`, `Code`, `City` and `VAT Number` columns (the fields an invoice template takes) between the existing ones; scripts indexing columns must adjust.
+- **invoices**: `invoices document` saves the linked file (under its own name, or `--out`) instead of printing its name and base64 glued into one column; its output is now `Transaction`, `Path`, `Bytes`.
+- **yuki-client**: `AccountingInfoClient::get_transaction_document` returns a parsed `TransactionDocument { file_name, data_base64 }` instead of the raw response.
+- **yuki-client**: `ContactClient::search_contacts` takes `(domain_id, option, value)`, `option` being one of the new `contact::SEARCH_OPTIONS`, and `get_suppliers_and_customers(_page)` takes `domain_id` first; `Contact` gains `code`, `hid`, `city` and `vat_number` and derives `Default`.
 - **yuki-client**: 0.3.0. `AccountingInfoClient::get_transaction_details` now takes `(administration_id, gl_account_code, start_date, end_date)` instead of a transaction ID, because `GetTransactionDetails` has no transaction-ID parameter; `TransactionDetail` gains `contact_name`.
+
+### Added
+
+- **upload**: `upload dir <path>` uploads the receipts in a directory that are not in Yuki yet, tracked by content hash in `<path>/.yuki-sync.json`. Each upload is recorded as `pending` before it is sent, so an uncertain outcome is never retried silently. `--seed-from-yuki` records files Yuki already has; `upload mark` records one by hand.
+- **sales**: `sales invoice create` creates a sales invoice through `ProcessSalesInvoices`, from a TOML file (`--file`) or a saved per-customer template (`--template`, in `~/.config/yuki/invoices/`). It is a draft in "To be sent" by default; `--send email|peppol|both` books and sends it. A preview (customer, lines, net, VAT, gross, mode) is confirmed at a prompt, `--yes` is required off a terminal, and `--dry-run` prints the preview and the `xmlDoc` without any API call. Exits 1 with kind `invoice_rejected` when Yuki fails or skips the invoice. `sales invoice templates` lists the templates, each validated. `pdf = "..."` in the file, or `--pdf`, sends your own PDF as `DocumentFileName`/`DocumentBase64`, which Yuki stores instead of its generated invoice (checked for the `%PDF-` header, at most 3 MB for Yuki's request limit, `.pdf` appended to a name without it; not allowed in a template, which is reused every month; the dry run shows its size instead of the base64, and the result names it in a `PDF` column). A request that went out without a usable answer exits 1 with kind `outcome_unknown`, warning that the invoice may already exist in Yuki.
+- **sales**: `sales invoice create --book` books without sending. `--number <REF>` sets the invoice number (`Reference`), and `--number auto` takes one past the highest `<year>-<seq>` in the sales archive's file names for the invoice date's year; a number the archive has is refused. A custom PDF now needs `--send` or `--book`, since Yuki rejects one on a draft ("When supplying a document process must be set to true"), and `--number`, the number printed on it. `sales invoice prepare` prints the fully resolved invoice as JSON (number, ISO and Dutch dates, customer, lines, totals per rate as the CLI computes them, Belgian structured payment reference) for rendering a PDF; it ignores any `pdf`. `--number` needs `--send` or `--book`; with `--pdf` it must be the explicit number `prepare` printed, with `--date`, and Yuki stores the PDF as `Invoice <number>.pdf`. Numbers given out are kept in a local ledger (`invoice-numbers.json`, written atomically under a lock): pending before the call, then booked or rejected; one left pending by an unknown outcome stays taken until `sales invoice numbers --resolve <n> booked|rejected`. `auto` takes one past the highest of the archive (only `Invoice`/`Factuur <year>-<seq>.pdf`, read for the invoice year after SetCurrentDomain) and the ledger. Lines take `remarks` (sent as `InvoiceLine/Remarks`) and `unit` (prepare only). The preview warns when VAT rounded per line would differ, and `--quiet --yes` still prints a one-line booking notice.
+- **documents**: `documents download <id> [--out PATH]` saves an archive document's file (`DocumentBinaryData`), named after its archive file name (`FindDocument`) unless `--out` names a file; it never overwrites. `ArchiveClient::find_document` and `document_binary_data` back it.
+- **yuki-client**: `SalesClient::process_sales_invoices` and `SalesInvoicesImport`, which read the import response whether Yuki sends it as elements or as escaped text; `SoapEnvelope::param_xml` for raw-XML (`s:any`) parameters.
+
+### Fixed
+
+- **yuki-client**: `SoapEnvelope::param` XML-escapes its value (`escape_text`). Requests time out (connect 15s, total 60s; uploads longer by size), `YukiError::delivery()` says whether a failed request may have been processed, and `ArchiveClient::documents_in_folder_all` reads a whole folder strictly.
+- **contacts**: `contacts search` returned every contact whatever the query, because it sent a `searchQuery` parameter `SearchContacts` does not have. It now sends the schema's `searchOption`, `searchValue`, `sortOrder`, `modifiedAfter` (as `xsi:nil`), `active` and `pageNumber`, searches all fields by default or the one `--by` names, includes inactive contacts, and follows pagination.
+- **contacts**: `contacts search` and `contacts list` ignored `--admin` and read the key's default administration; they now send its `domainID`. Both listings stop at a page whose first contact repeats, and after 50 pages (5000 contacts) with a warning, so a listing always ends. `SoapEnvelope::nil_param` sends such nillable parameters.
+- **sales**: `sales items` now honours `--region`, `--base-url` and their environment variables, like every other command.
 
 ## [0.1.13](https://github.com/rvben/yuki-cli/compare/v0.1.12...v0.1.13) - 2026-09-28
 

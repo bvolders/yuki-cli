@@ -1,3 +1,8 @@
+use std::path::{Path, PathBuf};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
 use crate::client::archive::ArchiveClient;
 use crate::config::Config;
 use crate::error::YukiError;
@@ -262,6 +267,111 @@ fn shift_days(date: &str, days: i32) -> String {
 fn date_in_range(doc_date: &str, filter_start: &str, filter_end: &str) -> bool {
     let normalized = doc_date.split('T').next().unwrap_or(doc_date);
     normalized >= filter_start && normalized <= filter_end
+}
+
+/// Save archive document `id` to `out`, or under its own file name.
+///
+/// FindDocument supplies the name only when `out` does not name a file.
+pub async fn download(
+    config: &Config,
+    admin: Option<&str>,
+    id: &str,
+    out: Option<&str>,
+    format: Option<&str>,
+    quiet: bool,
+) -> Result<(), YukiError> {
+    let target = config.target(admin)?;
+    let mut client = ArchiveClient::new().with_api_root(target.api_root);
+    client.authenticate(target.api_key).await?;
+    let name = match out {
+        Some(out) if !Path::new(out).is_dir() => String::new(),
+        _ => {
+            client
+                .find_document(id)
+                .await?
+                .ok_or_else(|| YukiError::NotFound(format!("document {id}")))?
+                .file_name
+        }
+    };
+    let data = client.document_binary_data(id).await?;
+    let path = save_file(&decode_base64(&data)?, &name, id, out)?;
+    print_saved("Document", id, &path, format, quiet)
+}
+
+/// Decode base64 as Yuki sends it, line breaks included.
+pub(crate) fn decode_base64(text: &str) -> Result<Vec<u8>, YukiError> {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    BASE64
+        .decode(compact)
+        .map_err(|e| YukiError::Xml(format!("the document is not valid base64: {e}")))
+}
+
+/// Where a downloaded file goes: `out` itself, `name` inside the directory
+/// `out`, or `name` in the working directory. Only `name`'s last component
+/// is used, so a name from Yuki cannot point outside that directory; a
+/// missing name falls back to `fallback`.
+pub(crate) fn output_path(name: &str, fallback: &str, out: Option<&str>) -> PathBuf {
+    let file = Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string());
+    match out {
+        Some(out) if Path::new(out).is_dir() => Path::new(out).join(file),
+        Some(out) => PathBuf::from(out),
+        None => PathBuf::from(file),
+    }
+}
+
+/// Write `bytes` to [`output_path`], never over an existing file.
+pub(crate) fn save_file(
+    bytes: &[u8],
+    name: &str,
+    fallback: &str,
+    out: Option<&str>,
+) -> Result<PathBuf, YukiError> {
+    use std::io::Write as _;
+    let path = output_path(name, fallback, out);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| {
+            let hint = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                "; remove it or pass --out"
+            } else {
+                ""
+            };
+            YukiError::Config(format!("{}: {e}{hint}", path.display()))
+        })?;
+    file.write_all(bytes)
+        .map_err(|e| YukiError::Config(format!("{}: {e}", path.display())))?;
+    Ok(path)
+}
+
+/// Report a saved file as one row: what it came from, its path and size.
+pub(crate) fn print_saved(
+    kind: &str,
+    id: &str,
+    path: &Path,
+    format: Option<&str>,
+    quiet: bool,
+) -> Result<(), YukiError> {
+    if quiet {
+        return Ok(());
+    }
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let headers = vec![kind.to_string(), "Path".into(), "Bytes".into()];
+    let rows = vec![vec![
+        id.to_string(),
+        path.display().to_string(),
+        bytes.to_string(),
+    ]];
+    match OutputFormat::from_flag(format, is_tty()) {
+        OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
+        OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
