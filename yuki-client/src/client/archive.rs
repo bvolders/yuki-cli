@@ -66,6 +66,11 @@ impl ArchiveClient {
         self
     }
 
+    /// SOAP requests sent so far in this process (see [`SoapClient::calls`]).
+    pub fn calls(&self) -> usize {
+        self.soap.calls()
+    }
+
     /// The endpoint this client posts to.
     pub fn base_url(&self) -> &str {
         self.soap.base_url()

@@ -6,7 +6,6 @@
 //! left. Anything else (a timeout, a server fault, a crash) leaves it pending,
 //! which is never retried automatically.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +13,6 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use crate::client::accounting::AccountingClient;
 use crate::client::archive::{ArchiveClient, ArchiveDocument};
 use crate::config::Config;
 use crate::error::{Delivery, YukiError};
@@ -359,10 +357,6 @@ fn capitalise(s: &str) -> String {
         .unwrap_or_default()
 }
 
-fn bump(calls: &Cell<usize>) {
-    calls.set(calls.get() + 1);
-}
-
 fn outcome(parts: Vec<String>) -> Outcome {
     if parts.is_empty() {
         Outcome::Done
@@ -385,10 +379,10 @@ pub async fn dir(
     format: Option<&str>,
     quiet: bool,
 ) -> Result<Outcome, YukiError> {
-    let calls = Cell::new(0);
-    let result = run_dir(load_config, admin, &opts, confirm, format, quiet, &calls).await;
+    let before = ArchiveClient::new().calls();
+    let result = run_dir(load_config, admin, &opts, confirm, format, quiet).await;
     if !quiet {
-        eprintln!("API calls made: {}", calls.get());
+        eprintln!("API calls made: {}", ArchiveClient::new().calls() - before);
     }
     result
 }
@@ -400,7 +394,6 @@ async fn run_dir(
     confirm: Confirm,
     format: Option<&str>,
     quiet: bool,
-    calls: &Cell<usize>,
 ) -> Result<Outcome, YukiError> {
     folder_id(opts.folder)?;
     for f in opts.seed_folders {
@@ -449,17 +442,7 @@ async fn run_dir(
         return Ok(Outcome::Done);
     }
     if opts.seed {
-        return seed(
-            load_config,
-            admin,
-            plan,
-            opts,
-            confirm,
-            format,
-            quiet,
-            calls,
-        )
-        .await;
+        return seed(load_config, admin, plan, opts, confirm, format, quiet).await;
     }
 
     let batch: Vec<Found> = plan.queue.iter().take(opts.max).cloned().collect();
@@ -493,7 +476,6 @@ async fn run_dir(
     let target = config.target(admin)?;
     let fid = folder_id(opts.folder)?;
     let mut client = ArchiveClient::new().with_api_root(target.api_root);
-    bump(calls);
     client.authenticate(target.api_key).await?;
     plan.refresh_moved();
 
@@ -540,7 +522,6 @@ async fn run_dir(
         if !quiet {
             eprint!("[{}/{}] {} ... ", i + 1, batch.len(), file.rel);
         }
-        bump(calls);
         let result = client
             .upload_document(target.admin_id, name, &BASE64.encode(&bytes), fid)
             .await;
@@ -685,13 +666,11 @@ fn possible_match(name: &str, doc: &ArchiveDocument) -> Option<&'static str> {
 async fn fetch_folder(
     client: &ArchiveClient,
     folder: &str,
-    calls: &Cell<usize>,
 ) -> Result<Vec<ArchiveDocument>, YukiError> {
     let fid = folder_id(folder)?;
     let mut docs = Vec::new();
     let mut seen = HashSet::new();
     for _ in 0..SEED_MAX_PAGES {
-        bump(calls);
         // From DateTime.MinValue, which the WSDL documents (for
         // SearchDocuments) as "all years": a document without a date is not
         // left out. Pages advance by what came back and end only with an
@@ -740,7 +719,6 @@ async fn seed(
     confirm: Confirm,
     format: Option<&str>,
     quiet: bool,
-    calls: &Cell<usize>,
 ) -> Result<Outcome, YukiError> {
     let candidates: Vec<&Found> = plan.queue.iter().chain(&plan.pending).collect();
     if candidates.is_empty() {
@@ -754,21 +732,16 @@ async fn seed(
     }
 
     let config = load_config()?;
-    let target = config.target(admin)?;
     // DocumentsInFolder takes no administration: it reads the session's
     // current domain, so select it first.
-    let mut accounting = AccountingClient::new().with_api_root(target.api_root);
-    bump(calls);
-    accounting.authenticate(target.api_key).await?;
-    bump(calls);
-    accounting.set_current_domain(target.domain_id).await?;
+    let (accounting, target) = crate::cli::setup_domain(&config, admin).await?;
     let session = accounting.session_id().unwrap_or_default();
     let client = ArchiveClient::new()
         .with_api_root(target.api_root)
         .with_session(session);
     let mut docs: Vec<(String, ArchiveDocument)> = Vec::new();
     for folder in seed_folders(opts) {
-        let found = fetch_folder(&client, &folder, calls).await?;
+        let found = fetch_folder(&client, &folder).await?;
         docs.extend(found.into_iter().map(|d| (folder.clone(), d)));
     }
 

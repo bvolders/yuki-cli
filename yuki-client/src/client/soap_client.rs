@@ -1,6 +1,8 @@
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::Client;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::error::YukiError;
 
@@ -79,11 +81,18 @@ pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// How long one SOAP request may take in total, unless the call says otherwise.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Requests sent by every transport in this process, counted by [`SoapClient::calls`].
+fn process_calls() -> Arc<AtomicUsize> {
+    static CALLS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    Arc::clone(CALLS.get_or_init(Arc::default))
+}
+
 /// HTTP transport client for the Yuki SOAP API.
 pub struct SoapClient {
     http: Client,
     base_url: String,
     pub(super) session_id: Option<String>,
+    calls: Arc<AtomicUsize>,
 }
 
 impl SoapClient {
@@ -108,7 +117,14 @@ impl SoapClient {
             http,
             base_url: base_url.to_string(),
             session_id: None,
+            calls: process_calls(),
         }
+    }
+
+    /// SOAP requests sent so far by every transport in this process, so
+    /// clients that share a session through `with_session` count together.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
     }
 
     pub fn with_session(mut self, session_id: &str) -> Self {
@@ -158,6 +174,7 @@ impl SoapClient {
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
         }
+        self.calls.fetch_add(1, Ordering::Relaxed);
         let response = request.send().await?;
 
         let status = response.status();
