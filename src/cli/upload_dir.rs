@@ -280,6 +280,23 @@ fn plan(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
     })
 }
 
+/// Under the lock: create the state file on a first run, so a concurrent run
+/// on a directory above or below sees this tree as synced, then check again
+/// that no state file sits above or below. A state file created here is
+/// removed again when the check fails.
+fn claim_root(root: PathBuf, excludes: &[String]) -> Result<Plan, YukiError> {
+    let state_file = root.join(STATE_FILE);
+    let created = !state_file.exists();
+    if created {
+        State::default().save(&root)?;
+    }
+    let result = sync::sync_root(&root).and_then(|root| plan(root, excludes));
+    if result.is_err() && created {
+        let _ = std::fs::remove_file(&state_file);
+    }
+    result
+}
+
 /// Print the plan to stderr: counts, then the files that would be uploaded.
 fn print_plan(plan: &Plan, opts: &DirOptions<'_>) {
     eprintln!(
@@ -392,7 +409,11 @@ async fn run_dir(
     let root = sync::sync_root(Path::new(opts.path))?;
     // A dry run writes nothing, so it takes no lock.
     let _lock = (!opts.dry_run).then(|| Lock::acquire(&root)).transpose()?;
-    let mut plan = plan(root, opts.excludes)?;
+    let mut plan = if opts.dry_run {
+        plan(root, opts.excludes)?
+    } else {
+        claim_root(root, opts.excludes)?
+    };
     if !quiet {
         print_plan(&plan, opts);
     }
@@ -538,17 +559,30 @@ async fn run_dir(
                 }
                 entry.error = Some(e.to_string());
                 match &e {
-                    // Refused before anything was stored: undo the write-ahead
-                    // and stop, as every further call would be refused too.
-                    YukiError::AuthFailed(_) | YukiError::RateLimited => {
-                        match before {
-                            Some(b) => plan.state.files.insert(file.hash.clone(), b),
-                            None => plan.state.files.remove(&file.hash),
-                        };
-                        plan.state.save(&plan.root)?;
+                    // HTTP 401/403/429: refused before the request was
+                    // processed. Undo the write-ahead and stop, as every
+                    // further call would be refused too.
+                    YukiError::AuthFailed(m) if m.starts_with("HTTP ") => {
+                        undo(&mut plan, &file.hash, before)?;
                         rows.push(Row::new(&file.rel, "not-attempted").error(e.to_string()));
                         stop = Some(e);
                         continue;
+                    }
+                    YukiError::RateLimited => {
+                        undo(&mut plan, &file.hash, before)?;
+                        rows.push(Row::new(&file.rel, "not-attempted").error(e.to_string()));
+                        stop = Some(e);
+                        continue;
+                    }
+                    // Any other authentication fault (matched by keywords)
+                    // may have come after processing: it stays pending, and
+                    // the run stops.
+                    YukiError::AuthFailed(_) => {
+                        pending += 1;
+                        stop = Some(YukiError::AuthFailed(e.to_string()));
+                        Row::new(&file.rel, "pending")
+                            .error(e.to_string())
+                            .note(pending_note(&plan.root, &file.rel))
                     }
                     YukiError::Request(r) if r.is_connect() || r.is_builder() => {
                         failed += 1;
@@ -612,6 +646,15 @@ async fn run_dir(
     Ok(outcome(parts))
 }
 
+/// Put back the record `hash` had before its write-ahead.
+fn undo(plan: &mut Plan, hash: &str, before: Option<Entry>) -> Result<(), YukiError> {
+    match before {
+        Some(b) => plan.state.files.insert(hash.to_string(), b),
+        None => plan.state.files.remove(hash),
+    };
+    plan.state.save(&plan.root)
+}
+
 /// The folders `--seed-from-yuki` searches: the given ones, else the upload
 /// folder and `inkoop`, where Yuki files purchase documents once processed.
 fn seed_folders(opts: &DirOptions<'_>) -> Vec<String> {
@@ -662,18 +705,18 @@ async fn fetch_folder(
     let fid = folder_id(folder)?;
     let mut docs = Vec::new();
     let mut seen = HashSet::new();
-    for page_no in 0..SEED_MAX_PAGES {
+    for _ in 0..SEED_MAX_PAGES {
         bump(calls);
+        // From DateTime.MinValue, which the WSDL documents (for
+        // SearchDocuments) as "all years": a document without a date is not
+        // left out. Pages advance by what came back and end only with an
+        // empty page, in case Yuki returns fewer records than asked.
         let page = client
-            .documents_in_folder_page(
-                fid,
-                "2000-01-01",
-                "2099-12-31",
-                SEED_PAGE_SIZE,
-                page_no * SEED_PAGE_SIZE,
-            )
+            .documents_in_folder_page(fid, "0001-01-01", "9999-12-31", SEED_PAGE_SIZE, docs.len())
             .await?;
-        let full = page.len() == SEED_PAGE_SIZE;
+        if page.is_empty() {
+            return Ok(docs);
+        }
         for doc in page {
             if !seen.insert(doc.id.clone()) {
                 return Err(YukiError::Config(format!(
@@ -684,13 +727,10 @@ async fn fetch_folder(
             }
             docs.push(doc);
         }
-        if !full {
-            return Ok(docs);
-        }
     }
     Err(YukiError::Config(format!(
-        "folder {folder} holds more than {} documents, more than seeding reads; nothing recorded",
-        SEED_MAX_PAGES * SEED_PAGE_SIZE
+        "folder {folder} still had documents after {SEED_MAX_PAGES} pages, more than seeding \
+         reads; nothing recorded"
     )))
 }
 
@@ -945,8 +985,13 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
             if existing.is_some() {
                 state.files.remove(&hash);
             } else {
-                state.files.retain(|_, e| {
-                    let keep = e.path != rel;
+                // Only a record whose content is gone from the tree, the same
+                // rule `upload dir` uses to call a file changed: content that
+                // moved elsewhere keeps its record.
+                let scan = sync::scan(&root, &Excludes::new(&[])?)?;
+                let present: HashSet<&str> = scan.files.iter().map(|f| f.hash.as_str()).collect();
+                state.files.retain(|h, e| {
+                    let keep = e.path != rel || present.contains(h.as_str());
                     if !keep {
                         doc = doc.take().or(e.document_id.clone());
                     }

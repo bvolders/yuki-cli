@@ -130,6 +130,9 @@ pub struct State {
     /// Hash the `files` keys are made with.
     pub hash: String,
     pub files: BTreeMap<String, Entry>,
+    /// Top-level fields this version does not know, kept as they are.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl Default for State {
@@ -138,6 +141,7 @@ impl Default for State {
             version: STATE_VERSION,
             hash: "sha256".into(),
             files: BTreeMap::new(),
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -275,13 +279,17 @@ pub struct Excludes {
 }
 
 impl Excludes {
-    /// The defaults plus `extra`.
+    /// The defaults plus `extra`. A leading `./` and a trailing `/` are
+    /// dropped, and patterns are compared in Unicode NFC like the paths.
     pub fn new(extra: &[String]) -> Result<Self, YukiError> {
         let patterns = DEFAULT_EXCLUDES
             .iter()
             .map(|s| (*s).to_string())
-            .chain(extra.iter().cloned())
-            .map(|p| {
+            .chain(extra.iter().map(|p| {
+                let p = p.strip_prefix("./").unwrap_or(p);
+                p.strip_suffix('/').unwrap_or(p).nfc().collect()
+            }))
+            .map(|p: String| {
                 glob::Pattern::new(&p)
                     .map(|compiled| (p.clone(), compiled))
                     .map_err(|e| YukiError::Config(format!("invalid --exclude {p:?}: {e}")))
@@ -292,6 +300,8 @@ impl Excludes {
 
     /// The first pattern that excludes `rel` (a `/`-separated relative path).
     pub fn matching(&self, rel: &str) -> Option<&str> {
+        let rel: String = rel.nfc().collect();
+        let rel = rel.as_str();
         let options = glob::MatchOptions {
             case_sensitive: false,
             require_literal_separator: true,
@@ -528,6 +538,11 @@ mod tests {
         assert_eq!(ex.matching("2026/amazon/old/a.pdf"), None);
         assert_eq!(ex.matching("2026/x/scan.PNG"), Some("*.png"));
         assert_eq!(ex.matching("2026/bol-com/x.pdf"), None);
+        // Spelled as a path, as Unicode NFD, it still matches.
+        let spelled = Excludes::new(&["./2025/".into(), "cafe\u{301}".into()]).unwrap();
+        assert_eq!(spelled.matching("2025/a.pdf"), Some("2025"));
+        assert_eq!(spelled.matching("Caf\u{e9}/a.pdf"), Some("caf\u{e9}"));
+        assert_eq!(spelled.matching("cafe\u{301}/a.pdf"), Some("caf\u{e9}"));
         let deep = Excludes::new(&["2026/amazon/**".into()]).unwrap();
         assert_eq!(
             deep.matching("2026/amazon/old/a.pdf"),
@@ -540,6 +555,9 @@ mod tests {
     fn state_round_trips_and_keeps_unknown_fields() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::default();
+        state
+            .extra
+            .insert("note".into(), Value::String("kept".into()));
         let mut e = entry("a.pdf", Status::Pending);
         e.extra
             .insert("matched_transaction".into(), Value::String("t-1".into()));
@@ -548,6 +566,7 @@ mod tests {
         let text = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
         assert!(text.contains("\"matched_transaction\": \"t-1\""), "{text}");
         assert!(text.contains("\"status\": \"pending\""), "{text}");
+        assert!(text.contains("\"note\": \"kept\""), "{text}");
         let loaded = State::load(dir.path()).unwrap();
         assert_eq!(loaded, state);
         // An update keeps the unknown fields.

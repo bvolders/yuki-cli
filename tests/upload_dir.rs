@@ -3,7 +3,8 @@
 //! The mock answers Authenticate, SetCurrentDomain, UploadDocument and
 //! DocumentsInFolder. What an upload gets depends on its file name:
 //! - "broken": a generic SOAP fault (outcome unknown: stays pending),
-//! - "expire": an invalid-session fault (an authentication error; stops the run),
+//! - "expire": an invalid-session fault (stops the run; stays pending),
+//! - "denied": HTTP 401 (refused unprocessed: stops the run, nothing recorded),
 //! - "garbled": HTTP 502 without a SOAP fault (stays pending),
 //! - "hang": no answer at all, ever,
 //! - anything else: a new document ID.
@@ -149,6 +150,8 @@ fn serve(mut stream: TcpStream, log: &Log, uploads: &AtomicUsize) {
                 return;
             } else if name.contains("broken") {
                 (500, fault("Server was unable to process request."), entry)
+            } else if name.contains("denied") {
+                (401, "Unauthorized".to_string(), entry)
             } else if name.contains("expire") {
                 (500, fault("Invalid session ID"), entry)
             } else if name.contains("garbled") {
@@ -366,7 +369,8 @@ fn a_non_interactive_run_without_yes_refuses_before_any_call() {
         assert!(err.contains("\"kind\":\"confirmation_required\""), "{err}");
     }
     assert_eq!(calls(&seen), 0);
-    assert!(!dir.path().join(STATE).exists());
+    // The lock holder claimed the root with an empty state, and nothing more.
+    assert_eq!(state(dir.path())["files"].as_object().unwrap().len(), 0);
 }
 
 #[test]
@@ -482,6 +486,12 @@ fn a_killed_run_leaves_its_upload_pending_and_releases_the_lock() {
         stderr(&second)
     );
 
+    // The first run claimed the root at once: a run below it is refused.
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let below = run(&home, &sub, &["--yes"]);
+    assert!(stderr(&below).contains("run on"), "{}", stderr(&below));
+
     child.kill().expect("kill yuki");
     child.wait().expect("reap yuki");
     // The kernel released the lock; the pending upload is not retried.
@@ -538,6 +548,30 @@ fn a_renamed_or_moved_file_is_not_uploaded_again() {
     let st = state(dir.path());
     let files = st["files"].as_object().unwrap();
     assert_eq!(files.values().next().unwrap()["path"], "2026/copy.pdf");
+}
+
+#[test]
+fn forget_by_path_keeps_the_record_of_content_that_moved() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("a.pdf", "first")]);
+    assert!(run(&home, dir.path(), &["--yes"]).status.success());
+    // a.pdf is renamed to b.pdf, and a new a.pdf appears.
+    std::fs::rename(dir.path().join("a.pdf"), dir.path().join("b.pdf")).unwrap();
+    std::fs::write(dir.path().join("a.pdf"), "second").unwrap();
+
+    let forgot = mark(&home, &dir.path().join("a.pdf"), &["--forget"]);
+    assert!(forgot.status.success(), "{}", stderr(&forgot));
+    assert_eq!(json(&forgot)["items"][0]["Action"], "unchanged");
+    let out = run(&home, dir.path(), &["--yes"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(row(&out, "b.pdf")["Action"], "synced");
+    assert_eq!(row(&out, "a.pdf")["Action"], "uploaded");
+    assert_eq!(
+        uploads(&seen),
+        ["a.pdf", "a.pdf"],
+        "b.pdf is not uploaded again"
+    );
 }
 
 #[test]
@@ -612,23 +646,41 @@ fn max_caps_the_uploads_of_one_run() {
 }
 
 #[test]
-fn an_authentication_error_stops_the_run_and_undoes_its_write_ahead() {
+fn an_http_refusal_stops_the_run_and_undoes_its_write_ahead() {
     let (root, seen) = mock_yuki();
     let home = home_with_config(&root);
-    let dir = receipts(&[("a.pdf", "a"), ("b-expire.pdf", "b"), ("c.pdf", "c")]);
+    let dir = receipts(&[("a.pdf", "a"), ("b-denied.pdf", "b"), ("c.pdf", "c")]);
     let out = run(&home, dir.path(), &["--yes"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert_eq!(
         actions(&out),
         pairs(&[
             ("a.pdf", "uploaded"),
-            ("b-expire.pdf", "not-attempted"),
+            ("b-denied.pdf", "not-attempted"),
             ("c.pdf", "not-attempted"),
         ])
     );
-    assert_eq!(uploads(&seen), ["a.pdf", "b-expire.pdf"]);
-    assert!(entry_for(dir.path(), "b-expire.pdf").is_none());
+    assert_eq!(uploads(&seen), ["a.pdf", "b-denied.pdf"]);
+    assert!(entry_for(dir.path(), "b-denied.pdf").is_none());
     assert!(stderr(&out).contains("API calls made: 3"));
+}
+
+#[test]
+fn an_auth_fault_stops_the_run_but_stays_pending() {
+    let (root, seen) = mock_yuki();
+    let home = home_with_config(&root);
+    let dir = receipts(&[("b-expire.pdf", "b"), ("c.pdf", "c")]);
+    let out = run(&home, dir.path(), &["--yes"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(
+        actions(&out),
+        pairs(&[("b-expire.pdf", "pending"), ("c.pdf", "not-attempted")])
+    );
+    assert_eq!(uploads(&seen), ["b-expire.pdf"]);
+    assert_eq!(
+        entry_for(dir.path(), "b-expire.pdf").unwrap()["status"],
+        "pending"
+    );
 }
 
 #[test]
@@ -751,7 +803,8 @@ fn seeding_records_unique_name_matches_after_selecting_the_administration() {
     assert!(note("2026/vercel/2026-09-07_vercel_REF12345.pdf").contains("y-vercel"));
     let err = stderr(&out);
     assert!(err.contains("by file name only"), "{err}");
-    assert!(err.contains("API calls made: 5"), "{err}");
+    assert!(err.contains("API calls made: 6"), "{err}");
+    // Paging ends on an empty page, advancing by what each page held.
     assert_eq!(
         *seen.lock().unwrap(),
         [
@@ -760,6 +813,7 @@ fn seeding_records_unique_name_matches_after_selecting_the_administration() {
             "DocumentsInFolder 7 0",
             "DocumentsInFolder 1 0",
             "DocumentsInFolder 1 500",
+            "DocumentsInFolder 1 508",
         ]
     );
     let bol = entry_for(dir.path(), "2026/bol-com/2026-08-30_bol-com_111.pdf").unwrap();
@@ -790,7 +844,7 @@ fn seeding_records_nothing_when_paging_looks_wrong() {
         stderr(&out)
     );
     assert!(stderr(&out).contains("nothing recorded"));
-    assert!(!dir.path().join(STATE).exists());
+    assert_eq!(state(dir.path())["files"].as_object().unwrap().len(), 0);
     assert_eq!(calls(&seen), 4);
 }
 
