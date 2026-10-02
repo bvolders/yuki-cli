@@ -7,7 +7,6 @@
 //! which is never retried automatically.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -304,10 +303,7 @@ fn go_ahead(confirm: Confirm, what: &str, quiet: bool) -> Option<Outcome> {
              or --dry-run to only see the plan"
         ))),
         Confirm::Prompt => {
-            eprint!("Go ahead and {what}? [y/N] ");
-            let _ = std::io::stderr().flush();
-            let answer = crate::cli::init::next_line(&mut std::io::stdin().lock());
-            if matches!(answer.as_deref(), Some("y" | "Y" | "yes" | "Yes")) {
+            if crate::cli::ask_yes_no(&format!("Go ahead and {what}?")) {
                 return None;
             }
             if !quiet {

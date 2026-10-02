@@ -456,24 +456,6 @@ fn the_preview_states_customer_lines_totals_and_mode() {
 }
 
 #[test]
-fn only_an_explicit_yes_confirms() {
-    for (answer, confirmed) in [
-        ("y\n", true),
-        ("YES\n", true),
-        (" yes \n", true),
-        ("\n", false),
-        ("n\n", false),
-        ("yep\n", false),
-        ("", false),
-    ] {
-        let mut prompt = Vec::new();
-        let got = ask("Create?", &mut answer.as_bytes(), &mut prompt).unwrap();
-        assert_eq!(got, confirmed, "{answer:?}");
-        assert_eq!(String::from_utf8(prompt).unwrap(), "Create? [y/N] ");
-    }
-}
-
-#[test]
 fn malformed_dates_and_terms_are_rejected() {
     for bad in ["2026-1-012", "+026-01-01", "2026-+2-01", "2026/10/01"] {
         assert!(parse_date(bad).is_err(), "{bad:?}");

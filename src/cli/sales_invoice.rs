@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -1592,39 +1591,6 @@ pub fn check_confirm(
     Err(InvoiceError::ConfirmationRequired(refused))
 }
 
-/// Whether a confirmation prompt can be asked and answered.
-pub fn can_prompt() -> bool {
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
-}
-
-/// Ask `question` on stderr and read the answer from stdin.
-pub fn confirm(question: &str) -> Result<bool, YukiError> {
-    ask(
-        question,
-        &mut std::io::stdin().lock(),
-        &mut std::io::stderr(),
-    )
-}
-
-/// Ask `question`; only `y` or `yes` confirms, so an empty line or end of
-/// input declines.
-fn ask(
-    question: &str,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> Result<bool, YukiError> {
-    let _ = write!(output, "{question} [y/N] ");
-    let _ = output.flush();
-    let mut answer = String::new();
-    input
-        .read_line(&mut answer)
-        .map_err(|e| YukiError::Config(format!("cannot read the answer: {e}")))?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
 /// Send the invoice to Yuki and print Yuki's answer per invoice.
 ///
 /// Returns the import so the caller can fail the run when an invoice was
@@ -1993,12 +1959,12 @@ pub async fn create(
         eprintln!("{line}");
     }
     if !yes {
-        if !can_prompt() {
+        if !crate::cli::can_prompt() {
             return Err(InvoiceError::ConfirmationRequired(
                 "sales invoice create writes to Yuki; pass --yes to confirm in non-interactive mode, or --dry-run to preview only".into(),
             ));
         }
-        if !confirm(&invoice.question())? {
+        if !crate::cli::ask_yes_no(&invoice.question()) {
             return Err(InvoiceError::ConfirmationRequired(
                 "not confirmed: nothing was sent to Yuki".into(),
             ));

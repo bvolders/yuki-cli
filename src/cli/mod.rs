@@ -31,6 +31,35 @@ pub fn interactive() -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
+/// [`interactive`], and stderr a terminal too, so the question is seen:
+/// for a booking, which must not be confirmed blind.
+pub fn can_prompt() -> bool {
+    interactive() && std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// Ask `question` on stderr, `[y/N]`, and read the answer from stdin.
+pub fn ask_yes_no(question: &str) -> bool {
+    ask_yes_no_on(
+        question,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// [`ask_yes_no`] on `input` and `output`: only `y` or `yes`, in any case,
+/// confirms, so an empty line, end of input or a read error declines.
+pub fn ask_yes_no_on(
+    question: &str,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> bool {
+    let _ = write!(output, "{question} [y/N] ");
+    let _ = output.flush();
+    let mut answer = String::new();
+    input.read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 /// Authenticate a client and set the active administration domain.
 ///
 /// Returns both the configured client and the resolved `Target` so callers can pass
@@ -959,6 +988,24 @@ pub enum UploadCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_explicit_yes_confirms() {
+        for (answer, confirmed) in [
+            ("y\n", true),
+            ("YES\n", true),
+            (" yes \n", true),
+            ("\n", false),
+            ("n\n", false),
+            ("yep\n", false),
+            ("", false),
+        ] {
+            let mut prompt = Vec::new();
+            let got = ask_yes_no_on("Create?", &mut answer.as_bytes(), &mut prompt);
+            assert_eq!(got, confirmed, "{answer:?}");
+            assert_eq!(String::from_utf8(prompt).unwrap(), "Create? [y/N] ");
+        }
+    }
 
     fn endpoint(args: &[&str], env: &[(&str, &str)]) -> Result<RunEndpoint, clap::Error> {
         let env: Vec<(&str, OsString)> = env.iter().map(|(k, v)| (*k, (*v).into())).collect();
