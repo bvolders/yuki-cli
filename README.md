@@ -383,8 +383,12 @@ to one prepared invoice:
 After a booking, the `Reference` Yuki returns is compared with the number
 sent (`2026-020` counts as `2026-20`). When it differs, or is missing, the
 command exits 1 with kind `reference_mismatch` and a `REFERENCE MISMATCH`
-message, even with `--quiet`; the number stays pending in the ledger with a
-note naming both, until you check Sales in Yuki and resolve it.
+message, even with `--quiet`, which says whether an email was requested and
+reported sent and whether Peppol was requested. The number stays pending in
+the ledger with a note naming both numbers. Correct the booking in Sales in
+Yuki, then settle ours: `--resolve <number> booked` if the customer may have
+the invoice under it (emailed, or sent over Peppol), else `--resolve <number>
+rejected` to free it.
 
 A reservation that will not be sent is freed with
 `yuki sales invoice numbers --release <number>` (or `--resolve <number>

@@ -1043,7 +1043,13 @@ fn the_reference_yuki_booked_must_be_the_number_sent() {
     for (reference, shown) in [("2026-21", "reference 2026-21"), ("", "no reference")] {
         match verdict(&import_of(reference, true, false), &inv) {
             Verdict::ReferenceMismatch(m) => {
-                assert!(m.contains(&format!("with {shown}, not 2026-20")), "{m}")
+                assert!(m.contains(&format!("with {shown}, not 2026-20")), "{m}");
+                assert!(
+                    m.contains("Email: not requested. Peppol: not requested."),
+                    "{m}"
+                );
+                assert!(m.contains("--resolve 2026-20 booked"), "{m}");
+                assert!(m.contains("--resolve 2026-20 rejected"), "{m}");
             }
             other => panic!("{reference}: {other:?}"),
         }
