@@ -73,7 +73,7 @@ fn to_entries(admins: &[Administration]) -> BTreeMap<String, AdminEntry> {
 }
 
 /// The next line of `input`, trimmed; `None` at end of input.
-fn next_line(input: &mut impl BufRead) -> Option<String> {
+pub(crate) fn next_line(input: &mut impl BufRead) -> Option<String> {
     let mut line = String::new();
     match input.read_line(&mut line) {
         Ok(0) | Err(_) => None,

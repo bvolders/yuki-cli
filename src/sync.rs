@@ -35,7 +35,7 @@ pub const EXTENSIONS: &[&str] = &["pdf", "jpg", "jpeg", "png"];
 pub const DEFAULT_EXCLUDES: &[&str] = &["_to_delete", ".*"];
 
 /// What is known about one file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Status {
     /// Uploaded by `upload dir`.
@@ -50,6 +50,7 @@ pub enum Status {
     /// Written before every upload and replaced once Yuki answers, so a
     /// crash, a kill or a timeout leaves it. Never retried automatically:
     /// resolve it with `upload mark` or seeding.
+    #[default]
     Pending,
 }
 
@@ -71,7 +72,7 @@ impl Status {
 }
 
 /// One file's record, keyed in [`State::files`] by its sha256.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     /// Path relative to the root, `/`-separated, as last seen.
     pub path: String,
@@ -102,18 +103,7 @@ impl Entry {
     /// The existing record of `hash` updated to `status` for a file at `rel`,
     /// or a fresh one; unknown fields are kept.
     pub fn update(state: &State, hash: &str, rel: &str, size: u64, status: Status) -> Self {
-        let mut e = state.files.get(hash).cloned().unwrap_or_else(|| Self {
-            path: String::new(),
-            size,
-            status,
-            document_id: None,
-            folder: None,
-            uploaded_at: None,
-            recorded_at: String::new(),
-            error: None,
-            note: None,
-            extra: BTreeMap::new(),
-        });
+        let mut e = state.files.get(hash).cloned().unwrap_or_default();
         e.path = rel.to_string();
         e.size = size;
         e.status = status;
@@ -277,7 +267,7 @@ pub fn now_utc() -> String {
 }
 
 fn rfc3339_utc(epoch_secs: i64) -> String {
-    let date = crate::period::date_from_epoch_days(epoch_secs.div_euclid(86_400));
+    let date = crate::period::date_at(epoch_secs, 0);
     let s = epoch_secs.rem_euclid(86_400);
     format!(
         "{date}T{:02}:{:02}:{:02}Z",
@@ -294,7 +284,7 @@ fn rfc3339_utc(epoch_secs: i64) -> String {
 /// `*.png` skips every PNG. A pattern with `/` is matched against the whole
 /// relative path, where `*` stays within one component and `**` crosses them.
 pub struct Excludes {
-    patterns: Vec<(String, glob::Pattern)>,
+    patterns: Vec<glob::Pattern>,
 }
 
 impl Excludes {
@@ -310,7 +300,6 @@ impl Excludes {
             }))
             .map(|p: String| {
                 glob::Pattern::new(&p)
-                    .map(|compiled| (p.clone(), compiled))
                     .map_err(|e| YukiError::Config(format!("invalid --exclude {p:?}: {e}")))
             })
             .collect::<Result<_, _>>()?;
@@ -328,15 +317,15 @@ impl Excludes {
         };
         self.patterns
             .iter()
-            .find(|(raw, pattern)| {
-                if raw.contains('/') {
+            .find(|pattern| {
+                if pattern.as_str().contains('/') {
                     pattern.matches_with(rel, options)
                 } else {
                     rel.split('/')
                         .any(|part| pattern.matches_with(part, options))
                 }
             })
-            .map(|(raw, _)| raw.as_str())
+            .map(glob::Pattern::as_str)
     }
 }
 

@@ -562,7 +562,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     use yuki_cli::cli::upload_dir::{Confirm, DirOptions, Outcome};
                     let confirm = if cli.yes {
                         Confirm::Yes
-                    } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    } else if yuki_cli::cli::interactive() {
                         Confirm::Prompt
                     } else {
                         Confirm::Refuse
@@ -581,7 +581,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?
                     {
-                        Outcome::Done | Outcome::Aborted => {}
+                        Outcome::Done => {}
                         Outcome::NeedsConfirmation(message) => {
                             return Err(AppError::ConfirmationRequired(message));
                         }
@@ -630,7 +630,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     currency,
                 } => {
                     // Require explicit confirmation for non-interactive uploads.
-                    if !is_tty() && !cli.yes {
+                    if !yuki_cli::cli::interactive() && !cli.yes {
                         return Err(AppError::ConfirmationRequired(
                             "upload file is a mutating operation; pass --yes to confirm in non-interactive mode".into(),
                         ));

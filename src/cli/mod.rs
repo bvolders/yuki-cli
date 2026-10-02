@@ -22,6 +22,12 @@ use crate::client::accounting::AccountingClient;
 use crate::config::{Config, Target};
 use crate::error::YukiError;
 
+/// Whether a confirmation can be asked: stdin is a terminal to answer on.
+/// Without one, a mutating command needs `--yes`.
+pub fn interactive() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin())
+}
+
 /// Authenticate a client and set the active administration domain.
 ///
 /// Returns both the configured client and the resolved `Target` so callers can pass
