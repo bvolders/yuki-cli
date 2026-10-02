@@ -121,7 +121,7 @@ pub async fn missing(
         .map(|(_, g)| {
             g.payments
                 .iter()
-                .map(|p| parse_fx(&p.description, cents(&p.open_amount)))
+                .map(|p| parse_fx(&p.description, cents(&p.amount)))
                 .collect()
         })
         .collect();
@@ -135,7 +135,7 @@ pub async fn missing(
                 supplier: name,
                 description: &p.description,
                 date: &p.date,
-                eur: cents(&p.open_amount).abs(),
+                eur: cents(&p.amount).abs(),
                 fx: fx.as_ref(),
             })
         })
@@ -258,7 +258,9 @@ pub async fn missing(
                 receipts::RECEIPTS_LOG
             ));
         }
-        if !l.has_sync_state {
+        if let Some(e) = &l.state_error {
+            notes.push(format!("uploads not shown: {e}"));
+        } else if !l.has_sync_state {
             notes.push(format!("no {}: uploads not shown", crate::sync::STATE_FILE));
         }
     }
@@ -323,6 +325,12 @@ mod tests {
             amount: open.into(),
             open_amount: open.into(),
             type_id: type_id.into(),
+            type_name: if type_id.is_empty() {
+                "Creditcardbetaling"
+            } else {
+                "Aankoopfactuur"
+            }
+            .into(),
             ..Default::default()
         }
     }

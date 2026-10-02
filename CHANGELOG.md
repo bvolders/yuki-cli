@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Breaking Changes
 
+- **yuki-client**: `OutstandingItem` gains public fields (`id`, `type_name`, `type_id`, `reference`, `document_id`); code that builds one with a struct literal needs `..Default::default()`.
 - **accounts**: `accounts balance` now reports the balance at the end of `--period` (or today, if the period is still running) instead of at its start, and adds an `As Of` column with that date. Scripts reading the old start-of-period figure, or indexing columns, must adjust.
 - **yuki-client**: HTTP 401/403 is now `YukiError::Unauthorized(status)` instead of `AuthFailed("HTTP …")`; `AuthFailed` remains for authentication faults.
 - **contacts**: `contacts search` shows `HID`, `Code`, `City` and `VAT Number` columns (the fields an invoice template takes) between the existing ones; scripts indexing columns must adjust.

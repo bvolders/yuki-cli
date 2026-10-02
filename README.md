@@ -630,6 +630,9 @@ account only shows the monthly card settlement ("Afrekening kredietkaarten"),
 which is skipped, so a card purchase without an invoice is not reported.
 `check missing` does list them.
 
+`name` and the per-administration `api_key` are optional. An administration without
+its own key uses the shared one, so rotating the shared key keeps reaching it.
+
 ### `check missing`: payments Yuki has no invoice for
 
 `check missing` is Yuki's "Betalingen waarvan factuur nog ontbreekt" with
@@ -649,28 +652,33 @@ description states it (`Bedrag 20 USD`), `~20.00 USD` when worked out from its
 them as `suppliers` and `summary`.
 
 `--receipts <dir>` adds a `Local receipt` column. It is read only: nothing in
-the folder is written. Each file `upload dir` would take (not `_to_delete` or dot
-files) is a receipt of the vendor its folder is named after (`2026/vercel/…`),
+the folder is written. Each file `upload dir` would take (not `_to_delete` or
+dot files) is a receipt of the vendor its folder is named after
+(`2026/vercel/…`; a file at the top takes it from a `date_vendor_ref` name),
 dated by the `YYYY-MM-DD` its name starts with. A `receipts-log.csv` at the
-root, with `filename`, `amount`, `currency` and `invoice_date` columns, gives
-amounts. A receipt matches a payment of that vendor (its supplier name, or a
-word of the description for a catch-all supplier) within 5 days, when the
-amount is the same in EUR or in the card line's stated foreign currency (±1
-cent when worked out from the rate). When the amounts cannot be compared (no
-amount in the log, or a USD receipt for a line that states no USD amount) the
-match is labelled `vendor and date only`. Each receipt goes to one payment,
-amount matches before date-only ones, then the closest date. A
-`.yuki-sync.json` marks a file `upload dir` already uploaded as
-`uploaded, awaiting Yuki`: Yuki has it but has not booked it yet.
+root, with a `filename` column relative to the root and `amount`, `currency`
+and `invoice_date` columns, gives amounts and dates.
+
+A receipt matches a payment of its vendor within 5 days when the amount is the
+same: in EUR, or in the foreign currency the card line states, or works out
+from its rate (to within half a euro cent at that rate). The vendor is the
+payment's supplier; only when no receipt is that supplier's is it looked for
+in the description, as for a card line booked to a catch-all supplier. When
+the amounts cannot be compared (no amount in the log, or a USD receipt for a
+line that states no USD amount) the match is labelled `vendor and date only`.
+Each receipt goes to one payment: as many payments as possible get an amount
+match, then a date-only one, the closest date winning a tie.
+
+The `.yuki-sync.json` of the folder (or of the synced folder above it) labels a
+file `uploaded, awaiting Yuki` (Yuki has it but has not booked it), `already in
+Yuki`, `upload outcome unknown` or `skipped`. An unreadable state file only
+hides these labels.
 
 ```sh
 yuki check missing                              # every supplier, every date
 yuki check missing --period 2026-Q3 --contact vercel
 yuki check missing --receipts ~/Documents/Receipts -o json
 ```
-
-`name` and the per-administration `api_key` are optional. An administration without
-its own key uses the shared one, so rotating the shared key keeps reaching it.
 
 ## Development
 

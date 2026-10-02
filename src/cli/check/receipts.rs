@@ -28,9 +28,11 @@ pub(super) struct Fx {
     /// Absolute amount in the foreign currency's cents.
     pub(super) amount: Cents,
     pub(super) currency: String,
-    /// Worked out from the `Koers` rate rather than stated as `Bedrag`, so
-    /// off by a cent at most.
+    /// Worked out from the `Koers` rate rather than stated as `Bedrag`.
     pub(super) derived: bool,
+    /// How many foreign cents the amount may be off: half a euro cent at
+    /// the rate, plus one, for a derived amount; 0 for a stated one.
+    pub(super) slack: i64,
 }
 
 impl Fx {
@@ -41,9 +43,15 @@ impl Fx {
     }
 }
 
-/// A Belgian-notation amount such as `4,04` or `1.234,56`.
+/// An amount such as `4,04` or `1.234,56` (Belgian notation), or `4.04`
+/// when it has no comma.
 fn belgian_amount(text: &str, decimals: u32) -> Option<i64> {
-    parse_scaled(&text.replace('.', "").replace(',', "."), decimals).ok()
+    let text = if text.contains(',') {
+        text.replace('.', "").replace(',', ".")
+    } else {
+        text.to_string()
+    };
+    parse_scaled(&text, decimals).ok()
 }
 
 fn is_currency(word: &str) -> bool {
@@ -63,6 +71,7 @@ pub(super) fn parse_fx(description: &str, eur: Cents) -> Option<Fx> {
                 amount: Cents(cents.abs()),
                 currency: w[2].to_string(),
                 derived: false,
+                slack: 0,
             });
         }
     }
@@ -73,14 +82,16 @@ pub(super) fn parse_fx(description: &str, eur: Cents) -> Option<Fx> {
         return None;
     }
     let rate = belgian_amount(rate, RATE_DECIMALS)?;
-    let amount = div_round(
-        i128::from(eur.abs().0) * i128::from(rate),
-        10_i128.pow(RATE_DECIMALS),
-    );
+    let scale = 10_i128.pow(RATE_DECIMALS);
+    let amount = div_round(i128::from(eur.abs().0) * i128::from(rate), scale);
+    // The EUR amount is rounded to the cent, so the foreign one is known to
+    // half a cent times the rate.
+    let slack = div_round(i128::from(rate), 2 * scale) + 1;
     Some(Fx {
         amount: Cents(amount as i64),
         currency,
         derived: true,
+        slack: slack as i64,
     })
 }
 
@@ -121,7 +132,8 @@ fn csv_fields(line: &str) -> Vec<String> {
     fields
 }
 
-/// The log's rows by `filename`, when it has that column. `amount` and
+/// The log's rows by `filename` (as [`sync::name_key`]: NFC, lowercase),
+/// when it has that column. `amount` (dot or Belgian comma decimals) and
 /// `currency` (EUR when absent) and `invoice_date` are read when present.
 fn read_log(text: &str) -> HashMap<String, LogRow> {
     let mut lines = text.lines();
@@ -150,7 +162,8 @@ fn read_log(text: &str) -> HashMap<String, LogRow> {
             continue;
         };
         let amount = get(amount_col)
-            .and_then(|a| Cents::parse_exact(a).ok())
+            .and_then(|a| belgian_amount(a, 2))
+            .map(Cents)
             .map(|a| {
                 let currency = get(currency_col).unwrap_or("EUR").to_uppercase();
                 (a.abs(), currency)
@@ -158,7 +171,7 @@ fn read_log(text: &str) -> HashMap<String, LogRow> {
         let date = get(date_col)
             .filter(|d| epoch_days(d).is_some())
             .map(str::to_string);
-        rows.insert(file.to_string(), (date, amount));
+        rows.insert(sync::name_key(file), (date, amount));
     }
     rows
 }
@@ -178,6 +191,8 @@ pub(super) struct Receipts {
     pub(super) has_amounts: bool,
     /// Whether a `.yuki-sync.json` was read.
     pub(super) has_sync_state: bool,
+    /// Why the `.yuki-sync.json` found could not be read.
+    pub(super) state_error: Option<String>,
 }
 
 /// Read the receipts under `dir`: the files `upload dir` would take (so not
@@ -195,9 +210,12 @@ pub(super) fn load(dir: &Path) -> Result<Receipts, YukiError> {
             )));
         }
     };
-    let state = match sync::find_root(dir)? {
-        Some(root) => Some(sync::peek(&root)?),
-        None => None,
+    // An unreadable state only hides the upload marks; this command never
+    // writes it, so it is no reason to stop.
+    let (state, state_error) = match sync::find_root(dir)?.map(|root| sync::peek(&root)) {
+        Some(Ok(state)) => (Some(state), None),
+        Some(Err(e)) => (None, Some(e.to_string())),
+        None => (None, None),
     };
     let files = scan
         .files
@@ -212,8 +230,7 @@ pub(super) fn load(dir: &Path) -> Result<Receipts, YukiError> {
                 folder
             };
             let (log_date, amount) = log
-                .get(&found.rel)
-                .or_else(|| log.get(name))
+                .get(&sync::name_key(&found.rel))
                 .cloned()
                 .unwrap_or_default();
             Receipt {
@@ -231,6 +248,7 @@ pub(super) fn load(dir: &Path) -> Result<Receipts, YukiError> {
     Ok(Receipts {
         has_amounts: files.iter().any(|r| r.amount.is_some()),
         has_sync_state: state.is_some(),
+        state_error,
         files,
     })
 }
@@ -255,11 +273,14 @@ pub(super) enum Fit {
     VendorDate,
 }
 
-/// Whether the receipt's vendor is the payment's supplier, or named in its
-/// description (a card line booked to a catch-all contact).
-fn same_vendor(receipt: &Receipt, wanted: &Wanted<'_>) -> bool {
+/// Whether the receipt's vendor is the payment's supplier.
+fn supplier_vendor(receipt: &Receipt, wanted: &Wanted<'_>) -> bool {
     normalized_names_match(&receipt.vendor, &normalize_name(wanted.supplier))
-        || normalized_names_match(&receipt.vendor, &normalize_name(wanted.description))
+}
+
+/// Whether the receipt's vendor is named in the payment's description.
+fn description_vendor(receipt: &Receipt, wanted: &Wanted<'_>) -> bool {
+    normalized_names_match(&receipt.vendor, &normalize_name(wanted.description))
 }
 
 /// Whether the receipt's amount is the payment's, in EUR or in the
@@ -272,39 +293,104 @@ fn same_amount(receipt: &Receipt, wanted: &Wanted<'_>) -> Option<bool> {
         return Some(*amount == wanted.eur);
     }
     let fx = wanted.fx.filter(|fx| fx.currency == *currency)?;
-    let slack = if fx.derived { 1 } else { 0 };
-    Some((fx.amount.0 - amount.0).abs() <= slack)
+    Some((fx.amount.0 - amount.0).abs() <= fx.slack)
+}
+
+/// A payment's candidate receipts, closest date first.
+type Edges = Vec<Vec<(Fit, i64, usize)>>;
+
+/// Kuhn's augmenting path: give payment `w` a receipt of at most fit
+/// `limit[w]`, moving earlier payments to another of theirs if need be.
+fn augment(
+    w: usize,
+    edges: &Edges,
+    limit: &[Fit],
+    seen: &mut [bool],
+    owner: &mut [Option<usize>],
+    out: &mut [Option<(usize, Fit)>],
+) -> bool {
+    for &(fit, _, r) in &edges[w] {
+        if fit > limit[w] || seen[r] {
+            continue;
+        }
+        seen[r] = true;
+        if owner[r].is_none_or(|other| augment(other, edges, limit, seen, owner, out)) {
+            owner[r] = Some(w);
+            out[w] = Some((r, fit));
+            return true;
+        }
+    }
+    false
 }
 
 /// The receipt for each payment, or `None`: same vendor, date within
-/// [`RECEIPT_DAYS`], and the same amount when the two can be compared. Each
-/// receipt goes to one payment, amount matches first, then the closest date.
+/// [`RECEIPT_DAYS`], and the same amount when the two can be compared. The
+/// vendor is the payment's supplier; only when no receipt is that supplier's
+/// is it looked for in the description (a card line booked to a catch-all
+/// contact). Each receipt goes to one payment: as many payments as possible
+/// get an amount match, then as many of the rest as possible a date-only
+/// one, preferring the closest date.
 pub(super) fn assign(receipts: &[Receipt], wanted: &[Wanted<'_>]) -> Vec<Option<(usize, Fit)>> {
-    let mut candidates = Vec::new();
-    for (w, payment) in wanted.iter().enumerate() {
-        for (r, receipt) in receipts.iter().enumerate() {
-            let Some(date) = receipt.date.as_deref() else {
-                continue;
-            };
-            let days = days_apart(date, payment.date);
-            if days > RECEIPT_DAYS || !same_vendor(receipt, payment) {
-                continue;
-            }
-            let fit = match same_amount(receipt, payment) {
-                Some(true) => Fit::Amount,
-                Some(false) => continue,
-                None => Fit::VendorDate,
-            };
-            candidates.push((fit, days, w, r));
-        }
-    }
-    candidates.sort();
-    let mut taken = vec![false; receipts.len()];
+    let edges: Edges = wanted
+        .iter()
+        .map(|payment| {
+            let by_supplier = receipts.iter().any(|r| supplier_vendor(r, payment));
+            let mut list: Vec<(Fit, i64, usize)> = receipts
+                .iter()
+                .enumerate()
+                .filter_map(|(r, receipt)| {
+                    let days = days_apart(receipt.date.as_deref()?, payment.date);
+                    let vendor = if by_supplier {
+                        supplier_vendor(receipt, payment)
+                    } else {
+                        description_vendor(receipt, payment)
+                    };
+                    if days > RECEIPT_DAYS || !vendor {
+                        return None;
+                    }
+                    let fit = match same_amount(receipt, payment) {
+                        Some(true) => Fit::Amount,
+                        Some(false) => return None,
+                        None => Fit::VendorDate,
+                    };
+                    Some((fit, days, r))
+                })
+                .collect();
+            list.sort_by_key(|&(fit, days, r)| (days, fit, r));
+            list
+        })
+        .collect();
+    let mut owner = vec![None; receipts.len()];
     let mut out = vec![None; wanted.len()];
-    for (fit, _, w, r) in candidates {
-        if out[w].is_none() && !taken[r] {
-            out[w] = Some((r, fit));
-            taken[r] = true;
+    // Amount matches first; a payment that has one keeps an amount match
+    // when the second pass moves it.
+    let mut limit = vec![Fit::Amount; wanted.len()];
+    // Payments with the closest candidate go first, so a tie between them
+    // goes to the closer one; a later payment still gets a receipt by moving
+    // an earlier one to another of its candidates.
+    let mut order: Vec<usize> = (0..wanted.len()).collect();
+    order.sort_by_key(|&w| edges[w].first().map_or(i64::MAX, |e| e.1));
+    for &w in &order {
+        augment(
+            w,
+            &edges,
+            &limit,
+            &mut vec![false; receipts.len()],
+            &mut owner,
+            &mut out,
+        );
+    }
+    for &w in &order {
+        if out[w].is_none() {
+            limit[w] = Fit::VendorDate;
+            augment(
+                w,
+                &edges,
+                &limit,
+                &mut vec![false; receipts.len()],
+                &mut owner,
+                &mut out,
+            );
         }
     }
     out
@@ -478,6 +564,81 @@ mod tests {
         };
         let got = assign(&receipts, &[pay("2026-09-04"), pay("2026-09-01")]);
         assert_eq!(got, vec![None, Some((0, Fit::Amount))]);
+    }
+
+    #[test]
+    fn receipts_go_to_as_many_payments_as_possible() {
+        let receipts = vec![
+            receipt("x/r1.pdf", "acme", "2026-09-04", Some(("10.00", "EUR"))),
+            receipt("x/r2.pdf", "acme", "2026-09-08", Some(("10.00", "EUR"))),
+        ];
+        let pay = |date| Wanted {
+            supplier: "Acme",
+            description: "",
+            date,
+            eur: Cents(1000),
+            fx: None,
+        };
+        // Closest first would give r1 to B and leave A without one.
+        let got = assign(&receipts, &[pay("2026-09-01"), pay("2026-09-05")]);
+        assert_eq!(got, vec![Some((0, Fit::Amount)), Some((1, Fit::Amount))]);
+    }
+
+    #[test]
+    fn a_description_names_the_vendor_only_when_no_receipt_is_the_suppliers() {
+        let receipts = vec![receipt("google/a.pdf", "google", "2026-08-21", None)];
+        let pay = |supplier| Wanted {
+            supplier,
+            description: "PAYPAL GOOGLE YOUTUBE",
+            date: "2026-08-21",
+            eur: Cents(2599),
+            fx: None,
+        };
+        assert_eq!(
+            assign(&receipts, &[pay("Diverse leveranciers")])[0].map(|m| m.0),
+            Some(0)
+        );
+        let both = [
+            receipt("google/a.pdf", "google", "2026-08-21", None),
+            receipt("paypal/b.pdf", "paypal", "2026-01-01", None),
+        ];
+        // Paypal has receipts of its own, none in the window: not Google's.
+        assert_eq!(assign(&both, &[pay("Paypal")]), vec![None]);
+    }
+
+    #[test]
+    fn a_derived_amount_allows_for_the_rate() {
+        let fx = parse_fx("SHOP TOKYO Koers (1 EUR = 159,98 JPY)", Cents(1875)).unwrap();
+        assert_eq!(fx.label(), "~2999.63 JPY");
+        assert_eq!(fx.slack, 81);
+        let receipts = vec![receipt(
+            "shop/a.pdf",
+            "shop",
+            "2026-09-01",
+            Some(("3000", "JPY")),
+        )];
+        let wanted = Wanted {
+            supplier: "Shop",
+            description: "",
+            date: "2026-09-01",
+            eur: Cents(1875),
+            fx: Some(&fx),
+        };
+        assert_eq!(assign(&receipts, &[wanted])[0], Some((0, Fit::Amount)));
+        assert_eq!(
+            parse_fx("X Bedrag 4.04 USD", Cents(355)).unwrap().label(),
+            "4.04 USD"
+        );
+    }
+
+    #[test]
+    fn the_log_is_keyed_like_file_names_on_disk() {
+        let log = read_log("filename,amount\n2026/caf\u{e9}/a.pdf,\"20,00\"\n");
+        // macOS hands out NFD names.
+        assert_eq!(
+            log[&sync::name_key("2026/cafe\u{301}/a.pdf")].1,
+            Some((Cents(2000), "EUR".into()))
+        );
     }
 
     #[test]

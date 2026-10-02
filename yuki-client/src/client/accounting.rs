@@ -45,10 +45,11 @@ pub struct OutstandingItem {
 
 impl OutstandingItem {
     /// Whether the item is a bank or card transaction rather than an invoice
-    /// or credit note: Yuki sends such an item a `Type` without an `ID`. Only
+    /// or credit note: Yuki sends such an item a `Type` without an `ID`
+    /// (`<Type ID="">Creditcardbetaling</Type>`). Only
     /// [`AccountingClient::outstanding_creditor_items_with_payments`] returns them.
     pub fn is_payment(&self) -> bool {
-        self.type_id.is_empty()
+        self.type_id.is_empty() && !self.type_name.is_empty()
     }
 }
 
