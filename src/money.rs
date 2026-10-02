@@ -33,6 +33,53 @@ impl Cents {
     pub fn abs(self) -> Self {
         Self(self.0.abs())
     }
+
+    /// `pct` percent of the amount (`pct` in hundredths of a percent, as
+    /// [`parse_percent`] gives it), rounded half away from zero to the cent.
+    pub fn percent(self, pct: i64) -> Self {
+        let part = div_round(
+            i128::from(self.0) * i128::from(pct),
+            100 * 10_i128.pow(PCT_DECIMALS),
+        );
+        Self(part as i64)
+    }
+
+    /// Belgian notation: a dot between thousands, a comma before the cents,
+    /// as an invoice text writes amounts: `4.312,50`.
+    pub fn belgian(self) -> String {
+        let sign = if self.0 < 0 { "-" } else { "" };
+        let abs = self.0.unsigned_abs();
+        let digits = (abs / 100).to_string();
+        let mut grouped = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                grouped.push('.');
+            }
+            grouped.push(c);
+        }
+        format!("{sign}{grouped},{:02}", abs % 100)
+    }
+}
+
+/// Decimals of a percentage: 21% is 2100 hundredths.
+pub const PCT_DECIMALS: u32 = 2;
+
+/// Whether a percentage is outside 0 to 100.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PercentError {
+    /// Not a number with up to two decimals: why.
+    Invalid(String),
+    OutOfRange,
+}
+
+/// Parse a percentage from 0 to 100 with up to two decimals into
+/// hundredths: `"21"` is 2100, `"12.5"` 1250.
+pub fn parse_percent(text: &str) -> Result<i64, PercentError> {
+    match parse_scaled(text.trim(), PCT_DECIMALS) {
+        Ok(pct) if (0..=100 * 10_i64.pow(PCT_DECIMALS)).contains(&pct) => Ok(pct),
+        Ok(_) => Err(PercentError::OutOfRange),
+        Err(e) => Err(PercentError::Invalid(e)),
+    }
 }
 
 impl std::ops::Neg for Cents {
@@ -52,24 +99,6 @@ impl std::ops::Add for Cents {
 impl std::iter::Sum for Cents {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         Self(iter.map(|c| c.0).sum())
-    }
-}
-
-impl Cents {
-    /// Belgian notation: a dot between thousands, a comma before the cents,
-    /// as an invoice text writes amounts: `4.312,50`.
-    pub fn belgian(self) -> String {
-        let sign = if self.0 < 0 { "-" } else { "" };
-        let abs = self.0.unsigned_abs();
-        let digits = (abs / 100).to_string();
-        let mut grouped = String::new();
-        for (i, c) in digits.chars().enumerate() {
-            if i > 0 && (digits.len() - i).is_multiple_of(3) {
-                grouped.push('.');
-            }
-            grouped.push(c);
-        }
-        format!("{sign}{grouped},{:02}", abs % 100)
     }
 }
 
@@ -135,6 +164,17 @@ pub fn div_round(numerator: i128, denominator: i128) -> i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_percentage_of_an_amount_rounds_half_away_from_zero() {
+        assert_eq!(parse_percent("21"), Ok(2100));
+        assert_eq!(parse_percent(" 12.5 "), Ok(1250));
+        assert_eq!(parse_percent("100.01"), Err(PercentError::OutOfRange));
+        assert!(matches!(parse_percent("x"), Err(PercentError::Invalid(_))));
+        assert_eq!(Cents(21_275).percent(2100), Cents(4468)); // 44.6775
+        assert_eq!(Cents(1_001).percent(5000), Cents(501)); // 5.005
+        assert_eq!(Cents(-1_001).percent(5000), Cents(-501));
+    }
 
     #[test]
     fn belgian_notation_groups_thousands_with_dots() {

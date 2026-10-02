@@ -22,7 +22,9 @@ use crate::client::escape_text;
 use crate::client::sales::{SalesClient, SalesInvoicesImport};
 use crate::config::{Config, Seller};
 use crate::error::{Delivery, YukiError};
-use crate::money::{Cents, div_round, format_scaled, parse_scaled};
+use crate::money::{
+    Cents, PCT_DECIMALS, PercentError, div_round, format_scaled, parse_percent, parse_scaled,
+};
 use crate::output::{OutputFormat, format_json, format_table, human_size, is_tty};
 use crate::period::{date_from_epoch_days, epoch_days, today};
 
@@ -31,8 +33,6 @@ pub const NAMESPACE: &str = "urn:xmlns:http://www.theyukicompany.com:salesinvoic
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 /// `ProductQuantity` carries up to four decimals.
 const QTY_DECIMALS: u32 = 4;
-/// `VATPercentage` carries up to two decimals.
-const PCT_DECIMALS: u32 = 2;
 /// `Notes` and `PaymentMethod` length limits from the XSD.
 const NOTES_MAX: usize = 500;
 const PAYMENT_METHOD_MAX: usize = 60;
@@ -355,16 +355,10 @@ impl Invoice {
         }
         bases
             .into_iter()
-            .map(|(percentage, base)| {
-                let vat = div_round(
-                    i128::from(base.0) * i128::from(percentage),
-                    100 * 10_i128.pow(PCT_DECIMALS),
-                );
-                VatRate {
-                    percentage,
-                    base,
-                    vat: Cents(vat as i64),
-                }
+            .map(|(percentage, base)| VatRate {
+                percentage,
+                base,
+                vat: base.percent(percentage),
             })
             .collect()
     }
@@ -702,12 +696,7 @@ impl Invoice {
     pub fn vat_per_line(&self) -> Cents {
         self.lines
             .iter()
-            .map(|l| {
-                Cents(div_round(
-                    i128::from(l.net().0) * i128::from(l.vat_percentage),
-                    100 * 10_i128.pow(PCT_DECIMALS),
-                ) as i64)
-            })
+            .map(|l| l.net().percent(l.vat_percentage))
             .sum()
     }
 
@@ -1183,17 +1172,10 @@ pub fn fill(text: &str, date: &str, net: Option<Cents>) -> Result<String, String
             _ => match name.strip_prefix("pct_of_net:") {
                 Some(pct) => {
                     let net = net.ok_or("{pct_of_net:…} only works in a line")?;
-                    let pct = parse_scaled(pct.trim(), PCT_DECIMALS)
-                        .ok()
-                        .filter(|p| (0..=100 * 10_i64.pow(PCT_DECIMALS)).contains(p))
-                        .ok_or_else(|| {
-                            format!("{{{name}}}: the percentage must be 0 to 100, e.g. 25")
-                        })?;
-                    let part = div_round(
-                        i128::from(net.0) * i128::from(pct),
-                        100 * 10_i128.pow(PCT_DECIMALS),
-                    );
-                    out.push_str(&Cents(part as i64).belgian());
+                    let pct = parse_percent(pct).map_err(|_| {
+                        format!("{{{name}}}: the percentage must be 0 to 100, e.g. 25")
+                    })?;
+                    out.push_str(&net.percent(pct).belgian());
                 }
                 None => {
                     return Err(format!(
@@ -1299,16 +1281,16 @@ fn validate_line(
             p.push(format!("{} is required, e.g. 21", field("vat_percentage")));
             None
         }
-        Some(text) => match parse_scaled(&text, PCT_DECIMALS) {
-            Ok(pct) if (0..=100 * 10_i64.pow(PCT_DECIMALS)).contains(&pct) => Some(pct),
-            Ok(_) => {
+        Some(text) => match parse_percent(&text) {
+            Ok(pct) => Some(pct),
+            Err(PercentError::OutOfRange) => {
                 p.push(format!(
                     "{} must be between 0 and 100",
                     field("vat_percentage")
                 ));
                 None
             }
-            Err(e) => {
+            Err(PercentError::Invalid(e)) => {
                 p.push(format!("{}: {e}", field("vat_percentage")));
                 None
             }
@@ -1465,7 +1447,10 @@ impl Invoice {
                     description: l.description,
                     qty: parse_quantity(&l.qty)?,
                     price: parse_price(&l.unit_price)?,
-                    vat_percentage: parse_scaled(&l.vat_percentage, PCT_DECIMALS)?,
+                    vat_percentage: parse_percent(&l.vat_percentage).map_err(|e| match e {
+                        PercentError::Invalid(e) => e,
+                        PercentError::OutOfRange => "a VAT percentage must be 0 to 100".into(),
+                    })?,
                     vat_type: l.vat_type,
                     vat_description: l.vat_description,
                     gl_account: l.gl_account,
