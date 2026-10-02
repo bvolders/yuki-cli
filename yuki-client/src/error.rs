@@ -23,8 +23,17 @@ pub enum YukiError {
     #[error("XML error: {0}")]
     Xml(String),
 
-    #[error("{0}")]
+    #[error("{}", request_message(.0))]
     Request(#[from] reqwest::Error),
+}
+
+/// A transport error, saying plainly when it was a timeout.
+fn request_message(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        format!("request timed out: {e}")
+    } else {
+        e.to_string()
+    }
 }
 
 impl YukiError {

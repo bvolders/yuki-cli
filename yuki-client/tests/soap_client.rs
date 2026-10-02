@@ -40,26 +40,6 @@ fn param_values_are_escaped_and_survive_a_parse() {
 }
 
 #[test]
-fn param_xml_inserts_a_well_formed_child_as_is() {
-    let envelope = SoapEnvelope::new("ProcessSalesInvoices")
-        .param_xml(
-            "xmlDoc",
-            "<SalesInvoices><Reference>A&amp;B</Reference></SalesInvoices>",
-        )
-        .build();
-    assert!(
-        envelope.contains(
-            "<yuki:xmlDoc><SalesInvoices><Reference>A&amp;B</Reference></SalesInvoices></yuki:xmlDoc>"
-        ),
-        "{envelope}"
-    );
-    assert_eq!(
-        SoapClient::parse_single_result(&envelope, "Reference").unwrap(),
-        "A&B"
-    );
-}
-
-#[test]
 fn builds_soap_envelope_without_session() {
     let envelope = SoapEnvelope::new("Authenticate")
         .param("accessKey", "my-api-key")

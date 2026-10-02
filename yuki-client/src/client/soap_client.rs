@@ -37,14 +37,6 @@ impl SoapEnvelope {
         self
     }
 
-    /// Add a parameter whose content is inserted as is, for operations that
-    /// take an XML document as a child element. The caller guarantees that
-    /// `xml` is well-formed XML; nothing is escaped.
-    pub fn param_xml(mut self, name: &str, xml: &str) -> Self {
-        self.params.push((name.to_string(), xml.to_string()));
-        self
-    }
-
     pub fn build(self) -> String {
         let mut body = String::new();
 
@@ -87,8 +79,11 @@ fn escape_xml(value: &str) -> String {
     out
 }
 
-/// How long one SOAP request may take before it is abandoned.
-pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long establishing a connection may take.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long one SOAP request may take in total, upload included.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// HTTP transport client for the Yuki SOAP API.
 pub struct SoapClient {
@@ -100,12 +95,14 @@ pub struct SoapClient {
 impl SoapClient {
     /// Create a transport with its own default HTTP client. Convenient for
     /// short-lived consumers such as the CLI, where each invocation is fresh.
-    /// Requests time out after [`REQUEST_TIMEOUT`].
+    /// Connecting times out after [`CONNECT_TIMEOUT`], a whole request after
+    /// [`REQUEST_TIMEOUT`].
     pub fn new(base_url: &str) -> Self {
         let http = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .expect("build the HTTP client");
         Self::with_client(base_url, http)
     }
 
