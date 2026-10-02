@@ -8,15 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- **upload**: `upload dir <path>` uploads the receipts in a directory that are not in Yuki yet. State is kept in `<path>/.yuki-sync.json`, keyed by content hash so a renamed or moved file is not uploaded again, written atomically, and guarded by an OS lock. Each upload is recorded as `pending` before it is sent; anything but a document ID from Yuki leaves it pending, never retried automatically until resolved with `upload mark`. It prints a plan and asks first (`--yes`, `--dry-run`), caps a run with `--max` (default 25), skips `_to_delete`, dotfiles, symbolic links and `--exclude` globs, and stops when the first 3 uploads fail alike. `--seed-from-yuki` records files whose name matches exactly one unclaimed Yuki document; `upload mark <file> --doc-id <id>|--skip|--forget` records one by hand.
+- **upload**: `upload dir <path>` uploads the receipts in a directory that are not in Yuki yet, tracked by content hash in `<path>/.yuki-sync.json`. Each upload is recorded as `pending` before it is sent, so an uncertain outcome is never retried silently. `--seed-from-yuki` records files Yuki already has; `upload mark` records one by hand.
 
 ### Fixed
 
-- **yuki-client**: `SoapEnvelope::param` now XML-escapes its value, so a file name, search query or description containing `&`, `<` or `>` no longer produces a malformed request. SOAP requests now give up connecting after 15 seconds and time out after 60 seconds (uploads: 60 plus 30 per MB, at most 600) instead of waiting forever; a timeout error says "timed out".
+- **yuki-client**: `SoapEnvelope::param` XML-escapes its value (`escape_text`). Requests time out (connect 15s, total 60s; uploads longer by size), `YukiError::delivery()` says whether a failed request may have been processed, and `ArchiveClient::documents_in_folder_all` reads a whole folder strictly.
 
 ### Breaking Changes
 
 - **accounts**: `accounts balance` now reports the balance at the end of `--period` (or today, if the period is still running) instead of at its start, and adds an `As Of` column with that date. Scripts reading the old start-of-period figure, or indexing columns, must adjust.
+- **yuki-client**: HTTP 401/403 is now `YukiError::Unauthorized(status)` instead of `AuthFailed("HTTP …")`; `AuthFailed` remains for authentication faults.
 - **yuki-client**: 0.3.0. `AccountingInfoClient::get_transaction_details` now takes `(administration_id, gl_account_code, start_date, end_date)` instead of a transaction ID, because `GetTransactionDetails` has no transaction-ID parameter; `TransactionDetail` gains `contact_name`.
 
 ## [0.1.13](https://github.com/rvben/yuki-cli/compare/v0.1.12...v0.1.13) - 2026-09-28

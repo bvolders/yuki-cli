@@ -664,23 +664,10 @@ pub enum UploadCommands {
 
     /// Upload the receipts in a directory that are not in Yuki yet, once each.
     ///
-    /// Scans PATH recursively for pdf, jpg, jpeg and png files and keeps what
-    /// it did in PATH/.yuki-sync.json, keyed by content hash, so a renamed or
-    /// moved file is not uploaded again. PATH must be the root of its tree: a
-    /// state file above or below it is refused. Prints the plan, then asks
-    /// (--yes skips the question; without a terminal --yes is required).
-    ///
-    /// Each upload is recorded as pending before it is sent, and as uploaded
-    /// once Yuki returns a document ID. Any other outcome (a timeout, a SOAP
-    /// fault, a server error, a crash) leaves it pending: it may be in Yuki,
-    /// so it is never retried automatically; check Yuki, then `upload mark`.
-    /// Only a request that never reached Yuki is failed and retried. A file
-    /// whose content changed since it was recorded waits for `upload mark`.
-    /// An authentication error, or the first 3 uploads failing alike, stops
-    /// the run. Exits 1 when any file needs attention.
-    ///
-    /// Run once with --seed-from-yuki first to record the files Yuki already
-    /// has, so they are not uploaded again.
+    /// State is kept in PATH/.yuki-sync.json, keyed by content hash. Prints the
+    /// plan and asks first (--yes without a terminal). An upload whose outcome
+    /// is uncertain stays pending and is never retried: resolve it with
+    /// `upload mark`. Exits 1 when any file needs attention. See the README.
     Dir {
         /// Directory to upload from.
         path: String,
@@ -689,12 +676,8 @@ pub enum UploadCommands {
         #[arg(long, default_value = "uitzoeken")]
         folder: String,
 
-        /// Skip paths matching this glob (case-insensitive); repeatable.
-        /// Always skipped as well: _to_delete and .* (dotfiles and
-        /// dot-directories). A pattern without / matches any path component,
-        /// so `2025` skips that directory and everything below it; one with /
-        /// matches the whole relative path (`*` stays in one component, `**`
-        /// crosses them). Symbolic links are never followed.
+        /// Skip paths matching this case-insensitive glob; repeatable. A name
+        /// without / matches any path component. _to_delete and .* always apply.
         #[arg(long = "exclude")]
         exclude: Vec<String>,
 

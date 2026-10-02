@@ -418,7 +418,7 @@ pub fn generate() -> Value {
             },
             {
                 "name": "upload dir",
-                "description": "Upload the pdf/jpg/jpeg/png files under a directory that are not in Yuki yet, once each. State is kept in <path>/.yuki-sync.json, keyed by sha256, so a renamed or moved file is not uploaded again; <path> must be the root (no state file above or below it), and an OS lock keeps runs apart. Prints the plan, then asks; non-interactive runs need --yes. Each upload is recorded as pending before it is sent and as uploaded when Yuki returns an ID; any other outcome stays pending and is never retried automatically (resolve with upload mark). Only a request that never reached Yuki is failed and retried. Stops on an authentication error or when the first 3 uploads fail alike; exits 1 when any file needs attention. --seed-from-yuki uploads nothing and, after confirmation, records files whose name matches exactly one unclaimed Yuki document; any paging anomaly records nothing.",
+                "description": "Upload the pdf/jpg/jpeg/png files under a directory that are not in Yuki yet, tracked by content hash in <path>/.yuki-sync.json. Uploads are recorded as pending before they are sent and never retried automatically when the outcome is uncertain; --seed-from-yuki records files Yuki already has.",
                 "mutating": true,
                 "args": [
                     {"name": "path", "type": "path", "required": true, "description": "Directory to upload from."},
