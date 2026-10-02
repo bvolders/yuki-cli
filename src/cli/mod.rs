@@ -9,17 +9,24 @@ pub mod invoices;
 pub mod projects;
 pub mod sales;
 pub mod upload;
+pub mod upload_dir;
 pub mod vat;
 
 use std::ffi::OsString;
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 
 use crate::client::Region;
 use crate::client::accounting::AccountingClient;
 use crate::config::{Config, Target};
 use crate::error::YukiError;
+
+/// Whether a confirmation can be asked: stdin is a terminal to answer on.
+/// Without one, a mutating command needs `--yes`.
+pub fn interactive() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin())
+}
 
 /// Authenticate a client and set the active administration domain.
 ///
@@ -653,6 +660,88 @@ pub enum UploadCommands {
         /// Currency code (default: EUR).
         #[arg(long, default_value = "EUR")]
         currency: String,
+    },
+
+    /// Upload the receipts in a directory that are not in Yuki yet, once each.
+    ///
+    /// State is kept in PATH/.yuki-sync.json, keyed by content hash. Prints the
+    /// plan and asks first (--yes without a terminal). An upload whose outcome
+    /// is uncertain stays pending and is never retried: resolve it with
+    /// `upload mark`. Exits 1 when any file needs attention. See the README.
+    Dir {
+        /// Directory to upload from.
+        path: String,
+
+        /// Target folder: uitzoeken (default), inkoop, verkoop, bank, personeel, belasting, overig-financieel.
+        #[arg(long, default_value = "uitzoeken")]
+        folder: String,
+
+        /// Skip paths matching this case-insensitive glob; repeatable. A name
+        /// without / matches any path component. _to_delete and .* always apply.
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+
+        /// Upload at most this many files in this run.
+        #[arg(long, default_value_t = 25)]
+        max: usize,
+
+        /// Print the plan only: no API calls, nothing written.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Upload nothing; record the files whose file name matches exactly one
+        /// Yuki document, claimed by no other file, as already-in-yuki, and
+        /// list ambiguous and near matches for review. Asks before writing.
+        #[arg(long)]
+        seed_from_yuki: bool,
+
+        /// Yuki folder to look in when seeding; repeatable. Defaults to
+        /// --folder and inkoop.
+        #[arg(long = "seed-folder", requires = "seed_from_yuki")]
+        seed_folder: Vec<String>,
+    },
+
+    /// Record by hand that a file is in Yuki, should be skipped, or is to be forgotten.
+    ///
+    /// Updates the .yuki-sync.json of the synced directory without contacting
+    /// Yuki: --dir, else the nearest directory above FILE that has one.
+    /// Resolves files `upload dir` reports as pending or changed: --doc-id when
+    /// Yuki has the file, --forget to upload it (again), --skip to keep it out.
+    #[command(group(ArgGroup::new("record").required(true).args(["doc_id", "skip", "forget"])))]
+    Mark {
+        /// The file to record.
+        file: String,
+
+        /// The Yuki document ID the file was uploaded as.
+        #[arg(long)]
+        doc_id: Option<String>,
+
+        /// Never upload this file.
+        #[arg(long)]
+        skip: bool,
+
+        /// Remove the record, so the next run treats the file as new. For a
+        /// changed file, removes the record of the earlier content at its path.
+        #[arg(long)]
+        forget: bool,
+
+        /// The Yuki folder the document is in.
+        #[arg(long)]
+        folder: Option<String>,
+
+        /// Note to keep with the record.
+        #[arg(long)]
+        note: Option<String>,
+
+        /// The synced directory (its root), needed when it has no
+        /// .yuki-sync.json yet.
+        #[arg(long)]
+        dir: Option<String>,
+
+        /// Replace an existing record, or record a document ID already
+        /// recorded for another file.
+        #[arg(long)]
+        force: bool,
     },
 
     /// List available cost categories.

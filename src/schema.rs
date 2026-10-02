@@ -417,6 +417,49 @@ pub fn generate() -> Value {
                 ]
             },
             {
+                "name": "upload dir",
+                "description": "Upload the pdf/jpg/jpeg/png files under a directory that are not in Yuki yet, tracked by content hash in <path>/.yuki-sync.json. Uploads are recorded as pending before they are sent and never retried automatically when the outcome is uncertain; --seed-from-yuki records files Yuki already has.",
+                "mutating": true,
+                "args": [
+                    {"name": "path", "type": "path", "required": true, "description": "Directory to upload from."},
+                    {"name": "--folder", "type": "string", "required": false, "description": "Target folder.", "default": "uitzoeken"},
+                    {"name": "--exclude", "type": "string[]", "required": false, "description": "Case-insensitive glob of paths to skip; repeatable. Without / it matches any path component (a directory name skips its whole subtree); with / the whole relative path. _to_delete and .* are always skipped; symbolic links are never followed."},
+                    {"name": "--max", "type": "integer", "required": false, "description": "Upload at most this many files in this run.", "default": 25},
+                    {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the plan only: no API calls, nothing written."},
+                    {"name": "--seed-from-yuki", "type": "boolean", "required": false, "description": "Upload nothing; record files whose file name matches exactly one unclaimed Yuki document as already-in-yuki, after confirmation."},
+                    {"name": "--seed-folder", "type": "string[]", "required": false, "description": "Yuki folder to look in when seeding; repeatable. Defaults to --folder and inkoop."}
+                ],
+                "output_fields": [
+                    {"name": "Path", "type": "string", "description": "Path relative to the directory."},
+                    {"name": "Action", "type": "string", "description": "uploaded, pending, failed, changed, error, not-attempted, deferred, synced, duplicate, excluded; would-upload or would-seed on --dry-run; already-in-yuki, ambiguous, possible-match or not-in-yuki when seeding."},
+                    {"name": "Doc ID", "type": "string"},
+                    {"name": "Error", "type": "string"},
+                    {"name": "Note", "type": "string"}
+                ]
+            },
+            {
+                "name": "upload mark",
+                "description": "Record by hand, in the synced directory's .yuki-sync.json, that a file is in Yuki as a document (--doc-id), must never be uploaded (--skip), or is to be forgotten (--forget). Does not contact Yuki.",
+                "mutating": true,
+                "args": [
+                    {"name": "file", "type": "path", "required": true, "description": "The file to record."},
+                    {"name": "--doc-id", "type": "string", "required": false, "description": "The Yuki document ID the file was uploaded as."},
+                    {"name": "--skip", "type": "boolean", "required": false, "description": "Never upload this file."},
+                    {"name": "--forget", "type": "boolean", "required": false, "description": "Remove the record, so the next run treats the file as new; for a changed file, the record of the earlier content at its path."},
+                    {"name": "--folder", "type": "string", "required": false, "description": "The Yuki folder the document is in."},
+                    {"name": "--note", "type": "string", "required": false, "description": "Note to keep with the record."},
+                    {"name": "--dir", "type": "path", "required": false, "description": "The synced directory (its root); defaults to the nearest directory above the file with a .yuki-sync.json."},
+                    {"name": "--force", "type": "boolean", "required": false, "description": "Replace an existing record, or record a document ID already recorded for another file."}
+                ],
+                "output_fields": [
+                    {"name": "Path", "type": "string"},
+                    {"name": "Action", "type": "string", "description": "recorded, unchanged, or forgotten."},
+                    {"name": "Doc ID", "type": "string"},
+                    {"name": "Error", "type": "string"},
+                    {"name": "Note", "type": "string"}
+                ]
+            },
+            {
                 "name": "upload categories",
                 "description": "List available cost categories.",
                 "mutating": false,
@@ -670,7 +713,10 @@ fn enrich_v0_3(schema: &mut Value) {
             );
             object.insert("fields_arg".into(), json!("--fields"));
         }
-        if matches!(name.as_str(), "upload file" | "profile remove") {
+        if matches!(
+            name.as_str(),
+            "upload file" | "upload dir" | "profile remove"
+        ) {
             object.insert("confirmation_bypass_arg".into(), json!("--yes"));
         }
         if name == "capabilities" {

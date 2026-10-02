@@ -241,6 +241,54 @@ yuki upload categories                                  # List cost category IDs
 yuki upload payment-methods                             # List payment method IDs
 ```
 
+#### A folder of receipts, uploaded once
+
+`upload dir` uploads the pdf, jpg, jpeg and png files under a directory that
+are not in Yuki yet. It records every file in `<dir>/.yuki-sync.json`, keyed by
+the file's sha256, so a renamed or moved file is not uploaded again. Run it on
+the root of the tree: a state file above or below the directory is refused. An
+OS lock on `.yuki-sync.json.lock` keeps two runs apart, and is released when a
+run ends or is killed.
+
+```sh
+yuki upload dir ~/Receipts --dry-run                    # The plan: no API calls, nothing written
+yuki upload dir ~/Receipts --seed-from-yuki             # Record files Yuki already has (by file name)
+yuki upload mark <file> --doc-id <id>                   # Record one file by hand
+yuki upload mark <file> --skip                          # Never upload this file
+yuki upload mark <file> --forget                        # Drop its record: upload it (again)
+yuki upload dir ~/Receipts                              # Show the plan, ask, then upload
+yuki upload dir ~/Receipts --yes --max 10 \
+  --exclude 2025                                         # Unattended, at most 10, skip any 2025/ directory
+```
+
+Dotfiles, dot-directories and `_to_delete` are always skipped, and symbolic
+links are never followed. Excludes are case-insensitive globs: one without `/`
+matches any path component (so `2025` skips that directory and everything in
+it), one with `/` the whole relative path.
+
+It prints the plan and asks before uploading; without a terminal it needs
+`--yes`. Before each upload the file is recorded as **pending**; when Yuki
+returns a document ID it becomes **uploaded**. Every other outcome, whether a
+timeout, a SOAP fault, a server error, a crash or a kill, leaves it pending,
+because the file may already be in Yuki. Pending files are never retried
+automatically and the exit code stays 1 until each is resolved: check Yuki,
+then `upload mark <file> --doc-id <id>`, or `--forget` to upload it again, or
+seed. Only a request that never reached Yuki (a refused connection) is
+recorded as **failed** and retried. A recorded path whose content changed is
+shown as **changed** and not uploaded until you `--forget` or `--skip` it. An
+authentication error, or the first 3 uploads of a run failing the same way,
+stops the run. `--max` (default 25) caps the uploads of one run.
+
+Seeding reads the upload folder and `inkoop` (or `--seed-folder`) and matches
+by file name only, because Yuki reports no size or hash: a different file
+uploaded under the same name is recorded as in Yuki, and a copy uploaded under
+another name is not found. A Yuki document is claimed at most once; names
+matching several documents, documents already recorded, and documents two local
+files claim are `ambiguous` and not recorded. Near matches (`possible-match`)
+are listed, never recorded. Seeding shows the matches and asks before writing,
+and records nothing if the listing pages look wrong. A state file that does not
+parse is refused rather than overwritten.
+
 ### Global flags
 
 | Flag | Description |
