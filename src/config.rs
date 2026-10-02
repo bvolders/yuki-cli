@@ -195,12 +195,14 @@ pub struct Seller {
     pub enterprise_number: String,
     pub vat_number: String,
     pub iban: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Written as `null` in a prepared invoice's `firm`; TOML leaves a
+    // `None` out of the config by itself.
+    #[serde(default)]
     pub bic: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub legal_form: Option<String>,
     /// RPR/RPM and its court, e.g. `RPR Antwerpen, afdeling Antwerpen`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub rpr: Option<String>,
 }
 
@@ -220,25 +222,6 @@ iban = "BE00000000000000"
 # legal_form = "BV"
 # rpr = "RPR Brussel"
 "#;
-
-    /// The seller as the prepared invoice's `firm`: every field, the
-    /// optional ones as `null` when unset.
-    pub fn firm(&self) -> serde_json::Value {
-        serde_json::json!({
-            "name": self.name,
-            "address": self.address,
-            "zipcode": self.zipcode,
-            "city": self.city,
-            "country": self.country,
-            "phone": self.phone,
-            "enterprise_number": self.enterprise_number,
-            "vat_number": self.vat_number,
-            "iban": self.iban,
-            "bic": self.bic,
-            "legal_form": self.legal_form,
-            "rpr": self.rpr,
-        })
-    }
 }
 
 /// A run-scoped endpoint: where to send requests and, when known, which

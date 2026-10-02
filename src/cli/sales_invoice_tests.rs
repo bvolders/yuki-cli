@@ -562,7 +562,7 @@ iban = "BE00000000000000"
 /// the invoice it was prepared from, to be booked as `send`.
 fn prepared(text: &str, send: SendMode) -> (serde_json::Value, Invoice) {
     let mut inv = numbered(text, None);
-    let json = inv.prepared_file(&seller(), "a1");
+    let json = inv.prepared(Some(&seller()), Some("a1"));
     inv.send = Some(send);
     (json, inv)
 }
@@ -575,7 +575,7 @@ fn a_prepared_file_books_exactly_what_was_prepared() {
     assert_eq!(json["firm"]["name"], "Example Studio");
     assert_eq!(json["lines"][0]["product_code"], "HOST");
     assert_eq!(json["lines"][0]["vat_description"], "BTW 21%");
-    let (back, admin) = Invoice::from_prepared(&json, "p.json", SendMode::Email).unwrap();
+    let (back, admin) = Invoice::from_prepared(json.clone(), "p.json", SendMode::Email).unwrap();
     assert_eq!(admin, "a1");
     assert_eq!(back.to_xml(), original.to_xml());
     assert_eq!(back.gross(), original.gross());
@@ -598,13 +598,13 @@ fn a_prepared_file_needs_a_number_an_administration_and_a_due_date() {
     ] {
         let mut broken = json.clone();
         broken[field] = serde_json::Value::Null;
-        let err = Invoice::from_prepared(&broken, "p.json", SendMode::Book)
+        let err = Invoice::from_prepared(broken.clone(), "p.json", SendMode::Book)
             .err()
             .unwrap()
             .to_string();
         assert!(err.contains(expect), "{field}: {err}");
     }
-    let err = Invoice::from_prepared(&serde_json::json!({"a": 1}), "p.json", SendMode::Book)
+    let err = Invoice::from_prepared(serde_json::json!({"a": 1}), "p.json", SendMode::Book)
         .err()
         .unwrap()
         .to_string();
@@ -617,7 +617,7 @@ fn a_custom_pdf_is_stored_under_the_number_before_the_contact() {
     let path = dir.path().join("doc.pdf");
     std::fs::write(&path, b"%PDF-1.7 hello").unwrap();
     let (json, _) = prepared(FULL, SendMode::Book);
-    let (mut inv, _) = Invoice::from_prepared(&json, "p.json", SendMode::Book).unwrap();
+    let (mut inv, _) = Invoice::from_prepared(json.clone(), "p.json", SendMode::Book).unwrap();
     inv.attach_pdf(&path).unwrap();
     let xml = inv.to_xml();
     // Stored under the number, whatever the local file is called.
@@ -710,7 +710,7 @@ fn book_books_without_sending_and_the_number_is_the_reference() {
 #[test]
 fn prepared_json_carries_the_figures_create_sends() {
     let inv = numbered(FULL, None);
-    let json = inv.prepared();
+    let json = inv.prepared(None, None);
     assert_eq!(json["number"], "2026-20");
     assert_eq!(json["date"]["iso"], "2026-10-01");
     assert_eq!(json["date"]["text"], "1 oktober 2026");
@@ -727,7 +727,7 @@ fn prepared_json_carries_the_figures_create_sends() {
     assert_eq!(json["totals"]["by_rate"][0]["vat"], "2.22");
     assert_eq!(json["payment_reference"], "+++202/6000/02014+++");
     // Without a number there is no reference either.
-    let unnumbered = invoice(FULL, None).prepared();
+    let unnumbered = invoice(FULL, None).prepared(None, None);
     assert!(unnumbered["number"].is_null() && unnumbered["payment_reference"].is_null());
 }
 
@@ -761,7 +761,7 @@ fn a_line_remark_goes_under_the_line_and_into_prepare() {
     assert!(xml.contains("<Remarks>waarvan overdracht auteursrecht op ontwikkelde software van 25% of €312.50</Remarks>"));
     // The unit is for the PDF only.
     assert!(!xml.contains(">u<"), "{xml}");
-    let json = inv.prepared();
+    let json = inv.prepared(None, None);
     assert_eq!(json["lines"][0]["unit"], "u");
     assert!(
         json["lines"][0]["remarks"]
@@ -791,8 +791,13 @@ fn per_line_rounding_that_differs_is_flagged() {
             .contains("!! VAT rounded per line would be 0.03 EUR, not 0.04: Yuki may book either"),
         "{preview}"
     );
-    assert_eq!(inv.prepared()["totals"]["vat_rounded_per_line"], "0.03");
-    assert!(invoice(MINIMAL, None).prepared()["totals"]["vat_rounded_per_line"].is_null());
+    assert_eq!(
+        inv.prepared(None, None)["totals"]["vat_rounded_per_line"],
+        "0.03"
+    );
+    assert!(
+        invoice(MINIMAL, None).prepared(None, None)["totals"]["vat_rounded_per_line"].is_null()
+    );
 }
 
 #[test]
@@ -834,7 +839,10 @@ remarks = "waarvan overdracht auteursrecht op ontwikkelde software van 25% of �
     );
     // The filled text is what prepare shows and create sends.
     assert!(invoice.to_xml().contains("€4.312,50"));
-    assert_eq!(invoice.prepared()["subject"], "Consultancy maart 2026 (03)");
+    assert_eq!(
+        invoice.prepared(None, None)["subject"],
+        "Consultancy maart 2026 (03)"
+    );
 }
 
 #[test]
@@ -914,7 +922,7 @@ fn a_vat_mention_is_passed_through_and_missed_at_zero_percent() {
     let inv = invoice(&mentioned, None);
     assert!(!inv.lacks_vat_mention());
     assert!(!inv.preview(None).contains("no vat_mention"));
-    assert_eq!(inv.prepared()["vat_mention"], "Btw verlegd");
+    assert_eq!(inv.prepared(None, None)["vat_mention"], "Btw verlegd");
     // Not part of what Yuki receives.
     assert!(!inv.to_xml().contains("verlegd"));
     assert!(!invoice(MINIMAL, None).lacks_vat_mention());
@@ -936,14 +944,14 @@ iban = "BE35733070723437"
 "#,
     )
     .unwrap();
-    let json = invoice(MINIMAL, None).prepared_for(Some(&seller));
+    let json = invoice(MINIMAL, None).prepared(Some(&seller), None);
     assert_eq!(json["firm"]["name"], "Studio Maak");
     assert_eq!(json["firm"]["enterprise_number"], "0748.926.706");
     assert_eq!(json["firm"]["iban"], "BE35733070723437");
     for unset in ["bic", "legal_form", "rpr"] {
         assert!(json["firm"][unset].is_null(), "{unset}");
     }
-    assert!(invoice(MINIMAL, None).prepared_for(None)["firm"].is_null());
+    assert!(invoice(MINIMAL, None).prepared(None, None)["firm"].is_null());
 }
 
 fn import_of(reference: &str, processed: bool, email_sent: bool) -> SalesInvoicesImport {
@@ -1063,7 +1071,112 @@ fn notes_remarks_and_the_vat_mention_take_placeholders_too() {
 fn a_prepared_invoice_without_a_currency_sends_none() {
     let (json, original) = prepared(&bookable(), SendMode::Book);
     assert!(json["currency"].is_null());
-    let (back, _) = Invoice::from_prepared(&json, "p.json", SendMode::Book).unwrap();
+    let (back, _) = Invoice::from_prepared(json.clone(), "p.json", SendMode::Book).unwrap();
     assert!(!back.to_xml().contains("<Currency>"), "{}", back.to_xml());
     assert_eq!(back.to_xml(), original.to_xml());
+}
+
+/// The prepared file of [`FULL`] as 2026-20: the keys and the `null`s a
+/// rendering template and `create --prepared` rely on, pinned.
+const GOLDEN: &str = r#"{
+  "admin_id": "a1",
+  "currency": "EUR",
+  "customer": {
+    "address": "Kerkstraat 1",
+    "address_2": "bus 2",
+    "city": "Gent",
+    "code": "C0042",
+    "country": "BE",
+    "email": "billing@example.be",
+    "name": "Example Customer BV",
+    "type": "Company",
+    "vat_number": "BE0123456789",
+    "zipcode": "9000"
+  },
+  "date": {
+    "iso": "2026-10-01",
+    "text": "1 oktober 2026"
+  },
+  "due_date": {
+    "iso": "2026-10-31",
+    "text": "31 oktober 2026"
+  },
+  "firm": {
+    "address": "Kerkstraat 1",
+    "bic": null,
+    "city": "Gent",
+    "country": "BE",
+    "enterprise_number": "0123.456.789",
+    "iban": "BE00000000000000",
+    "legal_form": null,
+    "name": "Example Studio",
+    "phone": "0400000000",
+    "rpr": null,
+    "vat_number": "BE0123.456.789",
+    "zipcode": "9000"
+  },
+  "layout": "Standard",
+  "lines": [
+    {
+      "description": "Managed hosting",
+      "gl_account": "700000",
+      "net": "100.00",
+      "product_code": "HOST",
+      "qty": "1",
+      "remarks": null,
+      "unit": null,
+      "unit_price": "100.00",
+      "vat_description": "BTW 21%",
+      "vat_percentage": "21",
+      "vat_type": 1
+    },
+    {
+      "description": "Books",
+      "gl_account": null,
+      "net": "37.05",
+      "product_code": null,
+      "qty": "3",
+      "remarks": null,
+      "unit": null,
+      "unit_price": "12.35",
+      "vat_description": null,
+      "vat_percentage": "6",
+      "vat_type": 2
+    }
+  ],
+  "notes": "Thank you",
+  "number": "2026-20",
+  "payment_method": "ElectronicTransfer",
+  "payment_reference": "+++202/6000/02014+++",
+  "remarks": "internal note",
+  "subject": "Hosting & support",
+  "totals": {
+    "by_rate": [
+      {
+        "net": "37.05",
+        "vat": "2.22",
+        "vat_percentage": "6"
+      },
+      {
+        "net": "100.00",
+        "vat": "21.00",
+        "vat_percentage": "21"
+      }
+    ],
+    "computed_by": "the CLI's computation, VAT per rate; Yuki books its own",
+    "gross": "160.27",
+    "net": "137.05",
+    "vat": "23.22",
+    "vat_rounded_per_line": null
+  },
+  "vat_mention": null
+}"#;
+
+#[test]
+fn a_prepared_file_keeps_its_keys_and_nulls() {
+    let (json, _) = prepared(FULL, SendMode::Book);
+    assert_eq!(serde_json::to_string_pretty(&json).unwrap(), GOLDEN);
+    // And reads back as itself.
+    let back: PreparedFile = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(serde_json::to_value(back).unwrap(), json);
 }

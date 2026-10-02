@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::invoice_ledger::{Claim, InvoiceLedger};
 use crate::cli::invoice_number::{dutch_date, structured_reference};
@@ -193,8 +193,9 @@ struct LineSpec {
 // The validated invoice.
 
 /// The customer: an existing Yuki contact by `code`, or the details Yuki
-/// needs to match or create one by name.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// needs to match or create one by name. Serialized as a prepared
+/// invoice's `customer`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contact {
     pub code: Option<String>,
     pub name: Option<String>,
@@ -206,8 +207,24 @@ pub struct Contact {
     pub city: Option<String>,
     pub vat_number: Option<String>,
     pub email: Option<String>,
-    /// `Company` or `Person`, as the XSD spells them.
-    pub kind: Option<&'static str>,
+    #[serde(rename = "type")]
+    pub kind: Option<ContactKind>,
+}
+
+/// A contact's `ContactType`, spelled as the XSD spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContactKind {
+    Company,
+    Person,
+}
+
+impl ContactKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Company => "Company",
+            Self::Person => "Person",
+        }
+    }
 }
 
 impl Contact {
@@ -411,75 +428,72 @@ impl Invoice {
         }
     }
 
-    /// The fully resolved invoice as JSON, for rendering a PDF of it: what
-    /// `create` sends for the same inputs, with the totals as the CLI
-    /// computes them (Yuki books its own). Amounts are strings with two
-    /// decimals and a dot.
-    pub fn prepared(&self) -> serde_json::Value {
-        use serde_json::json;
-        let date = |iso: &str| json!({"iso": iso, "text": dutch_date(iso)});
-        let c = &self.contact;
+    /// The fully resolved invoice as JSON, for rendering a PDF of it, with
+    /// the issuing firm (`null` without one) and, for a file `prepare --out`
+    /// writes, the administration its number is reserved in. The totals are
+    /// the CLI's computation (Yuki books its own); amounts are strings with
+    /// two decimals and a dot.
+    pub fn prepared(&self, firm: Option<&Seller>, admin_id: Option<&str>) -> serde_json::Value {
+        let date = |iso: &str| PreparedDate {
+            iso: iso.to_string(),
+            text: dutch_date(iso),
+        };
         let rates = self.vat_rates();
         let vat: Cents = rates.iter().map(|r| r.vat).sum();
-        json!({
-            "number": self.number,
-            "subject": self.subject,
-            "date": date(&self.date),
-            "due_date": self.due_date.as_deref().map(date),
+        let file = PreparedFile {
+            number: self.number.clone(),
+            admin_id: admin_id.map(str::to_string),
+            subject: self.subject.clone(),
+            date: date(&self.date),
+            due_date: self.due_date.as_deref().map(date),
             // Absent when the invoice names none: Yuki uses its default (EUR).
-            "currency": self.currency,
-            "payment_method": self.payment_method,
-            "notes": self.notes,
-            "remarks": self.remarks,
-            "layout": self.layout,
-            "vat_mention": self.vat_mention,
-            "customer": {
-                "code": c.code,
-                "name": c.name,
-                "address": c.address,
-                "address_2": c.address_2,
-                "zipcode": c.zipcode,
-                "city": c.city,
-                "country": c.country,
-                "vat_number": c.vat_number,
-                "email": c.email,
-                "type": c.kind,
+            currency: self.currency.clone(),
+            payment_method: self.payment_method.clone(),
+            notes: self.notes.clone(),
+            remarks: self.remarks.clone(),
+            layout: self.layout.clone(),
+            vat_mention: self.vat_mention.clone(),
+            firm: firm.cloned(),
+            customer: self.contact.clone(),
+            lines: self
+                .lines
+                .iter()
+                .map(|l| PreparedLine {
+                    description: l.description.clone(),
+                    remarks: l.remarks.clone(),
+                    unit: l.unit.clone(),
+                    qty: format_scaled(l.qty.0, QTY_DECIMALS),
+                    unit_price: l.price.to_string(),
+                    net: l.net().to_string(),
+                    vat_percentage: format_scaled(l.vat_percentage, PCT_DECIMALS),
+                    vat_type: l.vat_type,
+                    vat_description: l.vat_description.clone(),
+                    gl_account: l.gl_account.clone(),
+                    product_code: l.product_code.clone(),
+                })
+                .collect(),
+            totals: PreparedTotals {
+                net: self.net().to_string(),
+                vat: vat.to_string(),
+                gross: (self.net() + vat).to_string(),
+                computed_by: "the CLI's computation, VAT per rate; Yuki books its own".into(),
+                vat_rounded_per_line: (self.vat_per_line() != vat)
+                    .then(|| self.vat_per_line().to_string()),
+                by_rate: rates
+                    .iter()
+                    .map(|r| PreparedRate {
+                        vat_percentage: format_scaled(r.percentage, PCT_DECIMALS),
+                        net: r.base.to_string(),
+                        vat: r.vat.to_string(),
+                    })
+                    .collect(),
             },
-            "lines": self.lines.iter().map(|l| json!({
-                "description": l.description,
-                "remarks": l.remarks,
-                "unit": l.unit,
-                "qty": format_scaled(l.qty.0, QTY_DECIMALS),
-                "unit_price": l.price.to_string(),
-                "net": l.net().to_string(),
-                "vat_percentage": format_scaled(l.vat_percentage, PCT_DECIMALS),
-                "vat_type": l.vat_type,
-                "vat_description": l.vat_description,
-                "gl_account": l.gl_account,
-                "product_code": l.product_code,
-            })).collect::<Vec<_>>(),
-            "totals": {
-                "net": self.net().to_string(),
-                "vat": vat.to_string(),
-                "gross": (self.net() + vat).to_string(),
-                "computed_by": "the CLI's computation, VAT per rate; Yuki books its own",
-                "vat_rounded_per_line": (self.vat_per_line() != vat).then(|| self.vat_per_line().to_string()),
-                "by_rate": rates.iter().map(|r| json!({
-                    "vat_percentage": format_scaled(r.percentage, PCT_DECIMALS),
-                    "net": r.base.to_string(),
-                    "vat": r.vat.to_string(),
-                })).collect::<Vec<_>>(),
-            },
-            "payment_reference": self.number.as_deref().and_then(|n| structured_reference(n).ok()),
-        })
-    }
-
-    /// [`prepared`](Self::prepared) with the issuing firm as `firm`
-    /// (`null` without a `[seller]` in the config).
-    pub fn prepared_for(&self, seller: Option<&Seller>) -> serde_json::Value {
-        let mut json = self.prepared();
-        json["firm"] = seller.map_or(serde_json::Value::Null, Seller::firm);
-        json
+            payment_reference: self
+                .number
+                .as_deref()
+                .and_then(|n| structured_reference(n).ok()),
+        };
+        serde_json::to_value(file).expect("serialize prepared invoice")
     }
 
     /// What booking it as `send` needs, checked in one place for every way
@@ -780,7 +794,7 @@ impl Invoice {
         x.opt("EmailAddress", &c.email);
         x.opt("VATNumber", &c.vat_number);
         if let Some(kind) = c.kind {
-            x.leaf("ContactType", kind);
+            x.leaf("ContactType", kind.as_str());
         }
         x.close("Contact");
 
@@ -1220,8 +1234,8 @@ fn validate_contact(spec: ContactSpec, p: &mut Problems) -> Contact {
     let kind = match p.text("contact.type", spec.kind) {
         None => None,
         Some(kind) => match kind.to_ascii_lowercase().as_str() {
-            "company" => Some("Company"),
-            "person" => Some("Person"),
+            "company" => Some(ContactKind::Company),
+            "person" => Some(ContactKind::Person),
             _ => {
                 p.push(format!(
                     "contact.type '{kind}' must be \"company\" or \"person\""
@@ -1360,71 +1374,75 @@ pub fn seller_missing() -> InvoiceError {
     ))
 }
 
-#[derive(Deserialize)]
-struct PreparedFile {
-    number: Option<String>,
-    admin_id: Option<String>,
-    subject: Option<String>,
-    date: PreparedDate,
-    due_date: Option<PreparedDate>,
-    currency: Option<String>,
-    payment_method: Option<String>,
-    notes: Option<String>,
-    remarks: Option<String>,
-    layout: Option<String>,
-    vat_mention: Option<String>,
-    customer: PreparedCustomer,
-    lines: Vec<PreparedLine>,
+/// A prepared invoice, as `prepare` prints it and `prepare --out` writes
+/// it, and as `create --prepared` reads it back: one shape for both, every
+/// key always present (`null` when unset).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreparedFile {
+    pub number: Option<String>,
+    pub admin_id: Option<String>,
+    pub subject: Option<String>,
+    pub date: PreparedDate,
+    pub due_date: Option<PreparedDate>,
+    pub currency: Option<String>,
+    pub payment_method: Option<String>,
+    pub notes: Option<String>,
+    pub remarks: Option<String>,
+    pub layout: Option<String>,
+    pub vat_mention: Option<String>,
+    pub firm: Option<Seller>,
+    pub customer: Contact,
+    pub lines: Vec<PreparedLine>,
+    /// The CLI's figures, for the PDF; `create --prepared` recomputes them.
+    pub totals: PreparedTotals,
+    pub payment_reference: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct PreparedDate {
-    iso: String,
+/// A date as ISO and as Dutch text (`31 oktober 2026`).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreparedDate {
+    pub iso: String,
+    pub text: String,
 }
 
-#[derive(Deserialize)]
-struct PreparedCustomer {
-    code: Option<String>,
-    name: Option<String>,
-    address: Option<String>,
-    address_2: Option<String>,
-    zipcode: Option<String>,
-    city: Option<String>,
-    country: Option<String>,
-    vat_number: Option<String>,
-    email: Option<String>,
-    #[serde(rename = "type")]
-    kind: Option<String>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreparedLine {
+    pub description: String,
+    pub remarks: Option<String>,
+    pub unit: Option<String>,
+    pub qty: String,
+    pub unit_price: String,
+    pub net: String,
+    pub vat_percentage: String,
+    pub vat_type: i64,
+    pub vat_description: Option<String>,
+    pub gl_account: Option<String>,
+    pub product_code: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct PreparedLine {
-    description: String,
-    remarks: Option<String>,
-    unit: Option<String>,
-    qty: String,
-    unit_price: String,
-    vat_percentage: String,
-    vat_type: i64,
-    vat_description: Option<String>,
-    gl_account: Option<String>,
-    product_code: Option<String>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreparedTotals {
+    pub net: String,
+    pub vat: String,
+    pub gross: String,
+    pub computed_by: String,
+    pub vat_rounded_per_line: Option<String>,
+    pub by_rate: Vec<PreparedRate>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreparedRate {
+    pub vat_percentage: String,
+    pub net: String,
+    pub vat: String,
 }
 
 impl Invoice {
-    /// What `prepare --out` writes: [`prepared_for`](Self::prepared_for) with
-    /// the administration the number is reserved in.
-    pub fn prepared_file(&self, seller: &Seller, admin_id: &str) -> serde_json::Value {
-        let mut json = self.prepared_for(Some(seller));
-        json["admin_id"] = admin_id.into();
-        json
-    }
-
     /// The invoice a prepared file describes, to book as `send`: exactly its
     /// number, dates, customer and lines. The file's own figures are not
     /// trusted; its content hash, checked against the reservation, is.
     pub fn from_prepared(
-        prepared: &serde_json::Value,
+        prepared: serde_json::Value,
         origin: &str,
         send: SendMode,
     ) -> Result<(Self, String), InvoiceError> {
@@ -1432,19 +1450,13 @@ impl Invoice {
             InvoiceError::InvalidInput(format!("{origin} is not a prepared invoice: {e}"))
         };
         let file: PreparedFile =
-            serde_json::from_value(prepared.clone()).map_err(|e| bad(e.to_string()))?;
+            serde_json::from_value(prepared).map_err(|e| bad(e.to_string()))?;
         let number = file
             .number
             .ok_or_else(|| bad("it has no number: run prepare with --number".into()))?;
         let admin_id = file.admin_id.ok_or_else(|| {
             bad("it names no administration: write it with `prepare --out`".into())
         })?;
-        let kind = match file.customer.kind.as_deref() {
-            None => None,
-            Some("Company") => Some("Company"),
-            Some("Person") => Some("Person"),
-            Some(other) => return Err(bad(format!("unknown customer type {other}"))),
-        };
         let lines = file
             .lines
             .into_iter()
@@ -1468,7 +1480,6 @@ impl Invoice {
             return Err(bad("it has no lines".into()));
         }
         let due_date = file.due_date.map(|d| d.iso);
-        let c = file.customer;
         let invoice = Self {
             origin: origin.to_string(),
             subject: file.subject,
@@ -1482,18 +1493,7 @@ impl Invoice {
             vat_mention: file.vat_mention,
             pdf: None,
             number: Some(number),
-            contact: Contact {
-                code: c.code,
-                name: c.name,
-                country: c.country,
-                address: c.address,
-                address_2: c.address_2,
-                zipcode: c.zipcode,
-                city: c.city,
-                vat_number: c.vat_number,
-                email: c.email,
-                kind,
-            },
+            contact: file.customer,
             lines,
             send: Some(send),
         };
@@ -1542,7 +1542,7 @@ pub fn write_prepared(
             out.display()
         )));
     }
-    let json = invoice.prepared_file(seller, admin_id);
+    let json = invoice.prepared(Some(seller), Some(admin_id));
     let hash = content_hash(&json);
     InvoiceLedger::open()?.reserve_prepared(
         &Claim {
@@ -1941,7 +1941,7 @@ pub async fn create(
             })?;
             let (json, hash) = read_prepared(path)?;
             let (mut invoice, admin_id) =
-                Invoice::from_prepared(&json, &path.display().to_string(), send)?;
+                Invoice::from_prepared(json, &path.display().to_string(), send)?;
             if let Some(pdf) = args.pdf {
                 invoice.attach_pdf(pdf)?;
             }
@@ -2053,7 +2053,7 @@ pub async fn prepare(
             }
             json
         }
-        _ => invoice.prepared_for(seller),
+        _ => invoice.prepared(seller, None),
     };
     println!(
         "{}",
