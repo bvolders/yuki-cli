@@ -345,9 +345,11 @@ invoice: it needs `--send` or `--book`, since Yuki numbers a draft itself when
 it is booked. `--number auto` reads the sales (`verkoop`) archive for the
 invoice year, where Yuki names each invoice PDF after its number
 (`Invoice 2026-19.pdf`; only `.pdf` files named `Invoice <year>-<seq>` or
-`Factuur <year>-<seq>` count), adds the numbers the local ledger holds, and
-takes one past the highest of the invoice date's year (`2026-20`), padded like
-the existing numbers. A number either already has is refused. Yuki's own
+`Factuur <year>-<seq>` count) and takes the lowest number above the archive's
+highest of the invoice date's year that the local ledger does not hold as
+reserved, pending or booked (`2026-20`), padded like the existing numbers. A
+number released or rejected is given out again, so the numbering keeps no
+gaps. A number the archive or the ledger already has is refused. Yuki's own
 counter does not learn about numbers given this way, so once you start, number
 every invoice here.
 
@@ -386,7 +388,13 @@ note naming both, until you check Sales in Yuki and resolve it.
 
 A reservation that will not be sent is freed with
 `yuki sales invoice numbers --release <number>` (or `--resolve <number>
-rejected`); the prepared file can then no longer be booked.
+rejected`); the prepared file can then no longer be booked, and the next
+`auto` gives the number out again. A booking that never reached Yuki (no
+connection, or refused unprocessed with HTTP 401, 403 or 429) puts its number
+back to reserved for the same file, so the same `create --prepared` can simply
+be run again. `prepare`, `create` and `numbers` warn about a reservation older
+than 7 days (`2026-20 reserved since 2026-10-01 for Buuurt: book it or
+--release it`): with continuous numbering, a number never booked is a gap.
 
 The ledger, `~/.config/yuki/invoice-numbers.json`, covers the time before the
 archive shows an invoice: a number is `reserved` by `prepare --out`, `pending`
@@ -397,6 +405,14 @@ check "To be sent" or Sales in Yuki, then
 with `--quiet --yes`, a booking prints one line to stderr:
 `BOOKS IMMEDIATELY: <number> <customer> <gross>`. The ledger keeps each
 administration's numbers apart, and `2026-01` is the same number as `2026-1`.
+Entries written before the ledger recorded the administration belong to the
+configuration's only administration, if it has one, and are saved as such on
+the next write. With several administrations they count for none: every
+command lists them in a warning, and only
+`yuki --admin <name> sales invoice numbers --resolve <number> booked|rejected`
+(or `--release`), with an explicit `--admin`, settles one, recording it as that
+administration's.
+
 The structured reference (`+++DDD/DDDD/DDDCC+++`) has ten base digits: the
 year, then the sequence padded to six digits, for a `<year>-<seq>` number
 (`2026-20` → `2026000020`), or else every digit of the number, left-padded with

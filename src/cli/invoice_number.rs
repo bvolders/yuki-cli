@@ -85,14 +85,29 @@ pub fn numbers_in_file_names(files: &[String]) -> Vec<String> {
 /// widest padded sequence of that year (Yuki's own are not padded:
 /// `2026-9`, `2026-10`).
 pub fn next_number(numbers: &[String], year: u32) -> String {
-    let numbers: Vec<YearNumber> = numbers
+    next_free(numbers, &[], year)
+}
+
+/// The lowest number for `year` above the highest in `archive` that `held`
+/// (the ledger's reserved, pending and booked numbers) does not hold: a
+/// number released or rejected is given out again rather than skipped, so
+/// the numbering stays without gaps. Padded as [`next_number`] pads.
+pub fn next_free(archive: &[String], held: &[String], year: u32) -> String {
+    let of_year = |numbers: &[String]| -> Vec<YearNumber> {
+        numbers
+            .iter()
+            .filter_map(|n| year_number(n))
+            .filter(|n| n.year == year)
+            .collect()
+    };
+    let (archived, held) = (of_year(archive), of_year(held));
+    let mut seq = archived.iter().map(|n| n.seq).max().unwrap_or(0) + 1;
+    while held.iter().any(|n| n.seq == seq) {
+        seq += 1;
+    }
+    let width = archived
         .iter()
-        .filter_map(|n| year_number(n))
-        .filter(|n| n.year == year)
-        .collect();
-    let seq = numbers.iter().map(|n| n.seq).max().unwrap_or(0) + 1;
-    let width = numbers
-        .iter()
+        .chain(&held)
         .filter(|n| n.digits > 1 && n.digits > n.seq.to_string().len())
         .map(|n| n.digits)
         .max()
@@ -161,7 +176,13 @@ pub async fn resolve(
     }
     let admin_id = config.target(admin)?.admin_id;
     let archive = archive_numbers(config, admin, &years).await?;
-    choose(request, year, &archive, &InvoiceLedger::peek()?, admin_id)
+    choose(
+        request,
+        year,
+        &archive,
+        &InvoiceLedger::peek(config)?,
+        admin_id,
+    )
 }
 
 /// [`resolve`] once the archive's numbers are known.
@@ -174,10 +195,7 @@ pub fn choose(
 ) -> Result<String, YukiError> {
     let held: Vec<String> = ledger.taken_numbers(admin).map(str::to_string).collect();
     let number = match request {
-        NumberRequest::Auto => {
-            let all: Vec<String> = archive.iter().chain(&held).cloned().collect();
-            next_number(&all, year)
-        }
+        NumberRequest::Auto => next_free(archive, &held, year),
         NumberRequest::Given(number) => number.clone(),
     };
     if taken(archive, &number) {
@@ -301,6 +319,25 @@ mod tests {
         assert_eq!(next_number(&numbers, 2027), "2027-1");
         let padded = ["2026-007", "2026-012"].map(String::from);
         assert_eq!(next_number(&padded, 2026), "2026-013");
+    }
+
+    #[test]
+    fn auto_fills_the_lowest_gap_above_the_archive() {
+        let archive = ["2026-19".to_string()];
+        let held = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(next_free(&archive, &held(&[]), 2026), "2026-20");
+        // 20 and 22 held, 21 released: 21 is given out again.
+        assert_eq!(
+            next_free(&archive, &held(&["2026-20", "2026-22"]), 2026),
+            "2026-21"
+        );
+        assert_eq!(
+            next_free(&archive, &held(&["2026-20", "2026-21", "2026-22"]), 2026),
+            "2026-23"
+        );
+        // Numbers below the archive's highest are never reused.
+        assert_eq!(next_free(&archive, &held(&["2026-5"]), 2026), "2026-20");
+        assert_eq!(next_free(&archive, &held(&["2025-20"]), 2026), "2026-20");
     }
 
     #[test]

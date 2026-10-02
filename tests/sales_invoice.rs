@@ -1187,3 +1187,132 @@ fn an_unattended_booking_must_name_the_number_it_books() {
     assert!(ok.status.success(), "{}", stderr(&ok));
     assert_eq!(status_of(&home, "2026-20"), "booked");
 }
+
+#[test]
+fn a_released_number_is_given_out_again_rather_than_skipped() {
+    let (root, _log) = mock(String::new());
+    let home = home_with_seller(&root);
+    let (a, b, c) = (
+        home.path().join("a.json"),
+        home.path().join("b.json"),
+        home.path().join("c.json"),
+    );
+    assert!(prepare_out(&home, "hosting", &a).status.success());
+    assert!(prepare_out(&home, "support", &b).status.success());
+    let release = yuki(
+        &home,
+        &["sales", "invoice", "numbers", "--release", "2026-20"],
+    );
+    assert!(release.status.success(), "{}", stderr(&release));
+    let out = prepare_out(&home, "hosting", &c);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(json(&out)["number"], "2026-20");
+}
+
+/// A ledger entry for 2026-20 written before entries named their administration.
+const LEGACY_LEDGER: &str = r#"{"version": 1, "entries": [{"number": "2026-20",
+    "date": "2026-10-31", "customer": "Old BV", "gross": "121.00",
+    "status": "pending", "recorded_at": "2026-10-01T10:00:00Z"}]}"#;
+
+#[test]
+fn a_legacy_entry_belongs_to_the_only_administration() {
+    let (root, _log) = mock(String::new());
+    let home = home_with_seller(&root);
+    let ledger = home.path().join(".config/yuki/invoice-numbers.json");
+    std::fs::write(&ledger, LEGACY_LEDGER).unwrap();
+    let file = home.path().join("a.json");
+    let out = prepare_out(&home, "hosting", &file);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(json(&out)["number"], "2026-21");
+    // Saved with the administration on that write.
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    assert_eq!(saved["entries"][0]["admin"], "admin-1");
+    assert!(!stderr(&out).contains("without an administration"));
+}
+
+#[test]
+fn with_several_administrations_a_legacy_entry_needs_an_explicit_admin() {
+    let (root, _log) = mock(String::new());
+    let second = format!(
+        "{SELLER}\n[administrations.second]\ndomain_id = \"domain-2\"\nadmin_id = \"admin-2\"\nbase_url = \"{root}\"\n"
+    );
+    let home = common::home_with_config(&root, "test-key", &second);
+    let ledger = home.path().join(".config/yuki/invoice-numbers.json");
+    std::fs::write(&ledger, LEGACY_LEDGER).unwrap();
+    let list = yuki(&home, &["sales", "invoice", "numbers", "--output", "json"]);
+    assert!(list.status.success(), "{}", stderr(&list));
+    assert!(
+        stderr(&list).contains("numbers recorded without an administration (2026-20)"),
+        "{}",
+        stderr(&list)
+    );
+    assert!(json(&list)["items"].as_array().unwrap().is_empty());
+    // Without --admin it is not this administration's to settle.
+    let implicit = yuki(
+        &home,
+        &[
+            "sales",
+            "invoice",
+            "numbers",
+            "--resolve",
+            "2026-20",
+            "booked",
+        ],
+    );
+    assert_eq!(implicit.status.code(), Some(3), "{}", stderr(&implicit));
+    let explicit = yuki(
+        &home,
+        &[
+            "--admin",
+            "example",
+            "sales",
+            "invoice",
+            "numbers",
+            "--resolve",
+            "2026-20",
+            "booked",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(explicit.status.success(), "{}", stderr(&explicit));
+    assert_eq!(json(&explicit)["items"][0]["Status"], "booked");
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    assert_eq!(saved["entries"][0]["admin"], "admin-1");
+}
+
+#[test]
+fn a_prepared_booking_that_never_reached_yuki_can_be_retried() {
+    // ProcessSalesInvoices is refused unprocessed (HTTP 401) the first time.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let (root, _log) = common::mock(move |r| match r.action.as_str() {
+        "Authenticate" => (200, response("Authenticate", "session-1")),
+        "ProcessSalesInvoices" => {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (401, "Unauthorized".into())
+            } else {
+                (
+                    200,
+                    response(
+                        "ProcessSalesInvoices",
+                        &import_response(true, true, false, "2026-20"),
+                    ),
+                )
+            }
+        }
+        "DocumentsInFolder" => (200, archive_page(r)),
+        other => (200, response(other, "")),
+    });
+    let home = home_with_seller(&root);
+    let file = home.path().join("prepared.json");
+    assert!(prepare_out(&home, "hosting", &file).status.success());
+    let args = ["--book", "--yes", "--confirm", "2026-20"];
+    let refused = create_prepared(&home, &file, &args);
+    assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
+    // Back to reserved for the same content, not freed.
+    assert_eq!(status_of(&home, "2026-20"), "reserved");
+    let retried = create_prepared(&home, &file, &args);
+    assert!(retried.status.success(), "{}", stderr(&retried));
+    assert_eq!(status_of(&home, "2026-20"), "booked");
+}

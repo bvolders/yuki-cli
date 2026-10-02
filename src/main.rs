@@ -515,7 +515,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                     )));
                                 }
                                 let number = invoice.number.as_deref().unwrap_or_default();
-                                InvoiceLedger::peek()?
+                                InvoiceLedger::peek(&config)?
                                     .check_reserved(&admin_id, number, &hash)
                                     .map_err(invalid_input)?;
                                 binding = Some(hash);
@@ -548,6 +548,10 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         }
                         let config = load()?;
                         let target = config.target(admin)?;
+                        yuki_cli::cli::invoice_ledger::warn(
+                            &InvoiceLedger::peek(&config)?,
+                            target.admin_id,
+                        );
                         if let Some(request) = &inputs.number {
                             invoice.number = Some(
                                 invoice_number::resolve(&config, admin, request, &invoice.date)
@@ -627,6 +631,12 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                         if out.is_some() && seller.is_none() {
                             return Err(invalid_input(sales_invoice::seller_missing()));
                         }
+                        if let Some(config) = &config
+                            && let Ok(target) = config.target(admin)
+                        {
+                            use yuki_cli::cli::invoice_ledger::{InvoiceLedger, warn};
+                            warn(&InvoiceLedger::peek(config)?, target.admin_id);
+                        }
                         if let (Some(request), Some(config)) = (&inputs.number, &config) {
                             config.target(admin)?;
                             invoice.number = Some(
@@ -636,11 +646,11 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             );
                         }
                         let json = match (&out, &config, seller) {
-                            (Some(out), Some(config), Some(seller)) => {
+                            (Some(out), Some(config), Some(_)) => {
                                 let admin_id = config.target(admin)?.admin_id;
                                 let json = sales_invoice::write_prepared(
                                     &invoice,
-                                    seller,
+                                    config,
                                     admin_id,
                                     std::path::Path::new(out),
                                 )
@@ -683,7 +693,13 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             (None, None) => None,
                         };
                         let config = load()?;
-                        invoice_ledger::numbers(config.target(admin)?.admin_id, settle, format)?;
+                        invoice_ledger::numbers(
+                            &config,
+                            config.target(admin)?.admin_id,
+                            admin.is_some(),
+                            settle,
+                            format,
+                        )?;
                     }
                     SalesInvoiceCommands::Templates => {
                         yuki_cli::cli::sales_invoice::templates(format)?;

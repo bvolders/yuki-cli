@@ -1523,10 +1523,11 @@ pub fn read_prepared(path: &Path) -> Result<(serde_json::Value, String), YukiErr
 /// existing file). Returns what was written.
 pub fn write_prepared(
     invoice: &Invoice,
-    seller: &Seller,
+    config: &Config,
     admin_id: &str,
     out: &Path,
 ) -> Result<serde_json::Value, YukiError> {
+    let seller = config.seller.as_ref().ok_or_else(seller_missing)?;
     let number = invoice
         .number
         .as_deref()
@@ -1545,7 +1546,7 @@ pub fn write_prepared(
     }
     let json = invoice.prepared_file(seller, admin_id);
     let hash = content_hash(&json);
-    InvoiceLedger::open()?.reserve_prepared(
+    InvoiceLedger::open(config)?.reserve_prepared(
         &Claim {
             admin: admin_id,
             number,
@@ -1559,7 +1560,7 @@ pub fn write_prepared(
     text.push('\n');
     if let Err(e) = crate::ledger::atomic_write(out, text.as_bytes()) {
         // Nothing to send without the file: free the number again.
-        let _ = InvoiceLedger::open().and_then(|mut l| l.release(admin_id, number));
+        let _ = InvoiceLedger::open(config).and_then(|mut l| l.release(admin_id, number));
         return Err(YukiError::Config(format!("{}: {e}", out.display())));
     }
     Ok(json)
@@ -1668,7 +1669,7 @@ pub async fn submit_numbered(
         return Ok(verdict(&import, invoice));
     };
     let admin_id = config.target(admin)?.admin_id;
-    let mut ledger = InvoiceLedger::open()?;
+    let mut ledger = InvoiceLedger::open(config)?;
     match prepared {
         Some(hash) => ledger.send_reserved(admin_id, number, hash)?,
         None => ledger.reserve(&Claim {
@@ -1684,13 +1685,21 @@ pub async fn submit_numbered(
     let result = submit(config, admin, invoice, format, quiet)
         .await
         .map(|import| verdict(&import, invoice));
-    let outcome = InvoiceLedger::open().and_then(|mut ledger| match &result {
+    let outcome = InvoiceLedger::open(config).and_then(|mut ledger| match &result {
         Ok(Verdict::Done) => ledger.commit(admin_id, number).map(|()| true),
         // Booked under this number, only not sent as asked.
         Ok(Verdict::SendIncomplete(message)) => ledger
             .note(admin_id, number, message)
             .and_then(|()| ledger.commit(admin_id, number))
             .map(|()| true),
+        // Nothing reached Yuki: a prepared invoice keeps its number, to retry.
+        Err(SubmitError::Yuki(_)) if prepared.is_some() => {
+            ledger.unsend(admin_id, number)?;
+            eprintln!(
+                "invoice number {number} is reserved again for this prepared invoice: nothing reached Yuki, so run the same create --prepared again"
+            );
+            Ok(true)
+        }
         Ok(Verdict::Rejected { freed: true, .. }) | Err(SubmitError::Yuki(_)) => {
             ledger.reject(admin_id, number).map(|()| true)
         }
