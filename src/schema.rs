@@ -257,7 +257,7 @@ pub fn generate() -> Value {
             },
             {
                 "name": "sales invoice create",
-                "description": "Create a sales invoice in Yuki from a TOML file or a saved template: a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 (invoice_rejected) when Yuki fails or skips the invoice.",
+                "description": "Create a sales invoice in Yuki from a TOML file or a saved template: a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 with invalid_input for a bad file, confirmation_required when not confirmed, and invoice_rejected when Yuki fails or skips the invoice or does not book or email what --send asked.",
                 "mutating": true,
                 "args": [
                     {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file or --template is required."},
@@ -269,7 +269,6 @@ pub fn generate() -> Value {
                     {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it, the invoice is a draft."},
                     {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."}
                 ],
-                "errors": ["config_error", "auth_failed", "confirmation_required", "invoice_rejected", "error"],
                 "output_fields": [
                     {"name": "Succeeded", "type": "string"},
                     {"name": "Processed", "type": "string"},
@@ -652,10 +651,16 @@ pub fn generate() -> Value {
                 "description": "A mutating command was invoked non-interactively without --yes."
             },
             {
+                "kind": "invalid_input",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "An invoice file or template is missing or invalid; every problem is listed."
+            },
+            {
                 "kind": "invoice_rejected",
                 "exit_code": 1,
                 "retryable": false,
-                "description": "Yuki answered, but failed or skipped an invoice; its message is in the output and the error."
+                "description": "Yuki answered, but failed or skipped an invoice, or did not book or email it as --send asked; its message is in the output and the error."
             },
             {
                 "kind": "error",

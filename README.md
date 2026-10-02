@@ -259,11 +259,13 @@ unbooked and without an invoice number, so you can still check or edit it in
 Yuki. `--send email|peppol|both` books it instead (Yuki numbers it) and sends it.
 Before any write, the command prints a preview to stderr (customer, lines, net,
 VAT, gross total, and whether it creates a draft or books and sends) and asks
-for confirmation. `--yes` skips the prompt and is required when stdin is not a
-terminal. `--dry-run` prints the preview, then the exact `xmlDoc` on stdout, and
+for confirmation, which declines unless you answer `y`. `--yes` skips the prompt
+and is required when stdin or stderr is not a terminal. `--dry-run` prints the preview, then the exact `xmlDoc` on stdout, and
 contacts nothing, not even to authenticate. The command exits 1 with kind
-`invoice_rejected` when Yuki fails or skips the invoice, after printing Yuki's
-message.
+`invoice_rejected` when Yuki fails or skips the invoice, or does not book or
+email it as `--send` asked, after printing Yuki's answer; `invalid_input` lists
+every problem in the file; `confirmation_required` means nothing was sent.
+Totals must be positive: credit notes are not supported.
 
 Recurring invoices are templates you run yourself: one file per customer in
 `~/.config/yuki/invoices/<name>.toml`, created each month with `--template`

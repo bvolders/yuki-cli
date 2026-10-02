@@ -30,6 +30,13 @@ const PCT_DECIMALS: u32 = 2;
 /// `Notes` and `PaymentMethod` length limits from the XSD.
 const NOTES_MAX: usize = 500;
 const PAYMENT_METHOD_MAX: usize = 60;
+/// Ten integer digits: the XSD's limit on `ProductQuantity` and `SalesPrice`
+/// (totalDigits 14, fractionDigits 4) and on a line amount (12, 2).
+const QTY_MAX: i64 = 10_i64.pow(10 + QTY_DECIMALS);
+const PRICE_MAX: i64 = 10_i64.pow(12);
+const LINE_AMOUNT_MAX: i128 = 10_i128.pow(12);
+/// The longest payment term accepted, in days.
+const DUE_DAYS_MAX: i64 = 3_650;
 
 /// How a created invoice leaves Yuki. Without one, the invoice is a draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -68,19 +75,30 @@ pub struct Quantity(i64);
 pub fn parse_quantity(text: &str) -> Result<Quantity, String> {
     match parse_scaled(text, QTY_DECIMALS)? {
         0 => Err("a quantity cannot be zero".into()),
+        q if q.abs() >= QTY_MAX => Err(format!("'{text}' exceeds Yuki's 10 integer digits")),
         q => Ok(Quantity(q)),
     }
 }
 
 /// Parse a unit price with up to two decimals (`--price`, `price`).
 pub fn parse_price(text: &str) -> Result<Cents, String> {
-    Cents::parse_exact(text)
+    match Cents::parse_exact(text)? {
+        price if price.0.abs() >= PRICE_MAX => {
+            Err(format!("'{text}' exceeds Yuki's 10 integer digits"))
+        }
+        price => Ok(price),
+    }
 }
 
 /// Accept an ISO calendar date (`--date`, `date`, `due_date`).
 pub fn parse_date(text: &str) -> Result<String, String> {
     let text = text.trim();
-    if text.len() == 10 && epoch_days(text).is_some() {
+    let shaped = text.len() == 10
+        && text.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        });
+    if shaped && epoch_days(text).is_some() {
         Ok(text.to_string())
     } else {
         Err(format!("'{text}' is not a date (YYYY-MM-DD)"))
@@ -206,8 +224,13 @@ pub struct Line {
 impl Line {
     /// `qty × price`, rounded half away from zero to the cent.
     pub fn net(&self) -> Cents {
+        // Validation bounds the amount to LINE_AMOUNT_MAX, so it fits.
+        Cents(self.net_exact() as i64)
+    }
+
+    fn net_exact(&self) -> i128 {
         let exact = i128::from(self.qty.0) * i128::from(self.price.0);
-        Cents(div_round(exact, 10_i128.pow(QTY_DECIMALS)) as i64)
+        div_round(exact, 10_i128.pow(QTY_DECIMALS))
     }
 }
 
@@ -278,6 +301,11 @@ impl Invoice {
     /// The currency shown in the preview: Yuki's default is EUR.
     fn currency_label(&self) -> &str {
         self.currency.as_deref().unwrap_or("EUR")
+    }
+
+    /// Whether the invoice names its currency, rather than taking Yuki's default.
+    fn currency_given(&self) -> bool {
+        self.currency.is_some()
     }
 
     /// The yes/no question the confirmation prompt asks.
@@ -397,11 +425,20 @@ impl Invoice {
                 rate.base
             );
         }
-        let _ = write!(
+        let _ = writeln!(
             out,
             "  {:<15}{:>12} {currency}",
             "Gross total",
             self.gross().to_string()
+        );
+        let default = if self.currency_given() {
+            ""
+        } else {
+            "; no currency given, so Yuki's default (EUR)"
+        };
+        let _ = write!(
+            out,
+            "  (VAT computed per rate; Yuki books its own figures{default})"
         );
         out
     }
@@ -616,11 +653,11 @@ impl Problems {
         if value.is_empty() {
             return None;
         }
-        if value
-            .chars()
-            .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
-        {
-            self.push(format!("{field} contains a control character"));
+        if value.chars().any(|c| {
+            (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+                || matches!(c, '\u{FFFE}' | '\u{FFFF}')
+        }) {
+            self.push(format!("{field} contains a character XML cannot carry"));
         }
         Some(value)
     }
@@ -668,7 +705,13 @@ fn validate(
     let mut p = Problems::default();
 
     let subject = match overrides.subject {
-        Some(subject) => p.text("--subject", Some(subject.to_string())),
+        Some(subject) => {
+            let subject = p.text("--subject", Some(subject.to_string()));
+            if subject.is_none() {
+                p.push("--subject cannot be empty");
+            }
+            subject
+        }
         None => p.text("subject", spec.subject),
     };
     let date = match overrides.date {
@@ -689,8 +732,8 @@ fn validate(
             }
             Some(due)
         }
-        (None, Some(days)) if days < 0 => {
-            p.push("due_days cannot be negative");
+        (None, Some(days)) if !(0..=DUE_DAYS_MAX).contains(&days) => {
+            p.push(format!("due_days must be between 0 and {DUE_DAYS_MAX}"));
             None
         }
         (None, Some(days)) => epoch_days(&date).map(|d| date_from_epoch_days(d + days)),
@@ -752,6 +795,17 @@ fn validate(
         .enumerate()
         .filter_map(|(i, line)| validate_line(line, i + 1, overrides, &mut p))
         .collect();
+
+    let net: i128 = lines.iter().map(|l| i128::from(l.net().0)).sum();
+    if !lines.is_empty() && net <= 0 {
+        p.push(format!(
+            "the invoice total is {}: credit notes and zero invoices are not supported",
+            Cents(net as i64)
+        ));
+    }
+    if send.is_some_and(SendMode::email) && contact.code.is_none() && contact.email.is_none() {
+        p.push("--send email needs contact.email for a contact without a code");
+    }
 
     if !p.0.is_empty() {
         return Err(p.0);
@@ -887,7 +941,7 @@ fn validate_line(
     let vat_description = p.text(&field("vat_description"), spec.vat_description);
     let gl_account = p.text(&field("gl_account"), spec.gl_account);
     let product_code = p.text(&field("product_code"), spec.product_code);
-    Some(Line {
+    let line = Line {
         description: description?,
         qty: qty?,
         price: price?,
@@ -896,7 +950,20 @@ fn validate_line(
         vat_description,
         gl_account,
         product_code,
-    })
+    };
+    if line.price == Cents::ZERO {
+        p.push(format!(
+            "lines[{n}].price cannot be 0: Yuki would bill the catalogue price instead"
+        ));
+        return None;
+    }
+    if line.net_exact().abs() >= LINE_AMOUNT_MAX {
+        p.push(format!(
+            "lines[{n}]: qty × price exceeds Yuki's 10 integer digits for a line amount"
+        ));
+        return None;
+    }
+    Some(line)
 }
 
 // ---------------------------------------------------------------------------
@@ -955,7 +1022,6 @@ pub async fn submit(
 
     if !quiet {
         print_import(&import, format);
-        warn_unsent(&import, invoice.send);
     }
     Ok(import)
 }
@@ -992,21 +1058,31 @@ fn print_import(import: &SalesInvoicesImport, format: Option<&str>) {
     }
 }
 
-/// Say so when Yuki accepted an invoice but did not do what `--send` asked.
-fn warn_unsent(import: &SalesInvoicesImport, send: Option<SendMode>) {
-    let Some(mode) = send else { return };
-    for invoice in import.invoices.iter().filter(|i| i.succeeded) {
-        let name = if invoice.reference.is_empty() {
-            &invoice.subject
-        } else {
-            &invoice.reference
-        };
-        if !invoice.processed {
-            eprintln!("warning: Yuki saved invoice {name} but did not book it");
-        } else if mode.email() && !invoice.email_sent {
-            eprintln!("warning: Yuki booked invoice {name} but reports it was not emailed");
-        }
-    }
+/// Why Yuki did not do what `--send` asked of an invoice it accepted: not
+/// booked, or (when emailing) not emailed. Peppol delivery is not reported
+/// back, so it cannot be checked.
+pub fn unsent(import: &SalesInvoicesImport, send: Option<SendMode>) -> Option<String> {
+    let mode = send?;
+    let problems: Vec<String> = import
+        .invoices
+        .iter()
+        .filter(|i| i.succeeded)
+        .filter_map(|invoice| {
+            let name = if invoice.reference.is_empty() {
+                &invoice.subject
+            } else {
+                &invoice.reference
+            };
+            if !invoice.processed {
+                Some(format!("Yuki saved invoice {name} but did not book it"))
+            } else if mode.email() && !invoice.email_sent {
+                Some(format!("Yuki booked invoice {name} but did not email it"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    (!problems.is_empty()).then(|| problems.join("; "))
 }
 
 /// List the saved templates, each validated as `create` would read it.

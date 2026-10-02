@@ -375,7 +375,7 @@ fn control_characters_cannot_reach_the_xml() {
         &Overrides::default(),
     );
     assert!(
-        err.contains("lines[1].description contains a control character"),
+        err.contains("lines[1].description contains a character XML cannot carry"),
         "{err}"
     );
 }
@@ -454,4 +454,72 @@ fn only_an_explicit_yes_confirms() {
         assert_eq!(got, confirmed, "{answer:?}");
         assert_eq!(String::from_utf8(prompt).unwrap(), "Create? [y/N] ");
     }
+}
+
+#[test]
+fn malformed_dates_and_terms_are_rejected() {
+    for bad in ["2026-1-012", "+026-01-01", "2026-+2-01", "2026/10/01"] {
+        assert!(parse_date(bad).is_err(), "{bad:?}");
+    }
+    let err = problems(
+        &MINIMAL.replace(
+            "date = \"2026-10-01\"",
+            "date = \"2026-10-01\"\ndue_days = 9223372036854775807",
+        ),
+        &Overrides::default(),
+    );
+    assert!(err.contains("due_days must be between 0 and 3650"), "{err}");
+}
+
+#[test]
+fn amounts_beyond_the_xsd_digits_are_rejected() {
+    assert!(parse_quantity("10000000000").is_err());
+    assert!(parse_quantity("9999999999.9999").is_ok());
+    assert!(parse_price("10000000000").is_err());
+    let err = problems(
+        &MINIMAL.replace("price = 1250", "price = 9999999999.99\nqty = 1000000000"),
+        &Overrides::default(),
+    );
+    assert!(
+        err.contains("exceeds Yuki's 10 integer digits for a line amount"),
+        "{err}"
+    );
+}
+
+#[test]
+fn zero_prices_and_non_positive_totals_are_rejected() {
+    let err = problems(
+        &MINIMAL.replace("price = 1250", "price = 0"),
+        &Overrides::default(),
+    );
+    assert!(err.contains("price cannot be 0"), "{err}");
+    let err = problems(
+        &MINIMAL.replace("price = 1250", "price = -5"),
+        &Overrides::default(),
+    );
+    assert!(err.contains("the invoice total is -5.00"), "{err}");
+}
+
+#[test]
+fn xml_non_characters_and_an_empty_subject_override_are_rejected() {
+    let err = problems(
+        &MINIMAL.replace("Consultancy", "A\\uFFFEB"),
+        &Overrides::default(),
+    );
+    assert!(err.contains("a character XML cannot carry"), "{err}");
+    let overrides = Overrides {
+        subject: Some(" "),
+        ..Default::default()
+    };
+    assert!(problems(MINIMAL, &overrides).contains("--subject cannot be empty"));
+}
+
+#[test]
+fn emailing_a_new_contact_needs_its_address() {
+    let text = MINIMAL.replace("code = \"C0042\"", "name = \"New\"\ncountry = \"BE\"");
+    let err = parse(&text, "t", &Overrides::default(), Some(SendMode::Email))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--send email needs contact.email"), "{err}");
+    assert!(parse(&text, "t", &Overrides::default(), None).is_ok());
 }

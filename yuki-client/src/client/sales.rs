@@ -154,7 +154,7 @@ impl SalesClient {
         SoapEnvelope::new("ProcessSalesInvoices")
             .param("sessionId", session_id)
             .param("administrationId", administration_id)
-            .xml_param("xmlDoc", xml_doc)
+            .param_xml("xmlDoc", xml_doc)
             .build()
     }
 

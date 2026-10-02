@@ -205,7 +205,41 @@ fn send_email_books_and_emails_the_invoice() {
     ] {
         assert!(body.contains(fragment), "{fragment} missing from:\n{body}");
     }
+    // Escaped exactly once, inside a document that is not itself escaped.
+    assert!(
+        !body.contains("&amp;amp;") && !body.contains("&lt;SalesInvoices"),
+        "{body}"
+    );
     assert!(stderr(&output).contains("BOOK AND SEND BY EMAIL"));
+}
+
+#[test]
+fn a_send_yuki_did_not_carry_out_fails_even_when_quiet() {
+    for (processed, email_sent, expected) in [
+        (false, false, "did not book it"),
+        (true, false, "did not email it"),
+    ] {
+        let (root, _log) = mock(import_response(true, processed, email_sent, "2026-0043"));
+        let home = home_with_config(&root);
+        let output = yuki(
+            &home,
+            &[
+                "sales",
+                "invoice",
+                "create",
+                "--template",
+                "hosting",
+                "--send",
+                "email",
+                "--yes",
+                "--quiet",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{expected}");
+        let err = stderr(&output);
+        assert!(err.contains("\"kind\":\"invoice_rejected\""), "{err}");
+        assert!(err.contains(expected), "{err}");
+    }
 }
 
 #[test]
@@ -328,7 +362,7 @@ fn an_invalid_file_is_reported_before_anything_else() {
     assert_eq!(output.status.code(), Some(1));
     let err = stderr(&output);
     assert!(err.contains("contact.country is required"), "{err}");
-    assert!(err.contains("\"kind\":\"config_error\""), "{err}");
+    assert!(err.contains("\"kind\":\"invalid_input\""), "{err}");
     assert!(actions(&log).is_empty());
 }
 

@@ -35,12 +35,13 @@ impl SoapEnvelope {
         self
     }
 
-    /// Add a parameter whose value is an XML fragment, inserted unescaped as
-    /// child elements: for `s:any` parameters such as the `xmlDoc` of
+    /// Add a parameter whose value is raw XML, inserted unescaped as child
+    /// elements: for `s:any` parameters such as the `xmlDoc` of
     /// `ProcessSalesInvoices`, which take a document rather than text. The
-    /// caller owns the fragment's well-formedness and the escaping inside it.
-    pub fn xml_param(self, name: &str, xml: &str) -> Self {
-        self.param(name, xml)
+    /// caller guarantees the fragment is well-formed and escaped inside.
+    pub fn param_xml(mut self, name: &str, xml: &str) -> Self {
+        self.params.push((name.to_string(), xml.to_string()));
+        self
     }
 
     pub fn build(self) -> String {

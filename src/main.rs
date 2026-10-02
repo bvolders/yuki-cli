@@ -20,6 +20,8 @@ enum AppError {
     ConfirmationRequired(String),
     /// Yuki answered, but did not accept every invoice.
     InvoiceRejected(String),
+    /// An invoice file or template that cannot be read or is invalid.
+    InvalidInput(String),
 }
 
 impl fmt::Display for AppError {
@@ -27,7 +29,9 @@ impl fmt::Display for AppError {
         match self {
             Self::Yuki(e) => write!(f, "{e}"),
             Self::Other(e) => write!(f, "{e}"),
-            Self::ConfirmationRequired(message) | Self::InvoiceRejected(message) => {
+            Self::ConfirmationRequired(message)
+            | Self::InvoiceRejected(message)
+            | Self::InvalidInput(message) => {
                 write!(f, "{message}")
             }
         }
@@ -51,7 +55,7 @@ impl AppError {
         match self {
             Self::Yuki(e) => e.exit_code(),
             Self::Other(_) => 1,
-            Self::ConfirmationRequired(_) | Self::InvoiceRejected(_) => 1,
+            Self::ConfirmationRequired(_) | Self::InvoiceRejected(_) | Self::InvalidInput(_) => 1,
         }
     }
 
@@ -67,6 +71,7 @@ impl AppError {
             Self::Other(_) => "error",
             Self::ConfirmationRequired(_) => "confirmation_required",
             Self::InvoiceRejected(_) => "invoice_rejected",
+            Self::InvalidInput(_) => "invalid_input",
         }
     }
 }
@@ -448,7 +453,12 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                             date: date.as_deref(),
                             subject: subject.as_deref(),
                         };
-                        let invoice = sales_invoice::load(&source, &overrides, send)?;
+                        let invoice = sales_invoice::load(&source, &overrides, send).map_err(
+                            |e| match e {
+                                YukiError::Config(message) => AppError::InvalidInput(message),
+                                other => other.into(),
+                            },
+                        )?;
                         // A dry run needs no configuration and makes no API call.
                         if dry_run {
                             if !cli.quiet {
@@ -470,14 +480,18 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                                 ));
                             }
                             if !sales_invoice::confirm(&invoice.question())? {
-                                eprintln!("Cancelled: nothing was sent to Yuki.");
-                                return Ok(());
+                                return Err(AppError::ConfirmationRequired(
+                                    "not confirmed: nothing was sent to Yuki".into(),
+                                ));
                             }
                         }
                         let import =
                             sales_invoice::submit(&config, admin, &invoice, format, cli.quiet)
                                 .await?;
-                        if let Some(failure) = import.failure() {
+                        if let Some(failure) = import
+                            .failure()
+                            .or_else(|| sales_invoice::unsent(&import, invoice.send))
+                        {
                             return Err(AppError::InvoiceRejected(failure));
                         }
                     }
