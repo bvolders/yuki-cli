@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{Request, RequestLog as Log, fault, json, response, stderr, yuki};
+use common::{Request, RequestLog as Log, fails, fault, json, ok, response, stderr, yuki};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -157,19 +157,6 @@ fn mark(home: &TempDir, file: &Path, extra: &[&str]) -> Output {
     let mut args = vec!["upload", "mark", file.to_str().unwrap()];
     args.extend_from_slice(extra);
     yuki(home, &args)
-}
-
-#[track_caller]
-fn ok(out: &Output) {
-    assert!(out.status.success(), "{}", stderr(out));
-}
-
-/// The command exited with `code` and said `needle` on stderr.
-#[track_caller]
-fn fails(out: &Output, code: i32, needle: &str) {
-    let err = stderr(out);
-    assert_eq!(out.status.code(), Some(code), "{err}");
-    assert!(err.contains(needle), "{needle:?} not in: {err}");
 }
 
 /// The output row for `path`.

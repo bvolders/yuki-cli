@@ -7,7 +7,8 @@ use std::path::Path;
 use std::process::Output;
 
 use common::{
-    Request, RequestLog, actions, bodies, fault, json, response, stderr, stdout_json, yuki,
+    Request, RequestLog, actions, bodies, fails, fault, json, ok, response, stderr, stdout_json,
+    yuki,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -126,7 +127,7 @@ fn a_template_draft_is_created_with_yes() {
             "json",
         ],
     );
-    assert!(output.status.success(), "{}", stderr(&output));
+    ok(&output);
     let json = json(&output);
     assert_eq!(json["total"], 1);
     assert_eq!(json["items"][0]["Succeeded"], "Yes");
@@ -205,7 +206,7 @@ fn a_dry_run_prints_the_document_and_makes_no_call() {
             "--dry-run",
         ],
     );
-    assert!(output.status.success(), "{}", stderr(&output));
+    ok(&output);
     let xml = String::from_utf8_lossy(&output.stdout);
     assert!(
         xml.starts_with(
@@ -234,7 +235,7 @@ fn a_dry_run_needs_no_configuration() {
             "--dry-run",
         ],
     );
-    assert!(output.status.success(), "{}", stderr(&output));
+    ok(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("<Process>false</Process>"));
 }
 
@@ -287,7 +288,7 @@ fn templates_lists_valid_and_invalid_templates() {
         &home,
         &["sales", "invoice", "templates", "--output", "json"],
     );
-    assert!(output.status.success(), "{}", stderr(&output));
+    ok(&output);
     let json = json(&output);
     let items = json["items"].as_array().expect("items");
     assert_eq!(items.len(), 2, "{json}");
@@ -403,7 +404,7 @@ fn send_email_books_and_emails_the_invoice() {
         "2026-0042",
         &prepared,
     );
-    assert!(out.status.success(), "{}", stderr(&out));
+    ok(&out);
     let output = create_prepared(
         &home,
         &prepared,
@@ -417,7 +418,7 @@ fn send_email_books_and_emails_the_invoice() {
             "json",
         ],
     );
-    assert!(output.status.success(), "{}", stderr(&output));
+    ok(&output);
     let json = json(&output);
     let row = &json["items"][0];
     assert_eq!(
@@ -484,7 +485,7 @@ fn two_prepared_invoices_get_distinct_numbers_and_book_as_prepared() {
     let first = home.path().join("2026-10-hosting.json");
     let second = home.path().join("2026-10-support.json");
     let out = prepare_out(&home, "hosting", &first);
-    assert!(out.status.success(), "{}", stderr(&out));
+    ok(&out);
     assert!(stderr(&out).contains("Reserved invoice number 2026-20"));
     // Only the invoice year is read, strictly: pages until an empty one.
     let starts: Vec<String> = log
@@ -506,7 +507,7 @@ fn two_prepared_invoices_get_distinct_numbers_and_book_as_prepared() {
         ["2026-01-01 2026-12-31 0", "2026-01-01 2026-12-31 3"]
     );
     let out = prepare_out(&home, "support", &second);
-    assert!(out.status.success(), "{}", stderr(&out));
+    ok(&out);
     let written: Value = serde_json::from_slice(&std::fs::read(&second).unwrap()).unwrap();
     assert_eq!(written["number"], "2026-21");
     assert_eq!(written["firm"]["name"], "Example Studio");
@@ -517,12 +518,7 @@ fn two_prepared_invoices_get_distinct_numbers_and_book_as_prepared() {
     assert_eq!(status_of(&home, "2026-21"), "reserved");
     // --out never overwrites.
     let again = prepare_out(&home, "hosting", &first);
-    assert_eq!(again.status.code(), Some(1));
-    assert!(
-        stderr(&again).contains("exists already"),
-        "{}",
-        stderr(&again)
-    );
+    fails(&again, 1, "exists already");
     assert_eq!(status_of(&home, "2026-22"), Value::Null);
 
     // The first is booked with its PDF, exactly as prepared.
@@ -531,7 +527,7 @@ fn two_prepared_invoices_get_distinct_numbers_and_book_as_prepared() {
     let base64 = "JVBERi0xLjcgcmVuZGVyZWQgZnJvbSB0aGUgcHJlcGFyZWQgSlNPTg==";
     let pdf_arg = pdf.to_str().unwrap();
     let dry = create_prepared(&home, &first, &["--pdf", pdf_arg, "--book", "--dry-run"]);
-    assert!(dry.status.success(), "{}", stderr(&dry));
+    ok(&dry);
     let xml = String::from_utf8_lossy(&dry.stdout);
     assert!(!xml.contains(base64), "{xml}");
     assert!(xml.contains("bytes base64 (40-byte PDF)"), "{xml}");
@@ -550,7 +546,7 @@ fn two_prepared_invoices_get_distinct_numbers_and_book_as_prepared() {
             "json",
         ],
     );
-    assert!(booked.status.success(), "{}", stderr(&booked));
+    ok(&booked);
     assert_eq!(json(&booked)["items"][0]["PDF"], "Invoice 2026-20.pdf");
     let body = sent_body(&log);
     for fragment in [
@@ -570,12 +566,7 @@ fn two_prepared_invoices_get_distinct_numbers_and_book_as_prepared() {
     assert_eq!(status_of(&home, "2026-21"), "reserved");
     // A prepared invoice books once.
     let twice = create_prepared(&home, &first, &["--book", "--yes"]);
-    assert_eq!(twice.status.code(), Some(1));
-    assert!(
-        stderr(&twice).contains("is booked already"),
-        "{}",
-        stderr(&twice)
-    );
+    fails(&twice, 1, "is booked already");
 }
 
 #[test]
@@ -583,14 +574,14 @@ fn a_prepared_file_that_changed_or_lost_its_reservation_is_refused() {
     let (root, log) = mock(import_response(true, true, false, "2026-20"));
     let home = home(&root);
     let file = home.path().join("prepared.json");
-    assert!(prepare_out(&home, "hosting", &file).status.success());
+    ok(&prepare_out(&home, "hosting", &file));
     let original = std::fs::read_to_string(&file).unwrap();
 
     // Reformatted is the same content; a changed price is not.
     let reformatted: Value = serde_json::from_str(&original).unwrap();
     std::fs::write(&file, serde_json::to_string(&reformatted).unwrap()).unwrap();
     let dry = create_prepared(&home, &file, &["--book", "--dry-run"]);
-    assert!(dry.status.success(), "{}", stderr(&dry));
+    ok(&dry);
     std::fs::write(&file, original.replace("\"100.00\"", "\"90.00\"")).unwrap();
     let edited = create_prepared(&home, &file, &["--book", "--yes"]);
     assert_eq!(edited.status.code(), Some(1));
@@ -615,15 +606,10 @@ fn a_prepared_file_that_changed_or_lost_its_reservation_is_refused() {
             "rejected",
         ],
     );
-    assert!(release.status.success(), "{}", stderr(&release));
+    ok(&release);
     assert_eq!(status_of(&home, "2026-20"), "rejected");
     let released = create_prepared(&home, &file, &["--book", "--yes"]);
-    assert_eq!(released.status.code(), Some(1));
-    assert!(
-        stderr(&released).contains("is not reserved"),
-        "{}",
-        stderr(&released)
-    );
+    fails(&released, 1, "is not reserved");
     assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
     // Nothing is left to settle.
     let bad = yuki(
@@ -646,60 +632,64 @@ fn flags_that_would_change_a_prepared_invoice_are_refused() {
     let (root, log) = mock(import_response(true, true, false, "2026-20"));
     let home = home(&root);
     let file = home.path().join("prepared.json");
-    assert!(prepare_out(&home, "hosting", &file).status.success());
-    for extra in [
-        ["--qty", "2"],
-        ["--price", "1.00"],
-        ["--date", "2026-10-01"],
-        ["--subject", "Other"],
-        ["--template", "hosting"],
-        ["--file", "x.toml"],
+    ok(&prepare_out(&home, "hosting", &file));
+    let prepared = file.to_str().unwrap();
+    // clap refuses each before anything runs.
+    for (args, needle) in [
+        (
+            vec!["--prepared", prepared, "--qty", "2"],
+            "cannot be used with",
+        ),
+        (
+            vec!["--prepared", prepared, "--price", "1.00"],
+            "cannot be used with",
+        ),
+        (
+            vec!["--prepared", prepared, "--date", "2026-10-01"],
+            "cannot be used with",
+        ),
+        (
+            vec!["--prepared", prepared, "--subject", "Other"],
+            "cannot be used with",
+        ),
+        (
+            vec!["--prepared", prepared, "--template", "hosting"],
+            "cannot be used with",
+        ),
+        (
+            vec!["--prepared", prepared, "--file", "x.toml"],
+            "cannot be used with",
+        ),
+        // Only a prepared invoice carries a CLI number.
+        (
+            vec!["--template", "hosting", "--number", "2026-30"],
+            "unexpected argument '--number'",
+        ),
+        // A PDF needs a prepared invoice, alone or next to a template.
+        (
+            vec!["--template", "hosting", "--pdf", "x.pdf"],
+            "'--pdf <PATH>' cannot be used with",
+        ),
+        (
+            vec!["--pdf", "x.pdf"],
+            "required arguments were not provided:\n  --prepared <FILE>",
+        ),
     ] {
-        let mut args = extra.to_vec();
-        args.extend(["--book", "--yes"]);
-        let out = create_prepared(&home, &file, &args);
-        assert_eq!(out.status.code(), Some(2), "{extra:?}: {}", stderr(&out));
-        assert!(
-            stderr(&out).contains("cannot be used with"),
-            "{extra:?}: {}",
-            stderr(&out)
-        );
+        let mut all = args.clone();
+        all.extend(["--book", "--yes"]);
+        fails(&create(&home, &all), 2, needle);
     }
-    // create takes no number: only a prepared invoice carries one.
-    let numbered = create(
-        &home,
-        &[
-            "--template",
-            "hosting",
-            "--number",
-            "2026-30",
-            "--book",
-            "--yes",
-        ],
+    // A prepared invoice is booked; and there must be something to create.
+    fails(
+        &create_prepared(&home, &file, &["--yes"]),
+        1,
+        "a prepared invoice is booked",
     );
-    assert_eq!(numbered.status.code(), Some(2), "{}", stderr(&numbered));
-    // A prepared invoice is booked, and a PDF needs a prepared invoice.
-    let draft = create_prepared(&home, &file, &["--yes"]);
-    assert_eq!(draft.status.code(), Some(1));
-    assert!(stderr(&draft).contains("a prepared invoice is booked"));
-    // clap refuses --pdf without --prepared, alone or next to a template.
-    for args in [
-        &["--template", "hosting", "--pdf", "x.pdf", "--book", "--yes"][..],
-        &["--pdf", "x.pdf", "--book", "--yes"][..],
-    ] {
-        let loose = create(&home, args);
-        assert_eq!(loose.status.code(), Some(2), "{args:?}");
-        let err = stderr(&loose);
-        assert!(
-            err.contains("'--pdf <PATH>' cannot be used with")
-                || err.contains("required arguments were not provided:\n  --prepared <FILE>"),
-            "{args:?}: {err}"
-        );
-    }
-    // Nothing to create from.
-    let nothing = create(&home, &["--book", "--yes"]);
-    assert_eq!(nothing.status.code(), Some(1));
-    assert!(stderr(&nothing).contains("give the invoice: --file"));
+    fails(
+        &create(&home, &["--book", "--yes"]),
+        1,
+        "give the invoice: --file",
+    );
     assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
 }
 
@@ -721,13 +711,12 @@ fn prepare_out_needs_a_seller_and_the_admin_it_was_prepared_for() {
 
     // Booked under another administration than it was prepared for: refused.
     let home = self::home(&root);
-    assert!(prepare_out(&home, "hosting", &file).status.success());
+    ok(&prepare_out(&home, "hosting", &file));
     let config = home.path().join(".config/yuki/config.toml");
     let text = std::fs::read_to_string(&config).unwrap();
     std::fs::write(&config, text.replace("admin-1", "admin-9")).unwrap();
     let wrong = create_prepared(&home, &file, &["--book", "--yes"]);
-    assert_eq!(wrong.status.code(), Some(1));
-    assert!(stderr(&wrong).contains("was prepared for administration admin-1"));
+    fails(&wrong, 1, "was prepared for administration admin-1");
 }
 
 #[test]
@@ -774,7 +763,7 @@ fn prepare_and_create_agree_on_every_figure() {
     let file = home.path().join("prepared.json");
     let source = ["--template", "hosting", "--qty", "2.5", "--price", "85.10"];
     let output = prepare(&home, &source, "auto", &file);
-    assert!(output.status.success(), "{}", stderr(&output));
+    ok(&output);
     let json = json(&output);
     assert_eq!(json["number"], "2026-20");
     assert_eq!(json["date"]["text"], "31 oktober 2026");
@@ -796,7 +785,7 @@ fn prepare_and_create_agree_on_every_figure() {
 
     // create --prepared books the same.
     let output = create_prepared(&home, &file, &["--dry-run", "--book"]);
-    assert!(output.status.success(), "{}", stderr(&output));
+    ok(&output);
     // Expected values worked out by hand, not by the code under test:
     // 2.5 × 85.10 = 212.75 net; 21% of it 44.6775 → 44.68; gross 257.43.
     let xml = String::from_utf8_lossy(&output.stdout);
@@ -822,7 +811,7 @@ fn the_ledger_records_a_booking_and_blocks_the_number() {
     let (root, _log) = mock(import_response(true, true, false, "2026-20"));
     let home = home(&root);
     let output = book(&home, "2026-20", &["--book"]);
-    assert!(output.status.success(), "{}", stderr(&output));
+    ok(&output);
     // Quiet, a booking still says so in one line.
     let err = stderr(&output);
     assert!(
@@ -840,8 +829,11 @@ fn the_ledger_records_a_booking_and_blocks_the_number() {
     // The archive does not show 2026-20 yet; the ledger still refuses it,
     // and auto skips it.
     let again = book(&home, "2026-20", &["--book"]);
-    assert_eq!(again.status.code(), Some(1));
-    assert!(stderr(&again).contains("invoice number 2026-20 was already given out: booked"));
+    fails(
+        &again,
+        1,
+        "invoice number 2026-20 was already given out: booked",
+    );
     let next = prepare_out(&home, "hosting", &home.path().join("next.json"));
     assert_eq!(json(&next)["number"], "2026-21");
 }
@@ -903,7 +895,7 @@ fn an_unknown_outcome_keeps_the_number_pending_until_resolved() {
             "rejected",
         ],
     );
-    assert!(resolve.status.success(), "{}", stderr(&resolve));
+    ok(&resolve);
     assert_eq!(ledger_rows(&home)[0]["Status"], "rejected");
     let bad = yuki(
         &home,
@@ -950,7 +942,7 @@ fn peppol_is_reported_as_requested_never_as_delivered() {
     let (root, _log) = mock(import_response(true, true, false, "2026-20"));
     let home = home(&root);
     let file = home.path().join("prepared.json");
-    assert!(prepare_out(&home, "hosting", &file).status.success());
+    ok(&prepare_out(&home, "hosting", &file));
     let output = create_prepared(
         &home,
         &file,
@@ -964,7 +956,7 @@ fn peppol_is_reported_as_requested_never_as_delivered() {
             "json",
         ],
     );
-    assert!(output.status.success(), "{}", stderr(&output));
+    ok(&output);
     assert_eq!(
         json(&output)["items"][0]["Peppol"],
         "requested (Yuki does not report delivery)"
@@ -978,7 +970,7 @@ fn an_unattended_booking_must_name_the_number_it_books() {
     let (root, log) = mock(import_response(true, true, false, "2026-20"));
     let home = home(&root);
     let file = home.path().join("prepared.json");
-    assert!(prepare_out(&home, "hosting", &file).status.success());
+    ok(&prepare_out(&home, "hosting", &file));
     for (extra, expect) in [
         (
             vec!["--book", "--yes"],
@@ -997,13 +989,12 @@ fn an_unattended_booking_must_name_the_number_it_books() {
     }
     // A booking Yuki numbers itself cannot be confirmed without the prompt.
     let unnumbered = create(&home, &["--template", "hosting", "--book", "--yes"]);
-    assert_eq!(unnumbered.status.code(), Some(1));
-    assert!(stderr(&unnumbered).contains("so the invoice needs a number"));
+    fails(&unnumbered, 1, "so the invoice needs a number");
     assert!(!actions(&log).contains(&"ProcessSalesInvoices".to_string()));
     assert_eq!(status_of(&home, "2026-20"), "reserved");
     // The reservation is untouched, and the right number books it.
-    let ok = create_prepared(&home, &file, &["--book", "--yes", "--confirm", "2026-20"]);
-    assert!(ok.status.success(), "{}", stderr(&ok));
+    let booked = create_prepared(&home, &file, &["--book", "--yes", "--confirm", "2026-20"]);
+    ok(&booked);
     assert_eq!(status_of(&home, "2026-20"), "booked");
 }
 
@@ -1017,8 +1008,8 @@ fn a_released_number_is_given_out_again_rather_than_skipped() {
         home.path().join("b.json"),
         home.path().join("c.json"),
     );
-    assert!(prepare_out(&home, "hosting", &a).status.success());
-    assert!(prepare_out(&home, "support", &b).status.success());
+    ok(&prepare_out(&home, "hosting", &a));
+    ok(&prepare_out(&home, "support", &b));
     let release = yuki(
         &home,
         &[
@@ -1031,9 +1022,9 @@ fn a_released_number_is_given_out_again_rather_than_skipped() {
             "rejected",
         ],
     );
-    assert!(release.status.success(), "{}", stderr(&release));
+    ok(&release);
     let out = prepare_out(&home, "hosting", &c);
-    assert!(out.status.success(), "{}", stderr(&out));
+    ok(&out);
     assert_eq!(json(&out)["number"], "2026-20");
 }
 
@@ -1062,7 +1053,7 @@ fn a_prepared_booking_that_never_reached_yuki_can_be_retried() {
     });
     let home = home(&root);
     let file = home.path().join("prepared.json");
-    assert!(prepare_out(&home, "hosting", &file).status.success());
+    ok(&prepare_out(&home, "hosting", &file));
     let args = ["--book", "--yes", "--confirm", "2026-20"];
     let refused = create_prepared(&home, &file, &args);
     assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
@@ -1070,6 +1061,6 @@ fn a_prepared_booking_that_never_reached_yuki_can_be_retried() {
     // Back to reserved for the same content, not freed.
     assert_eq!(status_of(&home, "2026-20"), "reserved");
     let retried = create_prepared(&home, &file, &args);
-    assert!(retried.status.success(), "{}", stderr(&retried));
+    ok(&retried);
     assert_eq!(status_of(&home, "2026-20"), "booked");
 }

@@ -35,6 +35,20 @@ pub fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// The command succeeded; its stderr says why not.
+#[track_caller]
+pub fn ok(out: &Output) {
+    assert!(out.status.success(), "{}", stderr(out));
+}
+
+/// The command exited with `code` and said `needle` on stderr.
+#[track_caller]
+pub fn fails(out: &Output, code: i32, needle: &str) {
+    let err = stderr(out);
+    assert_eq!(out.status.code(), Some(code), "{err}");
+    assert!(err.contains(needle), "{needle:?} not in: {err}");
+}
+
 /// Stdout parsed as JSON, whatever the exit status.
 #[track_caller]
 pub fn json(output: &Output) -> Value {

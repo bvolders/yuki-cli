@@ -722,6 +722,7 @@ fn an_invoice_file_takes_no_pdf() {
         .to_string();
     assert!(err.contains("unknown field `pdf`"), "{err}");
 }
+
 #[test]
 fn a_line_remark_goes_under_the_line_and_into_prepare() {
     let text = MINIMAL.replace(
