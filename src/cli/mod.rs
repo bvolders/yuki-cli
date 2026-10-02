@@ -8,6 +8,7 @@ pub mod init;
 pub mod invoices;
 pub mod projects;
 pub mod sales;
+pub mod sales_invoice;
 pub mod upload;
 pub mod vat;
 
@@ -412,6 +413,63 @@ pub enum SalesCommands {
         #[arg(long)]
         fields: Option<String>,
     },
+
+    /// Create sales invoices from a file or a saved template.
+    Invoice {
+        #[command(subcommand)]
+        command: SalesInvoiceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SalesInvoiceCommands {
+    /// Create a sales invoice in Yuki: a draft, unless --send books and sends it.
+    ///
+    /// The invoice comes from a TOML file (--file) or a saved template
+    /// (--template, read from ~/.config/yuki/invoices/<name>.toml). A preview
+    /// of the customer, lines and totals is printed first, then confirmed on a
+    /// terminal; --yes skips the prompt and is required when not on a terminal.
+    /// --dry-run prints the preview and the exact xmlDoc without contacting Yuki.
+    #[command(group(
+        clap::ArgGroup::new("source").required(true).args(["file", "template"])
+    ))]
+    Create {
+        /// Invoice described in a TOML file.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+
+        /// Saved template name (see `sales invoice templates`).
+        #[arg(long, value_name = "NAME")]
+        template: Option<String>,
+
+        /// Quantity of the invoice's only line, e.g. 7.5.
+        #[arg(long, value_parser = sales_invoice::parse_quantity)]
+        qty: Option<sales_invoice::Quantity>,
+
+        /// Unit price excluding VAT of the invoice's only line, e.g. 1250.00.
+        #[arg(long, value_parser = sales_invoice::parse_price)]
+        price: Option<crate::money::Cents>,
+
+        /// Invoice date, YYYY-MM-DD. Default: the file's date, else today.
+        #[arg(long, value_parser = sales_invoice::parse_date)]
+        date: Option<String>,
+
+        /// Subject (title) of the invoice, replacing the file's.
+        #[arg(long)]
+        subject: Option<String>,
+
+        /// Book the invoice and send it: email, peppol, or both. Without it,
+        /// the invoice is created as a draft in "To be sent".
+        #[arg(long, value_enum)]
+        send: Option<sales_invoice::SendMode>,
+
+        /// Print the preview and the xmlDoc XML; make no API call at all.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// List saved invoice templates (~/.config/yuki/invoices/*.toml).
+    Templates,
 }
 
 #[derive(Subcommand)]

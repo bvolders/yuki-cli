@@ -4,7 +4,7 @@
 
 CLI client for the [Yuki](https://www.yukiworks.nl) bookkeeping SOAP API.
 
-[Yuki](https://www.yukiworks.nl) is a Dutch bookkeeping SaaS used for accounting, VAT returns, and document archiving. This CLI lets you query your administration, find missing invoices, and upload documents — from the terminal or as part of automated workflows.
+[Yuki](https://www.yukiworks.nl) is a Dutch bookkeeping SaaS used for accounting, VAT returns, and document archiving. This CLI lets you query your administration, find missing invoices, upload documents, and create sales invoices — from the terminal or as part of automated workflows.
 
 > **Note:** This project is not affiliated with or endorsed by Yuki Software.
 
@@ -240,6 +240,78 @@ yuki upload file invoice.pdf --amount 114.27 \
 yuki upload categories                                  # List cost category IDs
 yuki upload payment-methods                             # List payment method IDs
 ```
+
+### Sales invoices
+
+```sh
+yuki sales invoice create --file invoice.toml           # Ad-hoc invoice, created as a draft
+yuki sales invoice create --template acme-hosting       # From ~/.config/yuki/invoices/acme-hosting.toml
+yuki sales invoice create --template acme-consulting \
+  --qty 7.5 --subject "Consultancy October 2026"        # Monthly run: this month's hours
+yuki sales invoice create --template acme-hosting \
+  --send email                                          # Book it and email it to the customer
+yuki sales invoice create --file invoice.toml --dry-run # Preview and xmlDoc only; no API call
+yuki sales invoice templates                            # List saved templates, each validated
+```
+
+`create` makes a **draft** by default: it lands in Yuki's "To be sent" list,
+unbooked and without an invoice number, so you can still check or edit it in
+Yuki. `--send email|peppol|both` books it instead (Yuki numbers it) and sends it.
+Before any write, the command prints a preview to stderr (customer, lines, net,
+VAT, gross total, and whether it creates a draft or books and sends) and asks
+for confirmation. `--yes` skips the prompt and is required when stdin is not a
+terminal. `--dry-run` prints the preview, then the exact `xmlDoc` on stdout, and
+contacts nothing, not even to authenticate. The command exits 1 with kind
+`invoice_rejected` when Yuki fails or skips the invoice, after printing Yuki's
+message.
+
+Recurring invoices are templates you run yourself: one file per customer in
+`~/.config/yuki/invoices/<name>.toml`, created each month with `--template`
+and approved at the prompt. `--qty` and `--price` replace the quantity and
+price of a single-line invoice, `--date` the invoice date (default: the file's,
+else today) and `--subject` its subject. An invoice file has the same format:
+
+```toml
+# ~/.config/yuki/invoices/acme-hosting.toml
+subject = "Managed hosting"
+due_days = 30                     # or: due_date = 2026-11-01
+# date = 2026-10-01               # default: today
+# payment_method = "ElectronicTransfer"
+# layout = "Standard"             # a layout name from Yuki; default layout if unknown
+# currency = "EUR"                # Yuki's default
+# notes = "Thank you for your business."   # printed on the invoice, max 500 characters
+# remarks = "internal"            # stored, not printed
+
+[contact]
+code = "C0042"                    # an existing Yuki contact
+
+# Or a contact Yuki matches by name and address, or creates:
+# name = "Acme BV"
+# country = "BE"                  # required without a code (ISO 3166-1 alpha-2)
+# address = "Kerkstraat 1"
+# address_2 = "bus 2"
+# zipcode = "9000"
+# city = "Gent"
+# vat_number = "BE0123456789"
+# email = "billing@acme.example"
+# type = "company"                # or "person" (Yuki's default)
+
+[[lines]]
+description = "Managed hosting"
+qty = 1                           # default 1, up to 4 decimals
+price = 100.00                    # unit price excluding VAT, up to 2 decimals
+vat_percentage = 21               # with vat_type, selects the VAT code
+vat_type = 1                      # your administration's VAT type number
+gl_account = "700000"             # optional revenue account
+# vat_description = "BTW 21%"     # optional, to pick between VAT codes
+# product_code = "HOST"           # optional item number of a Yuki sales item
+```
+
+The example uses Belgian 21% VAT; nothing in the CLI assumes a country. The VAT
+percentage and type must match a VAT code of your administration, or Yuki
+rejects the invoice: check Settings > VAT rates in Yuki or `yuki vat codes`. The
+preview's VAT is computed per rate on the summed net and rounded once; the
+booked figure is Yuki's own.
 
 ### Global flags
 

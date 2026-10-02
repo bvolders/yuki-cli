@@ -256,6 +256,44 @@ pub fn generate() -> Value {
                 ]
             },
             {
+                "name": "sales invoice create",
+                "description": "Create a sales invoice in Yuki from a TOML file or a saved template: a draft in \"To be sent\" unless --send books and sends it. Prints a preview to stderr and asks for confirmation on a terminal; --yes is required otherwise. --dry-run prints the preview and the xmlDoc and makes no API call. Exits 1 (invoice_rejected) when Yuki fails or skips the invoice.",
+                "mutating": true,
+                "args": [
+                    {"name": "--file", "type": "path", "required": false, "description": "Invoice described in a TOML file. One of --file or --template is required."},
+                    {"name": "--template", "type": "string", "required": false, "description": "Saved template name, read from ~/.config/yuki/invoices/<name>.toml."},
+                    {"name": "--qty", "type": "number", "required": false, "description": "Quantity of the invoice's only line, up to 4 decimals."},
+                    {"name": "--price", "type": "number", "required": false, "description": "Unit price excluding VAT of the invoice's only line, up to 2 decimals."},
+                    {"name": "--date", "type": "string", "required": false, "description": "Invoice date, YYYY-MM-DD. Default: the file's date, else today."},
+                    {"name": "--subject", "type": "string", "required": false, "description": "Subject (title) of the invoice, replacing the file's."},
+                    {"name": "--send", "type": "string", "required": false, "enum": ["email", "peppol", "both"], "description": "Book the invoice and send it. Without it, the invoice is a draft."},
+                    {"name": "--dry-run", "type": "boolean", "required": false, "description": "Print the preview and the xmlDoc XML; make no API call."}
+                ],
+                "errors": ["config_error", "auth_failed", "confirmation_required", "invoice_rejected", "error"],
+                "output_fields": [
+                    {"name": "Succeeded", "type": "string"},
+                    {"name": "Processed", "type": "string"},
+                    {"name": "Email Sent", "type": "string"},
+                    {"name": "Reference", "type": "string"},
+                    {"name": "Subject", "type": "string"},
+                    {"name": "Message", "type": "string"}
+                ]
+            },
+            {
+                "name": "sales invoice templates",
+                "description": "List saved invoice templates (~/.config/yuki/invoices/*.toml), each validated; makes no API call.",
+                "mutating": false,
+                "output_fields": [
+                    {"name": "Name", "type": "string"},
+                    {"name": "Customer", "type": "string"},
+                    {"name": "Subject", "type": "string"},
+                    {"name": "Lines", "type": "string"},
+                    {"name": "Net", "type": "string"},
+                    {"name": "Path", "type": "string"},
+                    {"name": "Status", "type": "string"}
+                ]
+            },
+            {
                 "name": "invoices show",
                 "description": "Show one transaction by ID. Yuki cannot look a transaction up by ID, so this fetches every line on --account within --period (one API call) and keeps the matching one.",
                 "mutating": false,
@@ -614,6 +652,12 @@ pub fn generate() -> Value {
                 "description": "A mutating command was invoked non-interactively without --yes."
             },
             {
+                "kind": "invoice_rejected",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "Yuki answered, but failed or skipped an invoice; its message is in the output and the error."
+            },
+            {
                 "kind": "error",
                 "exit_code": 1,
                 "retryable": false,
@@ -640,7 +684,7 @@ fn enrich_v0_3(schema: &mut Value) {
             "effects".into(),
             json!(if !mutating {
                 "read_only"
-            } else if name == "upload file" {
+            } else if matches!(name.as_str(), "upload file" | "sales invoice create") {
                 "non_idempotent"
             } else {
                 "idempotent"
@@ -670,7 +714,10 @@ fn enrich_v0_3(schema: &mut Value) {
             );
             object.insert("fields_arg".into(), json!("--fields"));
         }
-        if matches!(name.as_str(), "upload file" | "profile remove") {
+        if matches!(
+            name.as_str(),
+            "upload file" | "profile remove" | "sales invoice create"
+        ) {
             object.insert("confirmation_bypass_arg".into(), json!("--yes"));
         }
         if name == "capabilities" {

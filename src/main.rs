@@ -7,7 +7,7 @@ use yuki_cli::cli::Commands;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
     DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, SalesCommands,
-    UploadCommands, VatCommands,
+    SalesInvoiceCommands, UploadCommands, VatCommands,
 };
 use yuki_cli::cli::{Cli, RunEndpoint};
 use yuki_cli::config::Config;
@@ -18,6 +18,8 @@ enum AppError {
     Yuki(YukiError),
     Other(anyhow::Error),
     ConfirmationRequired(String),
+    /// Yuki answered, but did not accept every invoice.
+    InvoiceRejected(String),
 }
 
 impl fmt::Display for AppError {
@@ -25,7 +27,9 @@ impl fmt::Display for AppError {
         match self {
             Self::Yuki(e) => write!(f, "{e}"),
             Self::Other(e) => write!(f, "{e}"),
-            Self::ConfirmationRequired(message) => write!(f, "{message}"),
+            Self::ConfirmationRequired(message) | Self::InvoiceRejected(message) => {
+                write!(f, "{message}")
+            }
         }
     }
 }
@@ -47,7 +51,7 @@ impl AppError {
         match self {
             Self::Yuki(e) => e.exit_code(),
             Self::Other(_) => 1,
-            Self::ConfirmationRequired(_) => 1,
+            Self::ConfirmationRequired(_) | Self::InvoiceRejected(_) => 1,
         }
     }
 
@@ -62,6 +66,7 @@ impl AppError {
             },
             Self::Other(_) => "error",
             Self::ConfirmationRequired(_) => "confirmation_required",
+            Self::InvoiceRejected(_) => "invoice_rejected",
         }
     }
 }
@@ -400,7 +405,6 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
         }
 
         Commands::Sales { command } => {
-            let config = Config::load()?;
             let admin = cli.admin.as_deref();
             match command {
                 SalesCommands::Items {
@@ -408,6 +412,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     offset,
                     fields,
                 } => {
+                    let config = load()?;
                     yuki_cli::cli::sales::items(
                         &config,
                         admin,
@@ -420,6 +425,66 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?;
                 }
+                SalesCommands::Invoice { command } => match command {
+                    SalesInvoiceCommands::Create {
+                        file,
+                        template,
+                        qty,
+                        price,
+                        date,
+                        subject,
+                        send,
+                        dry_run,
+                    } => {
+                        use yuki_cli::cli::sales_invoice::{self, Overrides, Source};
+                        let source = match (file, template) {
+                            (Some(file), _) => Source::File(file.into()),
+                            (None, Some(name)) => Source::Template(name),
+                            (None, None) => unreachable!("clap requires --file or --template"),
+                        };
+                        let overrides = Overrides {
+                            qty,
+                            price,
+                            date: date.as_deref(),
+                            subject: subject.as_deref(),
+                        };
+                        let invoice = sales_invoice::load(&source, &overrides, send)?;
+                        // A dry run needs no configuration and makes no API call.
+                        if dry_run {
+                            if !cli.quiet {
+                                eprintln!("{}\n", invoice.preview(None));
+                                eprintln!("Dry run: nothing was sent to Yuki. xmlDoc:");
+                            }
+                            println!("{}", invoice.to_xml());
+                            return Ok(());
+                        }
+                        let config = load()?;
+                        let target = config.target(admin)?;
+                        if !(cli.quiet && cli.yes) {
+                            eprintln!("{}\n", invoice.preview(Some(target.config_name)));
+                        }
+                        if !cli.yes {
+                            if !sales_invoice::can_prompt() {
+                                return Err(AppError::ConfirmationRequired(
+                                    "sales invoice create writes to Yuki; pass --yes to confirm in non-interactive mode, or --dry-run to preview only".into(),
+                                ));
+                            }
+                            if !sales_invoice::confirm(&invoice.question())? {
+                                eprintln!("Cancelled: nothing was sent to Yuki.");
+                                return Ok(());
+                            }
+                        }
+                        let import =
+                            sales_invoice::submit(&config, admin, &invoice, format, cli.quiet)
+                                .await?;
+                        if let Some(failure) = import.failure() {
+                            return Err(AppError::InvoiceRejected(failure));
+                        }
+                    }
+                    SalesInvoiceCommands::Templates => {
+                        yuki_cli::cli::sales_invoice::templates(format)?;
+                    }
+                },
             }
         }
 

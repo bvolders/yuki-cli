@@ -11,6 +11,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **accounts**: `accounts balance` now reports the balance at the end of `--period` (or today, if the period is still running) instead of at its start, and adds an `As Of` column with that date. Scripts reading the old start-of-period figure, or indexing columns, must adjust.
 - **yuki-client**: 0.3.0. `AccountingInfoClient::get_transaction_details` now takes `(administration_id, gl_account_code, start_date, end_date)` instead of a transaction ID, because `GetTransactionDetails` has no transaction-ID parameter; `TransactionDetail` gains `contact_name`.
 
+### Added
+
+- **sales**: `sales invoice create` creates a sales invoice through `ProcessSalesInvoices`, from a TOML file (`--file`) or a saved per-customer template (`--template`, in `~/.config/yuki/invoices/`). It is a draft in "To be sent" by default; `--send email|peppol|both` books and sends it. A preview (customer, lines, net, VAT, gross, mode) is confirmed at a prompt, `--yes` is required off a terminal, and `--dry-run` prints the preview and the `xmlDoc` without any API call. Exits 1 with kind `invoice_rejected` when Yuki fails or skips the invoice. `sales invoice templates` lists the templates, each validated.
+- **yuki-client**: `SalesClient::process_sales_invoices` and `SalesInvoicesImport`, which read the import response whether Yuki sends it as elements or as escaped text; `SoapEnvelope::xml_param` for `s:any` parameters.
+
+### Fixed
+
+- **sales**: `sales items` now honours `--region`, `--base-url` and their environment variables, like every other command.
+
 ## [0.1.13](https://github.com/rvben/yuki-cli/compare/v0.1.12...v0.1.13) - 2026-09-28
 
 ### Fixed
