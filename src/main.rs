@@ -410,8 +410,16 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                     )
                     .await?;
                 }
-                InvoiceCommands::Document { id } => {
-                    yuki_cli::cli::invoices::document(&config, admin, &id, format).await?;
+                InvoiceCommands::Document { id, out } => {
+                    yuki_cli::cli::invoices::document(
+                        &config,
+                        admin,
+                        &id,
+                        out.as_deref(),
+                        format,
+                        cli.quiet,
+                    )
+                    .await?;
                 }
             }
         }
@@ -544,6 +552,17 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
                 }
                 DocumentCommands::Search { query } => {
                     yuki_cli::cli::documents::search(&config, admin, &query, format).await?;
+                }
+                DocumentCommands::Download { id, out } => {
+                    yuki_cli::cli::documents::download(
+                        &config,
+                        admin,
+                        &id,
+                        out.as_deref(),
+                        format,
+                        cli.quiet,
+                    )
+                    .await?;
                 }
                 DocumentCommands::Exists {
                     amount,

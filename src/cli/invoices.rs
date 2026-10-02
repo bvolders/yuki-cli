@@ -1,5 +1,5 @@
 use crate::cli::accounts::resolve_period;
-use crate::cli::setup_domain;
+use crate::cli::{documents, setup_domain};
 use crate::client::accounting_info::{AccountingInfoClient, TransactionDetail};
 use crate::config::Config;
 use crate::error::YukiError;
@@ -90,32 +90,28 @@ pub async fn list(
     Ok(())
 }
 
+/// Save the document linked to transaction `id` to `out`, or under its
+/// own file name.
 pub async fn document(
     config: &Config,
     admin: Option<&str>,
     id: &str,
+    out: Option<&str>,
     format: Option<&str>,
+    quiet: bool,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
     let mut client = AccountingInfoClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
-    let xml = client.get_transaction_document(target.admin_id, id).await?;
-
-    let result = crate::client::soap_client::SoapClient::parse_single_result(
-        &xml,
-        "GetTransactionDocumentResult",
-    )
-    .unwrap_or(xml);
-
-    let headers = vec!["Transaction".into(), "Document".into()];
-    let rows = vec![vec![id.to_string(), result]];
-
-    let fmt = OutputFormat::from_flag(format, is_tty());
-    match fmt {
-        OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
-        OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
+    let document = client.get_transaction_document(target.admin_id, id).await?;
+    if document.data_base64.is_empty() {
+        return Err(YukiError::NotFound(format!(
+            "no document is linked to transaction {id}"
+        )));
     }
-    Ok(())
+    let bytes = documents::decode_base64(&document.data_base64)?;
+    let path = documents::save_file(&bytes, &document.file_name, id, out)?;
+    documents::print_saved("Transaction", id, &path, format, quiet)
 }
 
 /// Keep only the line with `id`, or report which scope was searched.

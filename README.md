@@ -165,7 +165,7 @@ yuki invoices list                        # Outstanding sales invoices (debtor i
 yuki invoices list --invoice-type purchase # Outstanding purchase invoices (creditor items)
 yuki invoices list --period 2025-Q1       # Only items dated in the period
 yuki invoices show <transaction-id> --account 400000 --period 2025-Q1  # One transaction
-yuki invoices document <transaction-id>   # Document linked to a transaction
+yuki invoices document <transaction-id>   # Save the document linked to a transaction
 yuki sales items                          # Sales item catalogue (products/services)
 
 yuki contacts search "Hetzner"            # Search contacts on every field
@@ -184,6 +184,7 @@ yuki projects balance <code> --period 2025  # Project balance
 yuki documents list --folder inkoop       # List documents in a folder
 yuki documents search "factuur"           # Full-text search
 yuki documents exists --amount 7.28 --date 2025-03  # Check if invoice exists
+yuki documents download <id> [--out <path>]  # Save the file, under its own name by default
 
 yuki admin list                           # List administrations
 yuki admin switch <name>                  # Change default administration

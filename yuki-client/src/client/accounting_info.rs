@@ -24,6 +24,14 @@ pub struct AccountStartBalance {
     pub balance: String,
 }
 
+/// The document linked to a transaction (`TransactionDocument`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransactionDocument {
+    pub file_name: String,
+    /// The file, base64-encoded as Yuki sends it.
+    pub data_base64: String,
+}
+
 /// A project entry.
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -230,14 +238,56 @@ impl AccountingInfoClient {
         &self,
         administration_id: &str,
         transaction_id: &str,
-    ) -> Result<String, YukiError> {
+    ) -> Result<TransactionDocument, YukiError> {
         let session = self.require_session()?;
         let envelope = SoapEnvelope::new("GetTransactionDocument")
             .session(session)
             .param("administrationID", administration_id)
             .param("transactionID", transaction_id)
             .build();
-        self.soap.call("GetTransactionDocument", envelope).await
+        let body = self.soap.call("GetTransactionDocument", envelope).await?;
+        Self::parse_transaction_document(&body)
+    }
+
+    /// Parse a `GetTransactionDocument` response: its result holds
+    /// `fileName` and base64 `filedata` as separate elements.
+    pub fn parse_transaction_document(xml: &str) -> Result<TransactionDocument, YukiError> {
+        if let Some(fault) = SoapClient::parse_soap_fault(xml) {
+            return Err(fault);
+        }
+        let mut reader = Reader::from_str(xml);
+        let mut document = TransactionDocument::default();
+        let mut field: Option<String> = None;
+        let mut content = ElementText::default();
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) => {
+                    let local = local_name(e.name().as_ref()).to_string();
+                    if matches!(local.as_str(), "fileName" | "filedata") {
+                        content.take();
+                        field = Some(local);
+                    }
+                }
+                Ok(Event::End(ref e)) => {
+                    let name = e.name();
+                    let local = local_name(name.as_ref());
+                    if field.as_deref() == Some(local) {
+                        let text = content.take();
+                        match local {
+                            "fileName" => document.file_name = text,
+                            _ => document.data_base64 = text,
+                        }
+                        field = None;
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => return Err(YukiError::Xml(e.to_string())),
+                Ok(ref event) => content.push_if(field.is_some(), event)?,
+            }
+            buf.clear();
+        }
+        Ok(document)
     }
 
     /// Retrieve the period date table for a given fiscal year.

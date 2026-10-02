@@ -390,10 +390,18 @@ pub enum InvoiceCommands {
         period: Option<String>,
     },
 
-    /// Show the document linked to a transaction.
+    /// Save the document linked to a transaction.
+    ///
+    /// Written under the document's own file name in the working directory,
+    /// or to --out (a file, or a directory to put it in); never over an
+    /// existing file.
     Document {
         /// Transaction ID.
         id: String,
+
+        /// File or directory to write to.
+        #[arg(long, value_name = "PATH")]
+        out: Option<String>,
     },
 }
 
@@ -508,6 +516,20 @@ pub enum DocumentCommands {
     Search {
         /// Search query.
         query: String,
+    },
+
+    /// Save an archive document's file.
+    ///
+    /// Written under the document's own file name in the working directory,
+    /// or to --out (a file, or a directory to put it in); never over an
+    /// existing file.
+    Download {
+        /// Document ID (as shown by `documents list`).
+        id: String,
+
+        /// File or directory to write to.
+        #[arg(long, value_name = "PATH")]
+        out: Option<String>,
     },
 
     /// Check if an invoice exists in the archive (by amount, date, and optional contact).

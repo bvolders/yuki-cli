@@ -323,15 +323,30 @@ pub fn generate() -> Value {
             },
             {
                 "name": "invoices document",
-                "description": "Show the document linked to a transaction.",
+                "description": "Save the document linked to a transaction under its own file name, or to --out (a file or a directory); never over an existing file. Read-only towards Yuki.",
                 "mutating": false,
                 "args": [
-                    {"name": "id", "type": "string", "required": true, "description": "Transaction ID."}
+                    {"name": "id", "type": "string", "required": true, "description": "Transaction ID."},
+                    {"name": "--out", "type": "path", "required": false, "description": "File or directory to write to."}
                 ],
                 "output_fields": [
-                    {"name": "id", "type": "string"},
-                    {"name": "filename", "type": "string"},
-                    {"name": "url", "type": "string"}
+                    {"name": "Transaction", "type": "string"},
+                    {"name": "Path", "type": "string"},
+                    {"name": "Bytes", "type": "string"}
+                ]
+            },
+            {
+                "name": "documents download",
+                "description": "Save an archive document's file under its own file name, or to --out (a file or a directory); never over an existing file. Read-only towards Yuki.",
+                "mutating": false,
+                "args": [
+                    {"name": "id", "type": "string", "required": true, "description": "Document ID, as shown by documents list."},
+                    {"name": "--out", "type": "path", "required": false, "description": "File or directory to write to."}
+                ],
+                "output_fields": [
+                    {"name": "Document", "type": "string"},
+                    {"name": "Path", "type": "string"},
+                    {"name": "Bytes", "type": "string"}
                 ]
             },
             {
