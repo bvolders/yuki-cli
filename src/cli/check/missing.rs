@@ -9,15 +9,16 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde_json::{Value, json};
+use serde_json::json;
 
+use super::matches::day;
 use super::receipts::{self, Fx, Wanted, parse_fx};
 use super::unmatched::Cents;
 use crate::cli::setup_domain;
 use crate::client::accounting::OutstandingItem;
 use crate::config::Config;
 use crate::error::YukiError;
-use crate::output::{OutputFormat, format_json, format_table, is_tty};
+use crate::output::{OutputFormat, format_table, is_tty, json_items};
 use crate::period::{parse_period, today};
 
 /// One supplier's group, as the UI shows it.
@@ -39,8 +40,7 @@ fn groups<'a>(
     let wanted =
         |name: &str| contact.is_none_or(|c| name.to_lowercase().contains(&c.to_lowercase()));
     let in_period = |date: &str| {
-        let day = date.get(0..10).unwrap_or(date);
-        period.is_none_or(|(start, end)| start.as_str() <= day && day <= end.as_str())
+        period.is_none_or(|(start, end)| (start.as_str()..=end.as_str()).contains(&day(date)))
     };
     let mut by_supplier: BTreeMap<(String, &str), Group<'a>> = BTreeMap::new();
     for item in items.iter().filter(|i| wanted(&i.contact_name)) {
@@ -81,9 +81,9 @@ struct Tally {
 impl Tally {
     fn add(&mut self, other: Tally) {
         self.payments += other.payments;
-        self.paid.0 += other.paid.0;
+        self.paid = self.paid + other.paid;
         self.invoices += other.invoices;
-        self.invoiced.0 += other.invoiced.0;
+        self.invoiced = self.invoiced + other.invoiced;
         self.receipts += other.receipts;
     }
 }
@@ -173,7 +173,7 @@ pub async fn missing(
         let mut tally = Tally::default();
         for (payment, fx) in group.payments.iter().zip(fx) {
             tally.payments += 1;
-            tally.paid.0 += cents(&payment.open_amount).0;
+            tally.paid = tally.paid + cents(&payment.open_amount);
             let mut row = vec![
                 (*name).to_string(),
                 "payment".into(),
@@ -195,7 +195,7 @@ pub async fn missing(
         }
         for invoice in &group.invoices {
             tally.invoices += 1;
-            tally.invoiced.0 += cents(&invoice.open_amount).0;
+            tally.invoiced = tally.invoiced + cents(&invoice.open_amount);
             let kind = if cents(&invoice.open_amount) < Cents::ZERO {
                 "open credit note"
             } else {
@@ -290,20 +290,20 @@ pub async fn missing(
             }
         }
         OutputFormat::Json => {
-            let mut out: Value = serde_json::from_str(&format_json(&headers, &rows))
-                .expect("format_json writes JSON");
-            let suppliers: Value = serde_json::from_str(&format_json(&summary_headers, &summary))
-                .expect("format_json writes JSON");
-            out["suppliers"] = suppliers["items"].clone();
-            out["summary"] = json!({
-                "suppliers": tallies.len(),
-                "payments": total.payments,
-                "payments_open": total.paid.to_string(),
-                "open_invoices": total.invoices,
-                "invoices_open": total.invoiced.to_string(),
-                "local_receipts": local.as_ref().map(|_| total.receipts),
-                "as_of": as_of,
-                "notes": notes,
+            let out = json!({
+                "items": json_items(&headers, &rows),
+                "total": rows.len(),
+                "suppliers": json_items(&summary_headers, &summary),
+                "summary": {
+                    "suppliers": tallies.len(),
+                    "payments": total.payments,
+                    "payments_open": total.paid.to_string(),
+                    "open_invoices": total.invoices,
+                    "invoices_open": total.invoiced.to_string(),
+                    "local_receipts": local.as_ref().map(|_| total.receipts),
+                    "as_of": as_of,
+                    "notes": notes,
+                },
             });
             println!(
                 "{}",

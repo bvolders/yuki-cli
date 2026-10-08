@@ -157,7 +157,7 @@ pub(super) struct Matches {
 }
 
 /// The date part of an API date.
-fn day(date: &str) -> &str {
+pub(super) fn day(date: &str) -> &str {
     date.get(0..10).unwrap_or(date)
 }
 

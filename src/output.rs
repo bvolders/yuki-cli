@@ -100,10 +100,9 @@ impl OutputFormat {
     }
 }
 
-/// Format rows as a clispec v0.2 items envelope: `{"items": [...], "total": N}`.
-pub fn format_json(headers: &[String], rows: &[Vec<String>]) -> String {
-    let items: Vec<Value> = rows
-        .iter()
+/// Rows as JSON objects keyed by header, as [`format_json`] lists them.
+pub fn json_items(headers: &[String], rows: &[Vec<String>]) -> Vec<Value> {
+    rows.iter()
         .map(|row| {
             let mut map = Map::new();
             for (i, header) in headers.iter().enumerate() {
@@ -112,7 +111,12 @@ pub fn format_json(headers: &[String], rows: &[Vec<String>]) -> String {
             }
             Value::Object(map)
         })
-        .collect();
+        .collect()
+}
+
+/// Format rows as a clispec v0.2 items envelope: `{"items": [...], "total": N}`.
+pub fn format_json(headers: &[String], rows: &[Vec<String>]) -> String {
+    let items = json_items(headers, rows);
     let total = items.len();
     serde_json::to_string_pretty(&json!({
         "items": items,
