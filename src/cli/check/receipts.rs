@@ -273,16 +273,6 @@ pub(super) enum Fit {
     VendorDate,
 }
 
-/// Whether the receipt's vendor is the payment's supplier.
-fn supplier_vendor(receipt: &Receipt, wanted: &Wanted<'_>) -> bool {
-    normalized_names_match(&receipt.vendor, &normalize_name(wanted.supplier))
-}
-
-/// Whether the receipt's vendor is named in the payment's description.
-fn description_vendor(receipt: &Receipt, wanted: &Wanted<'_>) -> bool {
-    normalized_names_match(&receipt.vendor, &normalize_name(wanted.description))
-}
-
 /// Whether the receipt's amount is the payment's, in EUR or in the
 /// description's foreign currency; `None` when they cannot be compared: the
 /// receipt has no amount, or is in a currency the description does not state
@@ -334,18 +324,21 @@ pub(super) fn assign(receipts: &[Receipt], wanted: &[Wanted<'_>]) -> Vec<Option<
     let edges: Edges = wanted
         .iter()
         .map(|payment| {
-            let by_supplier = receipts.iter().any(|r| supplier_vendor(r, payment));
+            let supplier = normalize_name(payment.supplier);
+            let vendor = if receipts
+                .iter()
+                .any(|r| normalized_names_match(&r.vendor, &supplier))
+            {
+                supplier
+            } else {
+                normalize_name(payment.description)
+            };
             let mut list: Vec<(Fit, i64, usize)> = receipts
                 .iter()
                 .enumerate()
                 .filter_map(|(r, receipt)| {
                     let days = days_apart(receipt.date.as_deref()?, payment.date);
-                    let vendor = if by_supplier {
-                        supplier_vendor(receipt, payment)
-                    } else {
-                        description_vendor(receipt, payment)
-                    };
-                    if days > RECEIPT_DAYS || !vendor {
+                    if days > RECEIPT_DAYS || !normalized_names_match(&receipt.vendor, &vendor) {
                         return None;
                     }
                     let fit = match same_amount(receipt, payment) {
