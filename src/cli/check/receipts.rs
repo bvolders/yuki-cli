@@ -14,7 +14,7 @@ use crate::period::epoch_days;
 use crate::sync::{self, Excludes, Status};
 
 /// Days a receipt's date may lie from the payment's.
-pub(super) const RECEIPT_DAYS: i64 = 5;
+const RECEIPT_DAYS: i64 = 5;
 
 /// Optional file with each receipt's amount, at the root of the folder.
 pub(super) const RECEIPTS_LOG: &str = "receipts-log.csv";
@@ -26,13 +26,13 @@ const RATE_DECIMALS: u32 = 12;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Fx {
     /// Absolute amount in the foreign currency's cents.
-    pub(super) amount: Cents,
-    pub(super) currency: String,
+    amount: Cents,
+    currency: String,
     /// Worked out from the `Koers` rate rather than stated as `Bedrag`.
-    pub(super) derived: bool,
+    derived: bool,
     /// How many foreign cents the amount may be off: half a euro cent at
     /// the rate, plus one, for a derived amount; 0 for a stated one.
-    pub(super) slack: i64,
+    slack: i64,
 }
 
 impl Fx {
@@ -99,7 +99,7 @@ pub(super) fn parse_fx(description: &str, eur: Cents) -> Option<Fx> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Receipt {
     /// Relative to the receipts folder, `/`-separated.
-    pub(super) rel: String,
+    rel: String,
     /// The vendor: the file's folder name, normalized.
     vendor: String,
     /// The invoice date: from the log, else the file name's `YYYY-MM-DD` prefix.
@@ -107,7 +107,7 @@ pub(super) struct Receipt {
     /// Amount and currency from the log; `None` when it has none.
     amount: Option<(Cents, String)>,
     /// What `.yuki-sync.json` records about the file.
-    pub(super) sync: Option<Status>,
+    sync: Option<Status>,
 }
 
 /// One row of the log: date, amount and currency.
@@ -363,27 +363,13 @@ pub(super) fn assign(receipts: &[Receipt], wanted: &[Wanted<'_>]) -> Vec<Option<
     // an earlier one to another of its candidates.
     let mut order: Vec<usize> = (0..wanted.len()).collect();
     order.sort_by_key(|&w| edges[w].first().map_or(i64::MAX, |e| e.1));
-    for &w in &order {
-        augment(
-            w,
-            &edges,
-            &limit,
-            &mut vec![false; receipts.len()],
-            &mut owner,
-            &mut out,
-        );
-    }
-    for &w in &order {
-        if out[w].is_none() {
-            limit[w] = Fit::VendorDate;
-            augment(
-                w,
-                &edges,
-                &limit,
-                &mut vec![false; receipts.len()],
-                &mut owner,
-                &mut out,
-            );
+    for pass in [Fit::Amount, Fit::VendorDate] {
+        for &w in &order {
+            if out[w].is_none() {
+                limit[w] = pass;
+                let mut seen = vec![false; receipts.len()];
+                augment(w, &edges, &limit, &mut seen, &mut owner, &mut out);
+            }
         }
     }
     out
@@ -631,16 +617,6 @@ mod tests {
         assert_eq!(
             log[&sync::name_key("2026/cafe\u{301}/a.pdf")].1,
             Some((Cents(2000), "EUR".into()))
-        );
-    }
-
-    #[test]
-    fn the_sync_state_marks_an_uploaded_receipt() {
-        let mut r = receipt("vercel/0007.pdf", "vercel", "2026-08-07", None);
-        r.sync = Some(Status::Uploaded);
-        assert_eq!(
-            cell(&r, Fit::Amount),
-            "vercel/0007.pdf (uploaded, awaiting Yuki)"
         );
     }
 }

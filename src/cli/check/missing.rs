@@ -24,7 +24,8 @@ use crate::period::{parse_period, today};
 /// One supplier's group, as the UI shows it.
 #[derive(Debug, Default)]
 struct Group<'a> {
-    payments: Vec<&'a OutstandingItem>,
+    /// Each with the foreign amount its description gives.
+    payments: Vec<(&'a OutstandingItem, Option<Fx>)>,
     invoices: Vec<&'a OutstandingItem>,
 }
 
@@ -50,14 +51,15 @@ fn groups<'a>(
         if !item.is_payment() {
             group.invoices.push(item);
         } else if in_period(&item.date) {
-            group.payments.push(item);
+            let fx = parse_fx(&item.description, cents(&item.amount));
+            group.payments.push((item, fx));
         }
     }
     by_supplier
         .into_iter()
         .filter(|(_, g)| !g.payments.is_empty())
         .map(|((_, name), mut g)| {
-            g.payments.sort_by(|a, b| a.date.cmp(&b.date));
+            g.payments.sort_by(|a, b| a.0.date.cmp(&b.0.date));
             g.invoices.sort_by(|a, b| a.date.cmp(&b.date));
             (name, g)
         })
@@ -116,22 +118,12 @@ pub async fn missing(
     }
 
     let groups = groups(&items, period.as_ref(), contact);
-    let fx: Vec<Vec<Option<Fx>>> = groups
-        .iter()
-        .map(|(_, g)| {
-            g.payments
-                .iter()
-                .map(|p| parse_fx(&p.description, cents(&p.amount)))
-                .collect()
-        })
-        .collect();
     // Receipts are matched across all suppliers at once, so one file never
     // serves two payments.
     let wanted: Vec<Wanted<'_>> = groups
         .iter()
-        .zip(&fx)
-        .flat_map(|((name, g), fx)| {
-            g.payments.iter().zip(fx).map(|(p, fx)| Wanted {
+        .flat_map(|(name, g)| {
+            g.payments.iter().map(|(p, fx)| Wanted {
                 supplier: name,
                 description: &p.description,
                 date: &p.date,
@@ -140,11 +132,11 @@ pub async fn missing(
             })
         })
         .collect();
-    let found = local
+    let mut found = local
         .as_ref()
         .map(|l| receipts::assign(&l.files, &wanted))
-        .unwrap_or_default();
-    let mut found = found.into_iter();
+        .unwrap_or_default()
+        .into_iter();
 
     let fmt = OutputFormat::from_flag(format, is_tty());
     let mut headers: Vec<String> = [
@@ -163,65 +155,64 @@ pub async fn missing(
     if local.is_some() {
         headers.push("Local receipt".into());
     }
-    let description = |text: &str| match fmt {
-        OutputFormat::Table => text.chars().take(70).collect(),
-        OutputFormat::Json => text.to_string(),
+    // The `Local receipt` cell is there only with `--receipts`.
+    let row = |name: &str, kind: &str, item: &OutstandingItem, reference: &str, fx, receipt| {
+        let description = match fmt {
+            OutputFormat::Table => item.description.chars().take(70).collect(),
+            OutputFormat::Json => item.description.clone(),
+        };
+        let mut row = vec![
+            name.to_string(),
+            kind.to_string(),
+            item.date.clone(),
+            description,
+            reference.to_string(),
+            item.amount.clone(),
+            item.open_amount.clone(),
+            fx,
+        ];
+        row.extend(receipt);
+        row
     };
     let mut rows = Vec::new();
     let mut tallies = Vec::new();
-    for ((name, group), fx) in groups.iter().zip(&fx) {
+    let mut total = Tally::default();
+    for (name, group) in &groups {
         let mut tally = Tally::default();
-        for (payment, fx) in group.payments.iter().zip(fx) {
+        for (payment, fx) in &group.payments {
             tally.payments += 1;
             tally.paid = tally.paid + cents(&payment.open_amount);
-            let mut row = vec![
-                (*name).to_string(),
-                "payment".into(),
-                payment.date.clone(),
-                description(&payment.description),
-                String::new(),
-                payment.amount.clone(),
-                payment.open_amount.clone(),
-                fx.as_ref().map(Fx::label).unwrap_or_default(),
-            ];
-            if let Some(local) = &local {
+            let receipt = local.as_ref().map(|local| {
                 let cell = found.next().flatten().map(|(r, fit)| {
                     tally.receipts += 1;
                     receipts::cell(&local.files[r], fit)
                 });
-                row.push(cell.unwrap_or_default());
-            }
-            rows.push(row);
+                cell.unwrap_or_default()
+            });
+            let fx = fx.as_ref().map(Fx::label).unwrap_or_default();
+            rows.push(row(name, "payment", payment, "", fx, receipt));
         }
         for invoice in &group.invoices {
+            let open = cents(&invoice.open_amount);
             tally.invoices += 1;
-            tally.invoiced = tally.invoiced + cents(&invoice.open_amount);
-            let kind = if cents(&invoice.open_amount) < Cents::ZERO {
+            tally.invoiced = tally.invoiced + open;
+            let kind = if open < Cents::ZERO {
                 "open credit note"
             } else {
                 "open invoice"
             };
-            let mut row = vec![
-                (*name).to_string(),
-                kind.into(),
-                invoice.date.clone(),
-                description(&invoice.description),
-                invoice.reference.clone(),
-                invoice.amount.clone(),
-                invoice.open_amount.clone(),
+            let receipt = local.as_ref().map(|_| String::new());
+            rows.push(row(
+                name,
+                kind,
+                invoice,
+                &invoice.reference,
                 String::new(),
-            ];
-            if local.is_some() {
-                row.push(String::new());
-            }
-            rows.push(row);
+                receipt,
+            ));
         }
+        total.add(tally);
         tallies.push((*name, tally));
-    }
-
-    let mut total = Tally::default();
-    for (_, t) in &tallies {
-        total.add(*t);
     }
     let mut summary_headers: Vec<String> = [
         "Supplier",
@@ -349,7 +340,7 @@ mod tests {
         // Ge-fibo has only an open invoice: not in the list.
         assert_eq!(names, ["amazon", "Vercel Inc"]);
         let vercel = &all[1].1;
-        assert_eq!(vercel.payments[0].date, "2026-02-08");
+        assert_eq!(vercel.payments[0].0.date, "2026-02-08");
         assert_eq!(vercel.invoices.len(), 1);
 
         let q3 = ("2026-07-01".to_string(), "2026-09-30".to_string());
