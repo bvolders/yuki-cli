@@ -567,6 +567,9 @@ pub async fn run_with<R: BufRead>(
         endpoint_override: None,
         // The firm issuing invoices is not something init discovers.
         seller: existing.as_ref().and_then(|c| c.seller.clone()),
+        // Nor is the API client, which Yuki support issues.
+        client_id: existing.as_ref().and_then(|c| c.client_id.clone()),
+        client_secret: existing.as_ref().and_then(|c| c.client_secret.clone()),
     };
 
     // A saved base_url is an endpoint the user chose, like a flag: keep it.

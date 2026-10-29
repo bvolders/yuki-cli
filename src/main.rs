@@ -4,7 +4,7 @@ use std::process;
 use clap::{CommandFactory, Parser};
 use owo_colors::OwoColorize;
 use yuki_cli::cli::Commands;
-use yuki_cli::cli::sales_invoice::InvoiceError;
+use yuki_cli::cli::invoice_common::InvoiceError;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
     DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, SalesCommands,
@@ -501,6 +501,18 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
             }
         }
 
+        Commands::Purchase { command } => {
+            yuki_cli::cli::purchase_invoice::run(
+                *command,
+                load,
+                cli.admin.as_deref(),
+                cli.yes,
+                cli.quiet,
+                format,
+            )
+            .await?;
+        }
+
         Commands::Documents { command } => {
             let config = load()?;
             let admin = cli.admin.as_deref();
@@ -633,7 +645,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
 
         Commands::Capabilities => {
             let value = serde_json::json!({
-                "areas": ["administrations", "vat", "contacts", "accounts", "projects", "invoices", "sales", "documents", "checks", "uploads"],
+                "areas": ["administrations", "vat", "contacts", "accounts", "projects", "invoices", "sales", "purchase", "documents", "checks", "uploads"],
                 "structured_output": true,
                 "daily_api_limit": 1000
             });

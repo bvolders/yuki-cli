@@ -236,6 +236,10 @@ pub fn config_show(config: &Config, format: Option<&str>, quiet: bool) {
                     "configured": !api_key.is_empty(),
                     "credential_source": credential_source,
                     "api_root": config.api_root(Some(entry)),
+                    // Where the API client comes from; never the secret.
+                    "api_client": config
+                        .api_client(Some(name), |v| std::env::var(v).ok())
+                        .map_or_else(|e| Some(e.to_string()), |c| c.map(|c| c.source)),
                 }),
             )
         })

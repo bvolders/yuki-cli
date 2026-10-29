@@ -12,6 +12,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -50,13 +51,19 @@ impl<S: LedgerFormat> Ledger<S> {
     /// Lock and load the ledger at `path`; a missing file is an empty state.
     /// Refused while another process holds the lock.
     pub fn open(path: &Path) -> Result<Self, YukiError> {
-        Self::locked(path, lock(path, false)?)
+        Self::open_within(path, Duration::ZERO)
+    }
+
+    /// [`open`](Self::open), waiting up to `patience` for another
+    /// process's lock before refusing.
+    pub fn open_within(path: &Path, patience: Duration) -> Result<Self, YukiError> {
+        Self::locked(path, lock(path, Some(patience))?)
     }
 
     /// [`open`](Self::open), waiting for another process's lock instead of
     /// refusing: for ledgers locked only for milliseconds at a time.
     pub fn open_wait(path: &Path) -> Result<Self, YukiError> {
-        Self::locked(path, lock(path, true)?)
+        Self::locked(path, lock(path, None)?)
     }
 
     fn locked(path: &Path, lock: fs::File) -> Result<Self, YukiError> {
@@ -156,7 +163,8 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{dot}{name}.{suffix}"))
 }
 
-fn lock(path: &Path, wait: bool) -> Result<fs::File, YukiError> {
+/// Lock `path`'s lock file, waiting forever (`None`) or up to `patience`.
+fn lock(path: &Path, patience: Option<Duration>) -> Result<fs::File, YukiError> {
     let lock = sibling(path, "lock");
     let io = |e: std::io::Error| YukiError::Config(format!("{}: {e}", lock.display()));
     if let Some(dir) = lock.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -168,16 +176,24 @@ fn lock(path: &Path, wait: bool) -> Result<fs::File, YukiError> {
         .write(true)
         .open(&lock)
         .map_err(io)?;
-    if wait {
+    let Some(patience) = patience else {
         return file.lock().map(|()| file).map_err(io);
-    }
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => Err(YukiError::Config(format!(
-            "another yuki run is working on {}; try again when it has finished",
-            path.display()
-        ))),
-        Err(fs::TryLockError::Error(e)) => Err(io(e)),
+    };
+    let deadline = Instant::now() + patience;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(YukiError::Config(format!(
+                    "another yuki run is working on {}; try again when it has finished",
+                    path.display()
+                )));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(io(e)),
+        }
     }
 }
 
@@ -293,6 +309,25 @@ mod tests {
         );
         // Only the file and its lock: no temporary file left behind.
         assert_eq!(names(dir.path()), [".notes.json.lock", "notes.json"]);
+    }
+
+    #[test]
+    fn open_within_waits_a_bounded_time_for_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".state.json");
+        let held = Ledger::<Notes>::open(&path).unwrap();
+        let start = Instant::now();
+        let err = Ledger::<Notes>::open_within(&path, Duration::from_millis(300))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another yuki run"), "{err}");
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        Ledger::<Notes>::open_within(&path, Duration::from_secs(5)).unwrap();
+        release.join().unwrap();
     }
 
     #[test]

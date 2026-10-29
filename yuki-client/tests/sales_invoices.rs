@@ -35,11 +35,11 @@ fn parses_a_success_sent_as_child_elements() {
     assert_eq!(
         import,
         SalesInvoicesImport {
-            total_succeeded: 1,
-            total_failed: 0,
-            total_skipped: 0,
+            total_succeeded: Some(1),
+            total_failed: Some(0),
+            total_skipped: Some(0),
             invoices: vec![ImportedInvoice {
-                succeeded: true,
+                succeeded: Some(true),
                 processed: true,
                 email_sent: true,
                 reference: "2026-0042".into(),
@@ -65,10 +65,11 @@ fn parses_a_failure_sent_as_escaped_text() {
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     let import = SalesClient::parse_process_sales_invoices(&envelope(&escaped)).unwrap();
-    assert_eq!(import.total_failed, 1);
+    assert_eq!(import.total_failed, Some(1));
     assert_eq!(import.invoices.len(), 1);
     let invoice = &import.invoices[0];
-    assert!(!invoice.succeeded && !invoice.processed && !invoice.email_sent);
+    assert!(invoice.succeeded == Some(false) && !invoice.processed && !invoice.email_sent);
+    assert!(import.nothing_created());
     assert_eq!(
         invoice.message,
         "No tax code for VATPercentage 21 & VATType 9"
@@ -84,9 +85,9 @@ fn parses_a_failure_sent_as_escaped_text() {
 #[test]
 fn a_skipped_or_missing_invoice_is_a_failure() {
     let skipped = SalesInvoicesImport {
-        total_skipped: 1,
+        total_skipped: Some(1),
         invoices: vec![ImportedInvoice {
-            succeeded: true,
+            succeeded: Some(true),
             ..Default::default()
         }],
         ..Default::default()

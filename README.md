@@ -4,7 +4,7 @@
 
 CLI client for the [Yuki](https://www.yukiworks.nl) bookkeeping SOAP API.
 
-[Yuki](https://www.yukiworks.nl) is a Dutch bookkeeping SaaS used for accounting, VAT returns, and document archiving. This CLI lets you query your administration, find missing invoices, upload documents, and create sales invoices — from the terminal or as part of automated workflows.
+[Yuki](https://www.yukiworks.nl) is a Dutch bookkeeping SaaS used for accounting, VAT returns, and document archiving. This CLI lets you query your administration, find missing invoices, upload documents, create sales invoices and book purchase invoices — from the terminal or as part of automated workflows.
 
 > **Note:** This project is not affiliated with or endorsed by Yuki Software.
 
@@ -491,6 +491,75 @@ rejects the invoice: check Settings > VAT rates in Yuki or `yuki vat codes`. The
 preview's VAT is computed per rate on the summed net and rounded once; the
 booked figure is Yuki's own.
 
+### Purchase invoices
+
+```sh
+yuki purchase book F2026-0042.pdf --contact "Leverancier BV" --reference F2026-0042 \
+  --date 2026-10-20 --total 121.00 --vat-amount 21.00 --payment-method credit-card \
+  --gl-account 612000 --vat-type 1 --vat-description "VAT 21%" --dry-run  # Check and show the xmlDoc
+yuki purchase book F2026-0042.pdf --contact-code SUP001 --reference F2026-0042 \
+  --date 2026-10-20 --total 121.00 --vat-amount 21.00 \
+  --payment-method transfer --iban BE68539007547034 \
+  --line "Hosting;612000;60.00;1;VAT 21%" --line "Licence;613000;40.00;1;VAT 21%" \
+  --yes --confirm F2026-0042                           # Two lines, unattended
+yuki purchase bookings                                 # What purchase book sent (local ledger)
+yuki purchase bookings --resolve F2026-0042 --as booked  # Settle one left pending
+```
+
+`purchase book` sends the PDF and its booking to Yuki (`ProcessPurchaseInvoices`)
+as a **proposal** the accountant checks and processes; `--process` marks it
+processed. Yuki overwrites a contact it matches with every element sent, so
+the supplier is looked up first (read-only): `--contact-code` must exist, and
+only the code goes; `--contact` is matched by name (case, punctuation and legal
+form aside) and only Yuki's spelling of the name goes. A name Yuki does not
+have is a **new** supplier, which the preview says in capitals: it needs
+`--country` (and takes `--vat-number`; a company unless `--person`).
+`--payment-method` is required; `transfer` needs `--iban`, which is checked
+(mod 97) and added to the contact. The file must be a `.pdf`. One line takes `--gl-account`, `--vat-type`,
+`--vat-description` and `--description`, and its amount is `--total` minus
+`--vat-amount`; more lines are `--line
+"description;gl_account;amount_excl_vat;vat_type;vat_description"`. The lines
+plus the VAT must make the total to the cent. Belgian VAT types are ambiguous
+(11 is several codes), so the type and description are sent as a pair, which
+must be an active VAT code (`yuki vat codes`), and each GL account must exist
+(`yuki accounts scheme`): Yuki would book an unknown one to a default account.
+When every line's VAT code is a plain rate (`VAT 21%`), `--vat-amount` must be
+the lines' VAT at those rates, within a cent per line; with any other code
+(reverse charge, imports, `Input tax`) the preview says it was not checked.
+
+A purchase invoice cannot be deleted through the API, so the command refuses
+(kind `invalid_input`, `DUPLICATE`) when the PDF may be in Yuki already: the
+same PDF, or the same reference from the same supplier, in the ledger
+(`~/.config/yuki/purchase-invoices.json`) and not rejected; three of the same
+supplier, reference, invoice date and total there, as Yuki's own duplicate
+check (`--allow-duplicate` books anyway); the PDF recorded as in Yuki or
+pending in the `.yuki-sync.json` of `upload dir` at or above its directory (a
+failed or skipped file is fine); or an archive document, among the supplier's
+(Yuki's free text matches the contact, not file names) and all within a week
+of the invoice date, with the same file name (ignoring extension, case and an
+`Invoice-` prefix), the reference in its file name or subject, or the same
+amount within 3 days (`--allow-archive-match` books anyway). References
+compare by letters and digits only (`F 2026/0042` is `F2026-0042`); supplier names in any case, ignoring
+punctuation and legal forms (`Leverancier B.V.` is `Leverancier BV`). A booked
+PDF is recorded in that `.yuki-sync.json` as in Yuki, and `upload dir` never
+uploads a PDF the ledger holds, wherever it was booked from.
+
+The safety model is `sales invoice create`'s: a preview on stderr and a prompt,
+`--yes` needs `--confirm <reference>`, and `--dry-run` prints the `xmlDoc` (the
+PDF elided) after the checks, which only read Yuki. The invoice is `pending` in
+the ledger (and in `.yuki-sync.json`) from just before the call; Yuki's answer
+makes it `booked`, or `rejected` when nothing reached Yuki or Yuki created
+nothing. A timeout or fault (`outcome_unknown`), or a booking under another
+reference (`reference_mismatch`), leaves it pending: check Yuki, then
+`purchase bookings --resolve <reference> --as booked|rejected` (with `--contact`
+when two suppliers share the reference), which settles the sync record too.
+
+Yuki may only accept purchase invoices from a registered API client. Set
+`client_id` and `client_secret` (top level, or per administration), or
+`YUKI_CLIENT_ID` and `YUKI_CLIENT_SECRET`, and `purchase book` authenticates
+with `AuthenticateClient`; Yuki support (support.accounting@nmbrs.com) issues
+them. Other commands keep the access key alone.
+
 ### Global flags
 
 | Flag | Description |
@@ -524,6 +593,10 @@ The `documents exists` command exits with code 3 when no matching document is fo
 # Used by any administration that does not carry a key of its own.
 api_key = "your-api-key"
 default_admin = "company_name"
+
+# Optional: a registered API client, for `purchase book` (AuthenticateClient).
+# client_id = "..."
+# client_secret = "..."
 
 # Skip these counterparties in `check unmatched` (case-insensitive substring match)
 unmatched_ignore = [

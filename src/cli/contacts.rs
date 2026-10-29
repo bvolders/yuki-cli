@@ -16,6 +16,11 @@ pub(crate) fn yes_no(value: bool) -> String {
     if value { "Yes" } else { "No" }.to_string()
 }
 
+/// [`yes_no`], or `?` when Yuki's answer did not say.
+pub(crate) fn yes_no_unknown(value: Option<bool>) -> String {
+    value.map_or("?".to_string(), yes_no)
+}
+
 fn contacts_to_rows(contacts: &[Contact]) -> Vec<Vec<String>> {
     contacts
         .iter()

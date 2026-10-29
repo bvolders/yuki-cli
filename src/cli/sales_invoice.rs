@@ -12,27 +12,25 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
-
 use serde::{Deserialize, Serialize};
 
-use crate::cli::contacts::yes_no;
+use crate::cli::contacts::{yes_no, yes_no_unknown};
+pub use crate::cli::invoice_common::{InvoiceError, PDF_MAX_BYTES, Pdf, parse_date};
+use crate::cli::invoice_common::{classify, rejection, xml_text};
 use crate::cli::invoice_ledger::{Claim, InvoiceLedger};
 use crate::cli::invoice_number::{dutch_date, structured_reference};
-use crate::client::escape_text;
+use crate::cli::xml_doc::{XmlWriter, bool_text};
 use crate::client::sales::{SalesClient, SalesInvoicesImport};
 use crate::config::{Config, Seller};
-use crate::error::{Delivery, YukiError};
+use crate::error::YukiError;
 use crate::money::{
     Cents, PCT_DECIMALS, PercentError, div_round, format_scaled, parse_percent, parse_scaled,
 };
-use crate::output::{OutputFormat, format_json, format_table, human_size, is_tty};
+use crate::output::{OutputFormat, format_json, format_table, human_size, is_tty, print_table};
 use crate::period::{date_from_epoch_days, epoch_days, today};
 
 /// Namespace of the `SalesInvoices` document; Yuki rejects one without it.
 pub const NAMESPACE: &str = "urn:xmlns:http://www.theyukicompany.com:salesinvoices";
-const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 /// `ProductQuantity` carries up to four decimals.
 const QTY_DECIMALS: u32 = 4;
 /// `Notes` and `PaymentMethod` length limits from the XSD.
@@ -43,10 +41,6 @@ const PAYMENT_METHOD_MAX: usize = 60;
 const QTY_MAX: i64 = 10_i64.pow(10 + QTY_DECIMALS);
 const PRICE_MAX: i64 = 10_i64.pow(12);
 const LINE_AMOUNT_MAX: i128 = 10_i128.pow(12);
-/// The largest custom PDF accepted. Yuki documents no limit, but ASP.NET's
-/// default `maxRequestLength` is 4 MB and base64 adds a third, so 3 MB of
-/// PDF (4 MB encoded) is about what one request can carry.
-pub const PDF_MAX_BYTES: usize = 3 * 1024 * 1024;
 /// The longest payment term accepted, in days.
 const DUE_DAYS_MAX: i64 = 3_650;
 
@@ -103,21 +97,6 @@ pub fn parse_price(text: &str) -> Result<Cents, String> {
             Err(format!("'{text}' exceeds Yuki's 10 integer digits"))
         }
         price => Ok(price),
-    }
-}
-
-/// Accept an ISO calendar date (`--date`, `date`, `due_date`).
-pub fn parse_date(text: &str) -> Result<String, String> {
-    let text = text.trim();
-    let shaped = text.len() == 10
-        && text.bytes().enumerate().all(|(i, b)| match i {
-            4 | 7 => b == b'-',
-            _ => b.is_ascii_digit(),
-        });
-    if shaped && epoch_days(text).is_some() {
-        Ok(text.to_string())
-    } else {
-        Err(format!("'{text}' is not a date (YYYY-MM-DD)"))
     }
 }
 
@@ -280,40 +259,6 @@ pub struct VatRate {
     pub percentage: i64,
     pub base: Cents,
     pub vat: Cents,
-}
-
-/// A custom invoice PDF, read and checked when the invoice is loaded.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pdf {
-    /// The local file name, for the preview; Yuki stores it as `Invoice <number>.pdf`.
-    pub name: String,
-    pub bytes: Vec<u8>,
-}
-
-impl Pdf {
-    /// Read `path`, which must be a PDF of at most [`PDF_MAX_BYTES`].
-    fn read(path: &Path) -> Result<Self, String> {
-        let shown = path.display();
-        let size = std::fs::metadata(path)
-            .map_err(|e| format!("{shown}: {e}"))?
-            .len();
-        if size > PDF_MAX_BYTES as u64 {
-            return Err(format!(
-                "{shown} is {}, over the {} limit",
-                human_size(size),
-                human_size(PDF_MAX_BYTES as u64)
-            ));
-        }
-        let bytes = std::fs::read(path).map_err(|e| format!("{shown}: {e}"))?;
-        if !bytes.starts_with(b"%PDF-") {
-            return Err(format!("{shown} is not a PDF (no %PDF- header)"));
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        Ok(Self { name, bytes })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -728,12 +673,7 @@ impl Invoice {
     }
 
     fn render(&self, embed_pdf: bool) -> String {
-        let mut x = XmlWriter::default();
-        let _ = writeln!(
-            x.out,
-            r#"<SalesInvoices xmlns="{NAMESPACE}" xmlns:xsi="{XSI}">"#
-        );
-        x.depth = 1;
+        let mut x = XmlWriter::root("SalesInvoices", NAMESPACE);
         x.open("SalesInvoice");
         // Without a number, no Reference: Yuki numbers the invoice.
         x.opt("Reference", &self.number);
@@ -760,18 +700,7 @@ impl Invoice {
                 "DocumentFileName",
                 &self.document_file_name().unwrap_or_default(),
             );
-            let encoded = BASE64.encode(&pdf.bytes);
-            if embed_pdf {
-                x.leaf("DocumentBase64", &encoded);
-            } else {
-                x.indent();
-                let _ = writeln!(
-                    x.out,
-                    "<DocumentBase64><!-- {} bytes base64 ({}-byte PDF) --></DocumentBase64>",
-                    encoded.len(),
-                    pdf.bytes.len()
-                );
-            }
+            x.base64(&pdf.bytes, embed_pdf);
         }
 
         let c = &self.contact;
@@ -814,48 +743,7 @@ impl Invoice {
         }
         x.close("InvoiceLines");
         x.close("SalesInvoice");
-        x.out.push_str("</SalesInvoices>");
-        x.out
-    }
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
-}
-
-/// An indented XML writer for the few element shapes the document needs.
-#[derive(Default)]
-struct XmlWriter {
-    out: String,
-    depth: usize,
-}
-
-impl XmlWriter {
-    fn indent(&mut self) {
-        self.out.push_str(&"  ".repeat(self.depth));
-    }
-
-    fn open(&mut self, name: &str) {
-        self.indent();
-        let _ = writeln!(self.out, "<{name}>");
-        self.depth += 1;
-    }
-
-    fn close(&mut self, name: &str) {
-        self.depth -= 1;
-        self.indent();
-        let _ = writeln!(self.out, "</{name}>");
-    }
-
-    fn leaf(&mut self, name: &str, value: &str) {
-        self.indent();
-        let _ = writeln!(self.out, "<{name}>{}</{name}>", escape_text(value));
-    }
-
-    fn opt(&mut self, name: &str, value: &Option<String>) {
-        if let Some(value) = value {
-            self.leaf(name, value);
-        }
+        x.finish("SalesInvoices")
     }
 }
 
@@ -938,17 +826,7 @@ impl Problems {
 
     /// Trimmed text, `None` when empty; characters XML 1.0 cannot carry are a problem.
     fn text(&mut self, field: &str, value: Option<String>) -> Option<String> {
-        let value = value?.trim().to_string();
-        if value.is_empty() {
-            return None;
-        }
-        if value.chars().any(|c| {
-            (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
-                || matches!(c, '\u{FFFE}' | '\u{FFFF}')
-        }) {
-            self.push(format!("{field} contains a character XML cannot carry"));
-        }
-        Some(value)
+        xml_text(field, value.as_deref(), &mut self.0)
     }
 
     /// Decimal text of a TOML number or string.
@@ -1580,11 +1458,11 @@ pub async fn submit(
     let import = client
         .process_sales_invoices(target.admin_id, &invoice.to_xml())
         .await
-        .map_err(|e| match e.delivery() {
-            Delivery::Unknown => InvoiceError::OutcomeUnknown(format!(
-                "{e}: the invoice may already have been created in Yuki — check 'To be sent'/'Sales' before retrying"
-            )),
-            Delivery::NotSent | Delivery::Refused => InvoiceError::Yuki(e),
+        .map_err(|e| {
+            classify(
+                e,
+                "the invoice may already have been created in Yuki — check 'To be sent'/'Sales' before retrying",
+            )
         })?;
 
     if !quiet {
@@ -1670,12 +1548,8 @@ pub enum Verdict {
 
 /// Judge Yuki's `import` of `invoice`.
 pub fn verdict(import: &SalesInvoicesImport, invoice: &Invoice) -> Verdict {
-    if let Some(failure) = import.failure() {
-        let freed = !import.invoices.is_empty() && import.invoices.iter().all(|i| !i.succeeded);
-        return Verdict::Rejected {
-            message: failure,
-            freed,
-        };
+    if let Some((message, freed)) = rejection(import) {
+        return Verdict::Rejected { message, freed };
     }
     let Some(mode) = invoice.send else {
         return Verdict::Done;
@@ -1719,77 +1593,6 @@ pub fn verdict(import: &SalesInvoicesImport, invoice: &Invoice) -> Verdict {
     Verdict::Done
 }
 
-/// Why a sales invoice command stopped, raised where it is found, with the
-/// error kind the CLI reports.
-#[derive(Debug)]
-pub enum InvoiceError {
-    /// From Yuki or the configuration; for [`submit`], nothing reached Yuki
-    /// or Yuki refused it unprocessed ([`Delivery::NotSent`],
-    /// [`Delivery::Refused`]). Its kind is the [`YukiError`]'s.
-    Yuki(YukiError),
-    /// The invoice, its file, the flags or the number are not acceptable;
-    /// nothing was sent (`invalid_input`).
-    InvalidInput(String),
-    /// Not confirmed, or not confirmable without a prompt; nothing was sent.
-    ConfirmationRequired(String),
-    /// Yuki answered, but did not create or book it as asked.
-    Rejected(String),
-    /// Booked, but not emailed as asked.
-    SendIncomplete(String),
-    /// Booked under another reference than the number sent.
-    ReferenceMismatch(String),
-    /// The request may have been processed, without an answer saying how
-    /// ([`Delivery::Unknown`]): a timeout, a dropped connection, a fault.
-    OutcomeUnknown(String),
-}
-
-impl InvoiceError {
-    /// The error kind; `error` for [`Yuki`](Self::Yuki), whose own kind the
-    /// CLI reports instead.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Yuki(_) => "error",
-            Self::InvalidInput(_) => "invalid_input",
-            Self::ConfirmationRequired(_) => "confirmation_required",
-            Self::Rejected(_) => "invoice_rejected",
-            Self::SendIncomplete(_) => "send_incomplete",
-            Self::ReferenceMismatch(_) => "reference_mismatch",
-            Self::OutcomeUnknown(_) => "outcome_unknown",
-        }
-    }
-
-    /// A configuration error is a problem with the input; anything else
-    /// stays a Yuki error.
-    pub fn input(e: YukiError) -> Self {
-        match e {
-            YukiError::Config(message) => Self::InvalidInput(message),
-            other => Self::Yuki(other),
-        }
-    }
-}
-
-impl std::fmt::Display for InvoiceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Yuki(e) => write!(f, "{e}"),
-            Self::InvalidInput(m)
-            | Self::ConfirmationRequired(m)
-            | Self::Rejected(m)
-            | Self::SendIncomplete(m)
-            | Self::ReferenceMismatch(m)
-            | Self::OutcomeUnknown(m) => f.write_str(m),
-        }
-    }
-}
-
-impl std::error::Error for InvoiceError {}
-
-impl From<YukiError> for InvoiceError {
-    fn from(e: YukiError) -> Self {
-        Self::Yuki(e)
-    }
-}
-
 impl Verdict {
     /// The run's result: success when Yuki did as asked.
     pub fn into_result(self) -> Result<(), InvoiceError> {
@@ -1803,7 +1606,7 @@ impl Verdict {
 }
 
 fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<&str>) {
-    let headers: Vec<String> = [
+    let headers = [
         "Succeeded",
         "Processed",
         "Email Sent",
@@ -1812,9 +1615,7 @@ fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<
         "PDF",
         "Peppol",
         "Message",
-    ]
-    .map(String::from)
-    .to_vec();
+    ];
     let pdf_name = invoice.document_file_name().unwrap_or_default();
     let peppol = invoice.peppol_label();
     let rows: Vec<Vec<String>> = import
@@ -1822,7 +1623,7 @@ fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<
         .iter()
         .map(|i| {
             vec![
-                yes_no(i.succeeded),
+                yes_no_unknown(i.succeeded),
                 yes_no(i.processed),
                 yes_no(i.email_sent),
                 i.reference.clone(),
@@ -1833,10 +1634,7 @@ fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<
             ]
         })
         .collect();
-    match OutputFormat::from_flag(format, is_tty()) {
-        OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
-        OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
-    }
+    print_table(format, &headers, &rows);
 }
 
 // ---------------------------------------------------------------------------

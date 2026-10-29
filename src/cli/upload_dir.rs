@@ -18,7 +18,7 @@ use crate::error::{Delivery, YukiError};
 use crate::folders::folder_id;
 use crate::ledger::Ledger;
 use crate::output::{OutputFormat, format_json, format_table, is_tty};
-use crate::sync::{self, Entry, Excludes, Found, STATE_FILE, State, Status, shell_quote};
+use crate::sync::{self, Entry, Excludes, Found, Held, STATE_FILE, State, Status, shell_quote};
 
 /// Options of `upload dir`.
 pub struct DirOptions<'a> {
@@ -169,7 +169,33 @@ impl Plan {
     }
 }
 
-fn plan(root: PathBuf, mut ledger: Ledger<State>, excludes: &[String]) -> Result<Plan, YukiError> {
+/// The record and the row of a file another command put in Yuki.
+fn held_record(state: &State, file: &Found, held: &Held) -> (Entry, Row) {
+    let entry = sync::record(
+        state,
+        &file.hash,
+        &file.rel,
+        file.size,
+        held.status,
+        held.note.clone(),
+    );
+    let action = if held.status == Status::Pending {
+        "pending"
+    } else {
+        "booked"
+    };
+    (entry, Row::new(&file.rel, action).note(held.note.clone()))
+}
+
+/// Sort the files of `root` into a plan. `held` holds the files another
+/// command put in Yuki, or may have (by hash): whatever the sync state
+/// says, they are recorded as such and never uploaded.
+fn plan(
+    root: PathBuf,
+    mut ledger: Ledger<State>,
+    excludes: &[String],
+    held: &HashMap<String, Held>,
+) -> Result<Plan, YukiError> {
     let excludes = Excludes::new(excludes)?;
     let state = ledger.state();
     let scan = sync::scan(&root, &excludes)?;
@@ -188,12 +214,29 @@ fn plan(root: PathBuf, mut ledger: Ledger<State>, excludes: &[String]) -> Result
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut synced, mut trouble) = (0, 0);
     let mut first_seen: HashMap<&str, &str> = HashMap::new();
+    // Records to add for files another command put in Yuki.
+    let mut recorded: Vec<(String, Entry)> = Vec::new();
     for file in &scan.files {
         if let Some(first) = first_seen.get(file.hash.as_str()) {
             rows.push(Row::new(&file.rel, "duplicate").note(format!("same content as {first}")));
             continue;
         }
         first_seen.insert(&file.hash, &file.rel);
+        let unrecorded = state
+            .files
+            .get(&file.hash)
+            .is_none_or(|e| e.status == Status::Failed);
+        if let Some(held) = held.get(&file.hash).filter(|_| unrecorded) {
+            let (entry, row) = held_record(state, file, held);
+            recorded.push((file.hash.clone(), entry));
+            if held.status == Status::Pending {
+                pending.push(file.clone());
+            } else {
+                synced += 1;
+            }
+            rows.push(row);
+            continue;
+        }
         let Some(entry) = state.files.get(&file.hash) else {
             match state.stale_record_at(&file.rel, &scanned) {
                 Some((_, e)) => {
@@ -247,13 +290,14 @@ fn plan(root: PathBuf, mut ledger: Ledger<State>, excludes: &[String]) -> Result
         rows.push(Row::new(rel, "error").error(error.clone()));
     }
     new.extend(retries);
-    let any_moved = !moved.is_empty();
+    let any_moved = !moved.is_empty() || !recorded.is_empty();
     let state = ledger.state_mut();
     for (hash, rel) in moved {
         if let Some(entry) = state.files.get_mut(&hash) {
             entry.path = rel;
         }
     }
+    state.files.extend(recorded);
     Ok(Plan {
         root,
         ledger,
@@ -361,8 +405,10 @@ async fn run_dir(
     } else {
         sync::open(&root)?
     };
+    // The PDFs `purchase book` sent.
+    let held = crate::cli::purchase_ledger::held_pdfs()?;
     // Accepted: concurrent first runs on /r and /r/sub can both pass these checks.
-    let mut plan = plan(root, ledger, opts.excludes)?;
+    let mut plan = plan(root, ledger, opts.excludes, &held)?;
     if !quiet {
         print_plan(&plan, opts);
     }
@@ -885,11 +931,17 @@ pub fn mark(opts: MarkOptions<'_>, format: Option<&str>, quiet: bool) -> Result<
             )));
         }
         _ => {
-            let base = Entry::update(state, &hash, &rel, bytes.len() as u64, status);
+            let base = sync::record(
+                state,
+                &hash,
+                &rel,
+                bytes.len() as u64,
+                status,
+                opts.note.unwrap_or("marked by hand").to_string(),
+            );
             let entry = Entry {
                 document_id: doc_id.clone(),
                 folder: opts.folder.map(str::to_string).or(base.folder.clone()),
-                note: Some(opts.note.unwrap_or("marked by hand").to_string()),
                 ..base
             };
             state.files.insert(hash, entry);

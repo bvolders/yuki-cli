@@ -5,7 +5,7 @@ Typed async client for the [Yuki](https://www.yukiworks.nl/) bookkeeping SOAP AP
 This crate is the transport and parsing layer extracted from
 [`yuki-cli`](https://github.com/rvben/yuki-cli): SOAP envelope building,
 key-based authentication, and typed wrappers over the Accounting, AccountingInfo,
-Sales, VAT, Contact, and Archive services. The CLI is a thin presentation layer
+Sales, Purchase, VAT, Contact, and Archive services. The CLI is a thin presentation layer
 on top; other consumers (such as a long-running service) can depend on this crate
 directly.
 

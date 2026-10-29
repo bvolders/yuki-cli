@@ -5,15 +5,20 @@ pub mod check;
 pub mod contacts;
 pub mod documents;
 pub mod init;
+pub mod invoice_common;
 pub mod invoice_ledger;
 pub mod invoice_number;
 pub mod invoices;
+pub mod keys;
 pub mod projects;
+pub mod purchase_invoice;
+pub mod purchase_ledger;
 pub mod sales;
 pub mod sales_invoice;
 pub mod upload;
 pub mod upload_dir;
 pub mod vat;
+pub mod xml_doc;
 
 use std::ffi::OsString;
 
@@ -292,6 +297,12 @@ pub enum Commands {
     Sales {
         #[command(subcommand)]
         command: SalesCommands,
+    },
+
+    /// Book supplier (purchase) invoices.
+    Purchase {
+        #[command(subcommand)]
+        command: Box<PurchaseCommands>,
     },
 
     /// Work with projects.
@@ -608,6 +619,51 @@ pub enum SalesInvoiceCommands {
     Templates,
 }
 
+#[derive(Subcommand)]
+pub enum PurchaseCommands {
+    /// Book a supplier's PDF invoice in Yuki (ProcessPurchaseInvoices).
+    ///
+    /// Without --process it lands as a proposal for the accountant to check
+    /// and process. Give the lines as one line (--gl-account, --vat-type,
+    /// --vat-description; its amount is --total minus --vat-amount) or as
+    /// repeated --line; the lines plus the VAT must make the total to the
+    /// cent. The VAT type and description must be an active pair (`yuki vat
+    /// codes`) and the GL account must exist (`yuki accounts scheme`).
+    /// Refused when the purchase ledger, the `upload dir` sync state of the
+    /// PDF's directory, or the Yuki archive suggests it is in Yuki already:
+    /// the API cannot delete a purchase invoice. Prints a preview and asks on
+    /// a terminal; --yes needs --confirm <reference>. --dry-run checks
+    /// (reading Yuki only) and prints the xmlDoc without sending.
+    Book(Box<purchase_invoice::BookArgs>),
+
+    /// List the purchase invoices `purchase book` sent, from the local ledger.
+    ///
+    /// An invoice is pending from just before Yuki is called until its
+    /// answer marks it booked or rejected. One left pending (no usable answer
+    /// came back) blocks booking the same PDF or reference again: check
+    /// Yuki, then settle it with --resolve <REFERENCE> --as booked|rejected,
+    /// which also settles the PDF's `upload dir` sync record.
+    Bookings {
+        /// Settle the pending invoice with this reference by hand, as --as says.
+        #[arg(long, value_name = "REFERENCE", requires = "resolution")]
+        resolve: Option<String>,
+
+        /// What --resolve settles it as: booked (it is in Yuki) or rejected (it is not).
+        #[arg(
+            long = "as",
+            id = "resolution",
+            value_name = "STATUS",
+            value_enum,
+            requires = "resolve"
+        )]
+        resolution: Option<invoice_ledger::Resolution>,
+
+        /// The supplier, when several have the --resolve reference pending.
+        #[arg(long, value_name = "NAME", requires = "resolve")]
+        contact: Option<String>,
+    },
+}
+
 /// What an invoice is made of: `create` and `prepare` take the same.
 #[derive(clap::Args)]
 pub struct InvoiceInputs {
@@ -628,7 +684,7 @@ pub struct InvoiceInputs {
     pub price: Option<crate::money::Cents>,
 
     /// Invoice date, YYYY-MM-DD. Default: the file's date, else today.
-    #[arg(long, value_parser = sales_invoice::parse_date)]
+    #[arg(long, value_parser = invoice_common::parse_date)]
     pub date: Option<String>,
 
     /// Subject (title) of the invoice, replacing the file's.

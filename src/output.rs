@@ -143,6 +143,16 @@ pub fn format_table(headers: &[String], rows: &[Vec<String>]) -> String {
     table.to_string()
 }
 
+/// Print `rows` under `headers` to stdout: a table, or JSON as `format`
+/// (and whether stdout is a terminal) says.
+pub fn print_table(format: Option<&str>, headers: &[&str], rows: &[Vec<String>]) {
+    let headers: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
+    match OutputFormat::from_flag(format, is_tty()) {
+        OutputFormat::Table => println!("{}", format_table(&headers, rows)),
+        OutputFormat::Json => println!("{}", format_json(&headers, rows)),
+    }
+}
+
 /// Format a structured error as the clispec v0.2 envelope.
 ///
 /// The spec requires the last line of stderr to be:

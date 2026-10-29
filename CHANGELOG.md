@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Breaking Changes
 
+- **yuki-client**: `SalesInvoicesImport`'s counts are `Option<u32>` and `ImportedInvoice::succeeded` is `Option<bool>`: `None` when Yuki's answer lacks the field or it does not parse, instead of 0/false. `SalesInvoicesImport::nothing_created()` says when the answer proves nothing was created; `sales invoice create` and `purchase book` free a number or an invoice only then, and otherwise leave it pending.
+
 - **yuki-client**: `OutstandingItem` gains public fields (`id`, `type_name`, `type_id`, `reference`, `document_id`); code that builds one with a struct literal needs `..Default::default()`.
 - **accounts**: `accounts balance` now reports the balance at the end of `--period` (or today, if the period is still running) instead of at its start, and adds an `As Of` column with that date. Scripts reading the old start-of-period figure, or indexing columns, must adjust.
 - **yuki-client**: HTTP 401/403 is now `YukiError::Unauthorized(status)` instead of `AuthFailed("HTTP …")`; `AuthFailed` remains for authentication faults.
@@ -19,6 +21,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **purchase**: `purchase book <pdf>` books a supplier invoice with `ProcessPurchaseInvoices`, a proposal unless `--process`: one line or repeated `--line`, which plus the VAT must make the total exactly; VAT type/description pairs and GL accounts checked against Yuki. Refuses a PDF that may be in Yuki already (local `purchase-invoices.json` ledger, the governing `.yuki-sync.json`, an archive search) and records a booked one in `.yuki-sync.json`. The supplier is looked up first: an existing one gets only its code or its exact name (Yuki overwrites a matched contact with what is sent), a new one is announced and needs `--country`. `--payment-method` is required (transfer needs a mod-97-checked `--iban`), and `--vat-amount` must follow from plain VAT rates. `upload dir` never uploads a PDF the ledger holds. Dry run, prompt, `--yes --confirm <reference>`, write-ahead and `purchase bookings --resolve` as for sales invoices.
+- **config**: optional `client_id`/`client_secret` (top level or per administration; env `YUKI_CLIENT_ID`/`YUKI_CLIENT_SECRET`): `purchase book` then authenticates with `AuthenticateClient`.
+- **yuki-client**: `purchase::PurchaseClient` (`ProcessPurchaseInvoices`, `authenticate_client`), `SoapClient::authenticate_client`, and `with_session` on `VatClient` and `AccountingInfoClient`.
 - **check**: `check missing [--period P] [--contact NAME] [--receipts DIR]` lists Yuki's "Betalingen waarvan factuur nog ontbreekt" per supplier: the bank and card payments no invoice settles yet, then the supplier's open invoices, with the foreign amount of a card line (`FX`), a summary per supplier and a total. One read, `OutstandingCreditorItemsByDateOutstanding` with `includeBankTransactions`. `--receipts` matches each payment to a file in a receipts folder (vendor from the folder name, amount from `receipts-log.csv` in EUR or the stated foreign currency, date within 5 days) and marks files `.yuki-sync.json` records as uploaded; the folder is only read.
 - **yuki-client**: `AccountingClient::outstanding_creditor_items_with_payments`; `OutstandingItem` gains `id`, `type_name`, `type_id`, `reference`, `document_id` and `is_payment()`.
 - **upload**: `upload dir <path>` uploads the receipts in a directory that are not in Yuki yet, tracked by content hash in `<path>/.yuki-sync.json`. Each upload is recorded as `pending` before it is sent, so an uncertain outcome is never retried silently. `--seed-from-yuki` records files Yuki already has; `upload mark` records one by hand.

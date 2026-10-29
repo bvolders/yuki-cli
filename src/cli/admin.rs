@@ -261,6 +261,8 @@ mod tests {
             base_url: None,
             endpoint_override: None,
             seller: None,
+            client_id: None,
+            client_secret: None,
         }
     }
 
