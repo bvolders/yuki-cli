@@ -686,6 +686,8 @@ fn upload_dir_never_uploads_a_pdf_purchase_book_sent() {
         &[
             "--reference",
             "F2026-0050",
+            "--date",
+            "2026-10-21",
             "--yes",
             "--confirm",
             "F2026-0050",
@@ -723,4 +725,48 @@ fn resolving_as_booked_records_a_pdf_without_a_sync_record() {
     ));
     let record = sync_record(pdf.parent().unwrap()).expect("recorded");
     assert_eq!(record["status"], "already-in-yuki");
+}
+
+#[test]
+fn a_respelled_or_three_of_four_duplicate_is_refused() {
+    let (root, log, process) = mock("");
+    let (home, pdf) = setup(&root, "");
+    ok(&book(&home, &pdf, CONFIRMED));
+    let rescan = home.path().join("inbox/rescan.pdf");
+    std::fs::write(&rescan, b"%PDF-1.4 the same invoice, scanned again").unwrap();
+    // The same reference spelled otherwise, from "Leverancier B.V.".
+    let out = book(
+        &home,
+        &rescan,
+        &[
+            "--contact",
+            "leverancier b.v.",
+            "--reference",
+            "F 2026/0042",
+            "--date",
+            "2026-10-01",
+            "--yes",
+            "--confirm",
+            "F 2026/0042",
+        ],
+    );
+    fails(&out, 1, "DUPLICATE: this supplier's reference");
+    // Same supplier, date and total under another reference.
+    let other_ref = [
+        "--reference",
+        "F2026-0099",
+        "--yes",
+        "--confirm",
+        "F2026-0099",
+    ];
+    let out = book(&home, &rescan, &other_ref);
+    fails(&out, 1, "--allow-duplicate");
+    assert_eq!(bodies(&log, "ProcessPurchaseInvoices").len(), 1);
+    let mut allowed = other_ref.to_vec();
+    allowed.push("--allow-duplicate");
+    *process.lock().unwrap() = (
+        200,
+        response("ProcessPurchaseInvoices", &import(true, "F2026-0099")),
+    );
+    ok(&book(&home, &rescan, &allowed));
 }

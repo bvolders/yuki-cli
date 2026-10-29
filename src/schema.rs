@@ -369,7 +369,8 @@ pub fn generate() -> Value {
                     {"name": "--process", "type": "boolean", "required": false, "description": "Mark it processed instead of a proposal."},
                     {"name": "--dry-run", "type": "boolean", "required": false, "description": "Check (read-only) and print the preview and xmlDoc; send nothing."},
                     {"name": "--confirm", "type": "string", "required": false, "description": "The reference, repeated: required with --yes."},
-                    {"name": "--allow-archive-match", "type": "boolean", "required": false, "description": "Book despite an archive document that looks like this invoice."}
+                    {"name": "--allow-archive-match", "type": "boolean", "required": false, "description": "Book despite an archive document that looks like this invoice."},
+                    {"name": "--allow-duplicate", "type": "boolean", "required": false, "description": "Book despite a ledger invoice with three of the same supplier, reference, date and total; the same PDF or supplier reference is always refused."}
                 ],
                 "output_fields": [
                     {"name": "Succeeded", "type": "string"},

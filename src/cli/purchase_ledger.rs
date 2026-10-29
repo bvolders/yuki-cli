@@ -90,16 +90,18 @@ impl Entry {
     }
 
     /// Whether this is the same supplier: the same code when both have
-    /// one, else the same name (Unicode NFC, any case).
+    /// one, else the same [`contact_key`].
     fn same_supplier(&self, contact: &str, code: Option<&str>) -> bool {
         match (self.contact_code.as_deref(), code) {
             (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
-            _ => name_key(self.contact.trim()) == name_key(contact.trim()),
+            _ => contact_key(&self.contact) == contact_key(contact),
         }
     }
 
+    /// Whether this is the same reference, as [`reference_key`] compares.
     fn same_reference(&self, reference: &str) -> bool {
-        name_key(self.reference.trim()) == name_key(reference.trim())
+        let key = reference_key(reference);
+        !key.is_empty() && reference_key(&self.reference) == key
     }
 
     /// One line naming the invoice, for messages.
@@ -179,16 +181,40 @@ impl PurchaseLedger {
     }
 
     /// Refused when an entry still holds the claimed PDF, or the claimed
-    /// reference from the same supplier.
-    pub fn check_free(&self, claim: &Claim) -> Result<(), InvoiceError> {
+    /// reference from the same supplier; and, unless `allow_duplicate`, when
+    /// three of supplier, reference, invoice date and total match one, as
+    /// Yuki's own duplicate check does.
+    pub fn check_free(&self, claim: &Claim, allow_duplicate: bool) -> Result<(), InvoiceError> {
         let held = self.entries().filter(|e| e.holds());
         for entry in held {
+            let supplier = entry.same_supplier(&claim.contact, claim.contact_code.as_deref());
+            let reference = entry.same_reference(&claim.reference);
+            let date = entry.date == claim.date;
+            let total = entry.total == claim.total;
+            let alike = [supplier, reference, date, total]
+                .iter()
+                .filter(|m| **m)
+                .count();
             let why = if entry.hash == claim.hash {
-                "this PDF"
-            } else if entry.same_reference(&claim.reference)
-                && entry.same_supplier(&claim.contact, claim.contact_code.as_deref())
-            {
-                "this supplier's reference"
+                "this PDF".to_string()
+            } else if reference && supplier {
+                "this supplier's reference".to_string()
+            } else if alike >= 3 && !allow_duplicate {
+                let mut same = Vec::new();
+                for (matched, what) in [
+                    (supplier, "supplier"),
+                    (reference, "reference"),
+                    (date, "date"),
+                    (total, "total"),
+                ] {
+                    if matched {
+                        same.push(what);
+                    }
+                }
+                format!(
+                    "an invoice with the same {} (pass --allow-duplicate if it really is another invoice)",
+                    same.join(", ")
+                )
             } else {
                 continue;
             };
@@ -209,8 +235,8 @@ impl PurchaseLedger {
 
     /// Write-ahead: record the claim as pending, refused like
     /// [`check_free`](Self::check_free).
-    pub fn send(&mut self, claim: &Claim) -> Result<(), InvoiceError> {
-        self.check_free(claim)?;
+    pub fn send(&mut self, claim: &Claim, allow_duplicate: bool) -> Result<(), InvoiceError> {
+        self.check_free(claim, allow_duplicate)?;
         self.file.state_mut().entries.push(Entry {
             admin: self.admin.clone(),
             contact: claim.contact.clone(),
@@ -332,6 +358,41 @@ pub fn held_pdfs_at(path: &Path) -> Result<HashMap<String, Entry>, YukiError> {
         .collect())
 }
 
+/// Legal forms left out of a supplier name when names are compared.
+const LEGAL_FORMS: &[&str] = &[
+    "bv", "nv", "bvba", "srl", "sa", "vof", "commv", "ltd", "inc", "llc", "gmbh",
+];
+
+/// A supplier name as names are compared: Unicode NFC, lower case, dots
+/// dropped (`B.V.` is `bv`), other punctuation as spaces, whitespace
+/// collapsed, and legal forms left out: `Leverancier B.V.` is `leverancier`.
+pub fn contact_key(name: &str) -> String {
+    let lower = name_key(name).replace('.', "");
+    let spaced: String = lower
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    let words: Vec<&str> = spaced
+        .split_whitespace()
+        .filter(|w| !LEGAL_FORMS.contains(w))
+        .collect();
+    if words.is_empty() {
+        // A name that is only a legal form: keep it whole.
+        spaced.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        words.join(" ")
+    }
+}
+
+/// A reference as references are compared: lower case, letters and digits
+/// only, so `F 2026/0042` is `F2026-0042`.
+pub fn reference_key(reference: &str) -> String {
+    name_key(reference)
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
 /// The ledger file: `purchase-invoices.json` next to the config.
 pub fn ledger_path() -> PathBuf {
     Config::dir().join("purchase-invoices.json")
@@ -369,33 +430,43 @@ mod tests {
     fn the_same_pdf_or_reference_is_refused_until_rejected() {
         let dir = Dir::new();
         let mut ledger = dir.open("a1");
-        ledger.send(&claim("F-1", "h1")).unwrap();
+        ledger.send(&claim("F-1", "h1"), false).unwrap();
         // The same PDF under another reference, and the same reference
         // (any case) with another PDF, are both refused while pending.
-        let err = ledger.send(&claim("F-2", "h1")).unwrap_err().to_string();
+        let err = ledger
+            .send(&claim("F-2", "h1"), false)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("DUPLICATE: this PDF") && err.contains("pending"),
             "{err}"
         );
-        let err = ledger.send(&claim("f-1", "h2")).unwrap_err().to_string();
+        let err = ledger
+            .send(&claim("f-1", "h2"), false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("this supplier's reference"), "{err}");
-        // Another supplier may use the same reference.
+        // Another supplier may use the same reference (on another date).
         let other = Claim {
             contact: "Andere NV".into(),
+            date: "2026-10-21".into(),
             ..claim("F-1", "h3")
         };
-        ledger.send(&other).unwrap();
+        ledger.send(&other, false).unwrap();
 
         ledger
             .settle("h1", Status::Rejected, Some("not sent"))
             .unwrap();
-        ledger.send(&claim("F-1", "h1")).unwrap();
+        ledger.send(&claim("F-1", "h1"), false).unwrap();
         ledger.settle("h1", Status::Booked, None).unwrap();
-        let err = ledger.send(&claim("F-1", "h1")).unwrap_err().to_string();
+        let err = ledger
+            .send(&claim("F-1", "h1"), false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("was booked"), "{err}");
         drop(ledger);
         // Another administration has its own invoices.
-        dir.open("a2").send(&claim("F-1", "h1")).unwrap();
+        dir.open("a2").send(&claim("F-1", "h1"), false).unwrap();
     }
 
     #[test]
@@ -407,21 +478,32 @@ mod tests {
             contact_code: Some(code.into()),
             ..claim("F-1", hash)
         };
-        ledger.send(&coded("Leverancier BV", "SUP1", "h1")).unwrap();
-        assert!(ledger.send(&coded("Leverancier", "sup1", "h2")).is_err());
-        ledger.send(&coded("Leverancier BV", "SUP2", "h3")).unwrap();
+        ledger
+            .send(&coded("Leverancier BV", "SUP1", "h1"), false)
+            .unwrap();
+        assert!(
+            ledger
+                .send(&coded("Leverancier", "sup1", "h2"), false)
+                .is_err()
+        );
+        let other = Claim {
+            total: "99.00".into(),
+            ..coded("Leverancier BV", "SUP2", "h3")
+        };
+        ledger.send(&other, false).unwrap();
     }
 
     #[test]
     fn a_pending_invoice_is_resolved_by_reference() {
         let dir = Dir::new();
         let mut ledger = dir.open("a1");
-        ledger.send(&claim("F-1", "h1")).unwrap();
+        ledger.send(&claim("F-1", "h1"), false).unwrap();
         let other = Claim {
             contact: "Andere NV".into(),
+            total: "99.00".into(),
             ..claim("F-1", "h2")
         };
-        ledger.send(&other).unwrap();
+        ledger.send(&other, false).unwrap();
         let err = ledger
             .resolve("F-1", None, Resolution::Booked)
             .unwrap_err()
@@ -438,5 +520,59 @@ mod tests {
         assert_eq!(settled.status, Status::Booked);
         assert!(settled.booked_at.is_some());
         assert!(ledger.resolve("F-1", None, Resolution::Booked).is_err());
+    }
+
+    #[test]
+    fn names_and_references_compare_normalised() {
+        assert_eq!(contact_key("Leverancier B.V."), "leverancier");
+        assert_eq!(contact_key("  LEVERANCIER   bv "), "leverancier");
+        assert_eq!(contact_key("Acme, Inc."), "acme");
+        assert_eq!(contact_key("Foo Comm.V"), "foo");
+        assert_eq!(contact_key("Bar GmbH & Co"), "bar co");
+        assert_eq!(contact_key("BV"), "bv");
+        assert_eq!(reference_key("F 2026/0042"), "f20260042");
+        assert_eq!(reference_key("f2026-0042"), "f20260042");
+
+        let dir = Dir::new();
+        let mut ledger = dir.open("a1");
+        ledger.send(&claim("F2026-0042", "h1"), false).unwrap();
+        let respelled = Claim {
+            contact: "leverancier b.v.".into(),
+            total: "1.00".into(),
+            date: "2026-01-01".into(),
+            ..claim("F 2026/0042", "h2")
+        };
+        let err = ledger.send(&respelled, false).unwrap_err().to_string();
+        assert!(err.contains("this supplier's reference"), "{err}");
+    }
+
+    #[test]
+    fn three_of_supplier_reference_date_and_total_is_a_duplicate_unless_allowed() {
+        let dir = Dir::new();
+        let mut ledger = dir.open("a1");
+        ledger.send(&claim("F-1", "h1"), false).unwrap();
+        // Same supplier, date and total under another reference (a
+        // re-issued invoice), and same reference, date and total from a
+        // supplier spelled otherwise.
+        for other in [
+            claim("F-1-bis", "h2"),
+            Claim {
+                contact: "Leveranciers".into(),
+                ..claim("F-1", "h3")
+            },
+        ] {
+            let err = ledger.send(&other, false).unwrap_err().to_string();
+            assert!(err.contains("--allow-duplicate"), "{err}");
+            assert!(err.contains("date, total"), "{err}");
+        }
+        // Two of four is not a duplicate.
+        let two = Claim {
+            total: "99.00".into(),
+            ..claim("F-2", "h4")
+        };
+        ledger.send(&two, false).unwrap();
+        // Allowed explicitly; the same PDF never is.
+        ledger.send(&claim("F-1-bis", "h2"), true).unwrap();
+        assert!(ledger.send(&claim("F-9", "h1"), true).is_err());
     }
 }

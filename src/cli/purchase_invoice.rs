@@ -19,7 +19,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::cli::contacts::{yes_no, yes_no_unknown};
 use crate::cli::invoice_ledger::Resolution;
-use crate::cli::purchase_ledger::{Claim, PurchaseLedger, Status as LedgerStatus};
+use crate::cli::purchase_ledger::{
+    Claim, PurchaseLedger, Status as LedgerStatus, contact_key, reference_key,
+};
 use crate::cli::sales_invoice::{InvoiceError, Pdf};
 use crate::cli::xml_doc::{XmlWriter, bool_text};
 use crate::client::accounting_info::AccountingInfoClient;
@@ -160,6 +162,9 @@ pub struct BookArgs {
     pub confirm: Option<String>,
     /// Book even when the archive holds a document that looks like it.
     pub allow_archive_match: bool,
+    /// Book even when the ledger holds an invoice with three of the same
+    /// supplier, reference, date and total.
+    pub allow_duplicate: bool,
 }
 
 /// The supplier: matched by `code`, else by `name`, else created from the
@@ -619,17 +624,17 @@ fn check_sync(state: &SyncState, spot: &SyncSpot, hash: &str) -> Result<(), Invo
 /// the same reference from the same supplier.
 fn archive_matches(invoice: &PurchaseInvoice, docs: &[ArchiveDocument]) -> Vec<String> {
     let name = sync::name_key(&invoice.pdf.name);
-    let reference = sync::name_key(&invoice.reference);
-    let supplier = sync::name_key(&invoice.supplier.name);
+    let reference = reference_key(&invoice.reference);
+    let supplier = contact_key(&invoice.supplier.name);
     let mut seen = std::collections::BTreeSet::new();
     docs.iter()
         .filter(|d| seen.insert(d.id.clone()))
         .filter_map(|d| {
-            let contact = sync::name_key(&d.contact_name);
+            let contact = contact_key(&d.contact_name);
             let why = if sync::name_key(&d.file_name) == name {
                 "same file name"
             } else if !reference.is_empty()
-                && sync::name_key(d.reference.trim()) == reference
+                && reference_key(&d.reference) == reference
                 && !contact.is_empty()
                 && (contact.contains(&supplier) || supplier.contains(&contact))
             {
@@ -935,6 +940,7 @@ async fn submit(
     invoice: &PurchaseInvoice,
     spot: Option<&SyncSpot>,
     api_client: Option<&ApiClient>,
+    allow_duplicate: bool,
     format: Option<&str>,
     quiet: bool,
 ) -> Result<(), InvoiceError> {
@@ -967,7 +973,7 @@ async fn submit(
     let claim = invoice.claim();
     if let Err(e) = PurchaseLedger::open(target.admin_id)
         .map_err(InvoiceError::from)
-        .and_then(|mut l| l.send(&claim))
+        .and_then(|mut l| l.send(&claim, allow_duplicate))
     {
         if let (Some(ledger), Some(ahead)) = (&mut sync_ledger, sync_ahead) {
             let _ = ledger.undo(ahead);
@@ -1110,7 +1116,7 @@ pub async fn book(
         .map_err(InvoiceError::input)?;
 
     // Everything local that may already have put the PDF in Yuki.
-    PurchaseLedger::peek(target.admin_id)?.check_free(&invoice.claim())?;
+    PurchaseLedger::peek(target.admin_id)?.check_free(&invoice.claim(), args.allow_duplicate)?;
     let spot = sync_spot(&invoice.path)?;
     if let Some(spot) = &spot {
         check_sync(sync::peek(&spot.root)?.state(), spot, &invoice.hash)?;
@@ -1150,6 +1156,7 @@ pub async fn book(
         &invoice,
         spot.as_ref(),
         api_client.as_ref(),
+        args.allow_duplicate,
         format,
         quiet,
     )

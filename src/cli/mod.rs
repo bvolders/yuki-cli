@@ -762,6 +762,12 @@ pub struct BookFlags {
     /// file name, or the same reference from the same supplier.
     #[arg(long)]
     pub allow_archive_match: bool,
+
+    /// Book even though the ledger holds an invoice with three of the same
+    /// supplier, reference, invoice date and total (Yuki's duplicate rule).
+    /// The same PDF, or the same supplier's reference, is always refused.
+    #[arg(long)]
+    pub allow_duplicate: bool,
 }
 
 impl From<BookFlags> for purchase_invoice::BookArgs {
@@ -790,6 +796,7 @@ impl From<BookFlags> for purchase_invoice::BookArgs {
             dry_run: f.dry_run,
             confirm: f.confirm,
             allow_archive_match: f.allow_archive_match,
+            allow_duplicate: f.allow_duplicate,
         }
     }
 }

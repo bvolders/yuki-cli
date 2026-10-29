@@ -522,12 +522,17 @@ must be an active VAT code (`yuki vat codes`), and each GL account must exist
 A purchase invoice cannot be deleted through the API, so the command refuses
 (kind `invalid_input`, `DUPLICATE`) when the PDF may be in Yuki already: the
 same PDF, or the same reference from the same supplier, in the ledger
-(`~/.config/yuki/purchase-invoices.json`) and not rejected; the PDF recorded as
-in Yuki or pending in the `.yuki-sync.json` of `upload dir` at or above its
-directory (a failed or skipped file is fine); or an archive document with the
-same file name, or the same reference from the same supplier (Yuki's free-text
-search; `--allow-archive-match` books anyway). A booked PDF is recorded in that
-`.yuki-sync.json` as in Yuki, so `upload dir` skips it.
+(`~/.config/yuki/purchase-invoices.json`) and not rejected; three of the same
+supplier, reference, invoice date and total there, as Yuki's own duplicate
+check (`--allow-duplicate` books anyway); the PDF recorded as in Yuki or
+pending in the `.yuki-sync.json` of `upload dir` at or above its directory (a
+failed or skipped file is fine); or an archive document with the same file
+name, or the same reference from the same supplier (Yuki's free-text search;
+`--allow-archive-match` books anyway). References compare by letters and digits
+only (`F 2026/0042` is `F2026-0042`); supplier names in any case, ignoring
+punctuation and legal forms (`Leverancier B.V.` is `leverancier bv`). A booked
+PDF is recorded in that `.yuki-sync.json` as in Yuki, and `upload dir` never
+uploads a PDF the ledger holds, wherever it was booked from.
 
 The safety model is `sales invoice create`'s: a preview on stderr and a prompt,
 `--yes` needs `--confirm <reference>`, and `--dry-run` prints the `xmlDoc` (the
