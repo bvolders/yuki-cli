@@ -2,6 +2,7 @@ pub mod accounting;
 pub mod accounting_info;
 pub mod archive;
 pub mod contact;
+pub mod invoice_import;
 pub mod purchase;
 mod region;
 pub mod sales;

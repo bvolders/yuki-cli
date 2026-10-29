@@ -2,7 +2,7 @@
 
 use crate::error::YukiError;
 
-use super::sales::{SalesInvoicesImport, parse_invoices_import};
+use super::invoice_import::{InvoicesImport, parse_invoices_import};
 use super::soap_client::{SoapClient, SoapEnvelope, payload_timeout};
 use super::{Region, service_url};
 
@@ -11,7 +11,7 @@ const SERVICE: &str = "Purchase.asmx";
 /// The outcome of `ProcessPurchaseInvoices`: Yuki's
 /// `PurchaseInvoicesImportResponse`, the same shape as the sales import
 /// (`email_sent` is never set). It returns no ID for the invoice created.
-pub type PurchaseInvoicesImport = SalesInvoicesImport;
+pub type PurchaseInvoicesImport = InvoicesImport;
 
 /// Client for the Yuki Purchase SOAP service.
 pub struct PurchaseClient {
@@ -52,6 +52,14 @@ impl PurchaseClient {
     /// The endpoint this client posts to.
     pub fn base_url(&self) -> &str {
         self.soap.base_url()
+    }
+
+    /// Reuse a session opened by another service client instead of
+    /// authenticating again.
+    #[must_use]
+    pub fn with_session(mut self, session_id: &str) -> Self {
+        self.soap = self.soap.with_session(session_id);
+        self
     }
 
     fn require_session(&self) -> Result<&str, YukiError> {
