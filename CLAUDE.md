@@ -35,13 +35,18 @@ src/ledger.rs            Ledger<S: LedgerFormat>: local JSON record, OS lock, ve
 src/sync.rs              upload dir's .yuki-sync.json (a Ledger) + scan/excludes/hashing
 src/cli/sales_invoice.rs   sales invoice create/prepare: TOML → xmlDoc for ProcessSalesInvoices
 src/cli/invoice_ledger.rs  invoice-numbers.json (a Ledger), locked only per read-write
+src/cli/xml_doc.rs         XmlWriter shared by the sales and purchase xmlDoc
+src/cli/purchase_invoice.rs  purchase book: flags → xmlDoc for ProcessPurchaseInvoices; duplicate guards (ledger, .yuki-sync.json, archive)
+src/cli/purchase_ledger.rs   purchase-invoices.json (a Ledger), keyed by supplier + reference + PDF sha256
 ```
+
+`purchase book` authenticates the Purchase client with `AuthenticateClient` when `Config::api_client()` finds `client_id`/`client_secret` (env `YUKI_CLIENT_ID`/`YUKI_CLIENT_SECRET` > admin > top level); every other service keeps plain `Authenticate`. Its read-only checks (VAT pairs, GL scheme, archive search) share one Accounting session via `with_session`. It holds the governing `.yuki-sync.json` lock from write-ahead until settled, so `upload dir` cannot upload the PDF meanwhile.
 
 Local records go through `ledger::Ledger`: `open` (lock + load), `peek` (read only), `save`, and `write_ahead` → `commit`/`undo`. Record a call as pending before making it. A failed call is classified by `YukiError::delivery()`: `NotSent` (never left) and `Refused` (401/403/429) may be retried or freed; `Unknown` (timeout, fault, 5xx) stays pending until the user resolves it. Requests time out after 15s connect / 60s total; one carrying a file uses `call_with_timeout` with `payload_timeout` (60s + 30s/MB, max 10 min).
 
 ### SOAP Client Pattern
 
-Each service client (accounting, archive, vat, contact, sales) wraps `SoapClient` with a service URL `{api_root}/{Service}.asmx`. Regions are list-driven: `Region::ALL` plus the one `Region::info()` table (code, country, host) in `yuki-client`; nothing else may hardcode an nl/be pair. `yuki init` detects a key's region by authenticating on every `Region::ALL` root concurrently (`cli::init::detect`; "Invalid access key" = not this region, any other error is reported) and records it; `--region`/`--base-url` skip detection. CLI handlers pass `target.api_root` via `.with_api_root()`, resolved by `Config::endpoint()` (override flag/env > admin `base_url` > admin `region` > top-level `base_url` > top-level `region` > nl, the last only as a legacy fallback for configs written before init recorded the region), which also yields the region for country conventions; `api_root()`/`region()` are its shorthands. Tests point detection at a local mock with the hidden `YUKI_PROBE_ROOTS=code=root,...`. The flow is always: `authenticate()` → `set_current_domain()` → operation calls. The `setup_domain()` helper in `cli/mod.rs` handles the first two steps.
+Each service client (accounting, archive, vat, contact, sales, purchase) wraps `SoapClient` with a service URL `{api_root}/{Service}.asmx`. Regions are list-driven: `Region::ALL` plus the one `Region::info()` table (code, country, host) in `yuki-client`; nothing else may hardcode an nl/be pair. `yuki init` detects a key's region by authenticating on every `Region::ALL` root concurrently (`cli::init::detect`; "Invalid access key" = not this region, any other error is reported) and records it; `--region`/`--base-url` skip detection. CLI handlers pass `target.api_root` via `.with_api_root()`, resolved by `Config::endpoint()` (override flag/env > admin `base_url` > admin `region` > top-level `base_url` > top-level `region` > nl, the last only as a legacy fallback for configs written before init recorded the region), which also yields the region for country conventions; `api_root()`/`region()` are its shorthands. Tests point detection at a local mock with the hidden `YUKI_PROBE_ROOTS=code=root,...`. The flow is always: `authenticate()` → `set_current_domain()` → operation calls. The `setup_domain()` helper in `cli/mod.rs` handles the first two steps.
 
 `SoapEnvelope` is a builder: `.new("Op").session(sid).param("key", "val").build()` produces the XML envelope. All operations require `administrationID` as a parameter.
 
@@ -61,6 +66,7 @@ These are hard-won lessons from the actual API behavior:
 - VAT operations use exact casing: `VATReturnList`, `ActiveVATCodesList`
 - Real XML field names often differ from what you'd guess (lowercase, different names)
 - `paymentMethod` must be int (`0` = unspecified), not empty string
+- `ProcessPurchaseInvoices` takes `sessionId`/`administrationId` (lowercase d) and `disableAutoCorrect`; it returns no invoice ID, and a contact matched by `ContactCode` is overwritten with the address fields sent. An unknown `GLAccountCode` is silently booked to a default account; Belgian `LineVATType` numbers are ambiguous without `LineVATDescription`
 - `SearchDocuments`: `folderID=-1, tabID=-1` means "all folders"
 - Amount uses dot decimal separator (`695.74`), not comma
 
