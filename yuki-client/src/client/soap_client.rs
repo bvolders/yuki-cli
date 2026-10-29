@@ -254,6 +254,27 @@ impl SoapClient {
         Ok(session)
     }
 
+    /// Authenticate as a registered API client (`AuthenticateClient`): the
+    /// access key plus the client ID and secret Yuki issues to an
+    /// integration. Stores the returned session ID.
+    pub async fn authenticate_client(
+        &mut self,
+        client_id: &str,
+        client_secret: &str,
+        api_key: &str,
+    ) -> Result<String, YukiError> {
+        let envelope = SoapEnvelope::new("AuthenticateClient")
+            .param("clientID", client_id)
+            .param("clientSecret", client_secret)
+            .param("accessKey", api_key)
+            .build();
+
+        let body = self.call("AuthenticateClient", envelope).await?;
+        let session = Self::parse_single_result(&body, "AuthenticateClientResult")?;
+        self.session_id = Some(session.clone());
+        Ok(session)
+    }
+
     /// Extract the text content of a single named element from a SOAP response.
     ///
     /// Returns an error if a SOAP fault is found or the element is missing.

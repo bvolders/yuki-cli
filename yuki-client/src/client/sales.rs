@@ -169,22 +169,35 @@ impl SalesClient {
     /// child elements or as escaped XML text inside `ProcessSalesInvoicesResult`.
     /// Both are accepted.
     pub fn parse_process_sales_invoices(xml: &str) -> Result<SalesInvoicesImport, YukiError> {
-        if let Some(fault) = SoapClient::parse_soap_fault(xml) {
-            return Err(fault);
-        }
-        if let Some(import) = Self::parse_import(xml)? {
-            return Ok(import);
-        }
-        let text = SoapClient::parse_single_result(xml, "ProcessSalesInvoicesResult")?;
-        Self::parse_import(&text).ok().flatten().ok_or_else(|| {
-            YukiError::Xml(format!(
-                "ProcessSalesInvoices returned no SalesInvoicesImportResponse: {text}"
-            ))
-        })
+        parse_invoices_import(xml, "ProcessSalesInvoices", "SalesInvoicesImportResponse")
     }
+}
 
-    /// The `SalesInvoicesImportResponse` in `xml`, or `None` when it has none.
-    fn parse_import(xml: &str) -> Result<Option<SalesInvoicesImport>, YukiError> {
+/// Parse the response of `operation` (`ProcessSalesInvoices`,
+/// `ProcessPurchaseInvoices`), whose result is an import response `root`
+/// (`SalesInvoicesImportResponse`, `PurchaseInvoicesImportResponse`) sent as
+/// child elements or as escaped XML text; both are accepted.
+pub(crate) fn parse_invoices_import(
+    xml: &str,
+    operation: &str,
+    root: &str,
+) -> Result<SalesInvoicesImport, YukiError> {
+    if let Some(fault) = SoapClient::parse_soap_fault(xml) {
+        return Err(fault);
+    }
+    if let Some(import) = SalesClient::parse_import(xml, root)? {
+        return Ok(import);
+    }
+    let text = SoapClient::parse_single_result(xml, &format!("{operation}Result"))?;
+    SalesClient::parse_import(&text, root)
+        .ok()
+        .flatten()
+        .ok_or_else(|| YukiError::Xml(format!("{operation} returned no {root}: {text}")))
+}
+
+impl SalesClient {
+    /// The import response `root` in `xml`, or `None` when it has none.
+    fn parse_import(xml: &str, root: &str) -> Result<Option<SalesInvoicesImport>, YukiError> {
         let flag = |text: &str| text.eq_ignore_ascii_case("true") || text == "1";
         let count = |text: &str| text.parse::<u32>().unwrap_or(0);
         let mut reader = Reader::from_str(xml);
@@ -199,7 +212,7 @@ impl SalesClient {
                 Ok(Event::Start(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
-                        "SalesInvoicesImportResponse" => {
+                        name if name == root => {
                             import = Some(SalesInvoicesImport::default());
                         }
                         "Invoice" if import.is_some() => invoice = Some(ImportedInvoice::default()),
