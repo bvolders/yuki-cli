@@ -55,6 +55,100 @@ pub fn parse_period(period: &str) -> Result<(String, String), YukiError> {
     Err(invalid())
 }
 
+/// First day of the month `months` before the month of `date` (`YYYY-MM-DD`),
+/// e.g. `month_start_before("2026-02-15", 3)` is `"2025-11-01"`.
+///
+/// An unparseable year or month falls back to 1970 and January.
+pub fn month_start_before(date: &str, months: i32) -> String {
+    let year: i32 = date.get(0..4).and_then(|y| y.parse().ok()).unwrap_or(1970);
+    let month: i32 = date.get(5..7).and_then(|m| m.parse().ok()).unwrap_or(1);
+    let total = year * 12 + (month - 1) - months;
+    format!("{:04}-{:02}-01", total / 12, total % 12 + 1)
+}
+
+/// Today's date in the local time zone as `YYYY-MM-DD`.
+///
+/// Local, not UTC: in Belgium the UTC date lags the calendar by a day for the
+/// last one or two hours of every day, which would clamp a running period to
+/// yesterday.
+pub fn today() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    date_at(secs, local_utc_offset(secs))
+}
+
+/// The current year in the local time zone, from [`today`].
+pub fn current_year() -> u32 {
+    today()[..4].parse().unwrap_or(1970)
+}
+
+/// Calendar date (`YYYY-MM-DD`) of a Unix timestamp seen at a UTC offset in seconds.
+pub fn date_at(epoch_secs: i64, utc_offset_secs: i64) -> String {
+    date_from_epoch_days((epoch_secs + utc_offset_secs).div_euclid(86_400))
+}
+
+/// The local time zone's UTC offset at `epoch_secs`, from the C library
+/// (honours `TZ` and DST); 0 when it cannot tell.
+#[cfg(unix)]
+fn local_utc_offset(epoch_secs: i64) -> i64 {
+    let t = epoch_secs as libc::time_t;
+    // SAFETY: `localtime_r` only writes into the `tm` we own and hand it, and
+    // reads `t`; a zeroed `tm` is a valid value of the plain C struct.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
+}
+
+#[cfg(not(unix))]
+fn local_utc_offset(_epoch_secs: i64) -> i64 {
+    0
+}
+
+/// Calendar date (`YYYY-MM-DD`) of a day count since 1970-01-01.
+///
+/// Howard Hinnant's `civil_from_days`, valid for the proleptic Gregorian calendar.
+pub fn date_from_epoch_days(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Days since 1970-01-01 of an ISO date (`YYYY-MM-DD`, anything after the
+/// tenth character such as a time is ignored); `None` when it is not a date.
+///
+/// The inverse of [`date_from_epoch_days`] (Howard Hinnant's `days_from_civil`).
+pub fn epoch_days(date: &str) -> Option<i64> {
+    let date = date.get(0..10)?;
+    let (y, rest) = date.split_once('-')?;
+    let (m, d) = rest.split_once('-')?;
+    let (year, month, day): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    if !(1..=12).contains(&month)
+        || day < 1
+        || day > i64::from(days_in_month(year as u32, month as u32))
+    {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
 /// Return the number of days in the given month of the given year.
 fn days_in_month(year: u32, month: u32) -> u32 {
     match month {

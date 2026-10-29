@@ -1,5 +1,6 @@
-use std::process::{Command, Output};
+mod common;
 
+use common::{stdout_json, yuki};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -31,23 +32,6 @@ api_key = "holding-key"
     .expect("config file");
 }
 
-fn yuki(home: &TempDir, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_yuki"))
-        .args(args)
-        .env("HOME", home.path())
-        .output()
-        .expect("yuki command")
-}
-
-fn stdout_json(output: Output) -> Value {
-    assert!(
-        output.status.success(),
-        "command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("JSON stdout")
-}
-
 #[test]
 fn canonical_local_account_workflow_preserves_unrelated_credentials() {
     let home = TempDir::new().expect("temp home");
@@ -77,7 +61,7 @@ fn canonical_local_account_workflow_preserves_unrelated_credentials() {
     let doctor = stdout_json(yuki(&home, &["doctor", "--offline", "--output", "json"]));
     assert_eq!(doctor["ok"], true);
     assert_eq!(doctor["offline"], true);
-    assert_eq!(doctor["checks"].as_array().map(Vec::len), Some(4));
+    assert_eq!(doctor["checks"].as_array().map(Vec::len), Some(5));
 
     let shown = stdout_json(yuki(&home, &["config", "show", "--output", "json"]));
     assert_eq!(shown["active_profile"], "holding");

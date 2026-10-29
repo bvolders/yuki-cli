@@ -1,4 +1,4 @@
-use yuki_client::client::accounting::AccountingClient;
+use yuki_client::client::accounting::{AccountingClient, TransactionType};
 use yuki_client::client::accounting_info::AccountingInfoClient;
 use yuki_client::client::archive::ArchiveClient;
 use yuki_client::client::contact::parse_contacts;
@@ -90,6 +90,39 @@ fn parses_gl_transactions_with_contact() {
     assert_eq!(txs[0].contact_name, "Hetzner Online GmbH");
     assert_eq!(txs[0].amount, "-7.28");
     assert_eq!(txs[1].contact_name, "");
+    assert_eq!(txs[0].transaction_type, None, "absent means unknown");
+}
+
+/// Belgian (CODA) bank lines: no contact on an unprocessed line, and a GL code in
+/// `Contact` for a line booked straight to a ledger account. Data is made up.
+#[test]
+fn parses_gl_transactions_with_contact_from_a_belgian_bank_account() {
+    let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GLAccountTransactionsAndContactResponse xmlns="http://www.theyukicompany.com/">
+      <GLAccountTransactionsAndContactResult>
+        <GLAccountTransactions xmlns="">
+          <GLAccountTransaction ID="tx-be-1"><Date>2026-07-07</Date><Description>Binnenlandse overschrijvingen - SEPA credit transfers : Enkelvoudige overschrijving | Netto bedrag: 88,110 : Overschrijving | EXAMPLE PARTNERS BV</Description><Amount>-88.11</Amount><SalesItem /><Project></Project><GLAccountCode>550003</GLAccountCode><FileName></FileName><TransactionType>0</TransactionType></GLAccountTransaction>
+          <GLAccountTransaction ID="tx-be-2"><Date>2026-07-06</Date><Description>Kaarten : Betaling met debetkaart binnen eurozone | Netto bedrag: 4,560 : | Debet ATM/POS</Description><Amount>-4.56</Amount><SalesItem /><Contact>657100</Contact><ContactID>00000000-0000-0000-0000-000000000001</ContactID><Project></Project><GLAccountCode>550003</GLAccountCode><FileName>Example &amp; Co - 0001.pdf</FileName><TransactionType>10</TransactionType></GLAccountTransaction>
+        </GLAccountTransactions>
+      </GLAccountTransactionsAndContactResult>
+    </GLAccountTransactionsAndContactResponse>
+  </soap:Body>
+</soap:Envelope>"#;
+
+    let txs = AccountingClient::parse_gl_transactions_with_contact(xml).unwrap();
+    assert_eq!(txs.len(), 2);
+    assert!(txs[0].description.ends_with("| EXAMPLE PARTNERS BV"));
+    assert_eq!(txs[0].contact_name, "");
+    assert_eq!(txs[0].gl_account, "550003");
+    assert_eq!(txs[1].contact_name, "657100");
+    assert_eq!(txs[1].amount, "-4.56");
+    // The journal type separates bank lines from purchase documents.
+    assert_eq!(txs[0].transaction_type, Some(TransactionType::Bank));
+    assert_eq!(txs[1].transaction_type, Some(TransactionType::Bank));
+    assert_eq!(txs[0].file_name, "");
+    assert_eq!(txs[1].file_name, "Example & Co - 0001.pdf");
 }
 
 #[test]
@@ -166,6 +199,30 @@ fn parses_contacts() {
     assert_eq!(contacts[1].id, "contact-002");
     assert!(contacts[1].is_customer);
     assert!(!contacts[1].is_supplier);
+}
+
+/// The fields an invoice template needs; a real contact's `Code` is often empty.
+#[test]
+fn parses_contact_code_hid_city_and_vat_number() {
+    let xml = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>
+<SearchContactsResponse xmlns="http://www.theyukicompany.com/"><SearchContactsResult><Contacts xmlns="">
+  <Contact ID="c-1"><HID>42</HID><Code /><Name>Example &amp; Co BV</Name><Type>Customer</Type>
+    <City>Gent</City><Country>BE</Country><VATNumber>BE0123456789</VATNumber>
+    <IsSupplier>false</IsSupplier><IsCustomer>true</IsCustomer></Contact>
+  <Contact ID="c-2"><HID>43</HID><Code>C0043</Code><Name>Other</Name></Contact>
+</Contacts></SearchContactsResult></SearchContactsResponse></soap:Body></soap:Envelope>"#;
+    let contacts = parse_contacts(xml).unwrap();
+    assert_eq!(contacts.len(), 2);
+    let c = &contacts[0];
+    assert_eq!(
+        (c.hid.as_str(), c.code.as_str(), c.name.as_str()),
+        ("42", "", "Example & Co BV")
+    );
+    assert_eq!(
+        (c.city.as_str(), c.vat_number.as_str()),
+        ("Gent", "BE0123456789")
+    );
+    assert_eq!(contacts[1].code, "C0043");
 }
 
 #[test]
@@ -253,6 +310,66 @@ fn parses_transaction_details() {
     assert_eq!(details[0].amount, "7.28");
     assert_eq!(details[0].currency, "EUR");
     assert_eq!(details[0].gl_account_code, "45100");
+}
+
+#[test]
+fn transaction_details_envelope_matches_the_wsdl() {
+    // AccountingInfo.GetTransactionDetails takes an administration, a GL account
+    // and a date range; it has no transaction-id parameter.
+    let envelope = AccountingInfoClient::transaction_details_envelope(
+        "session-1",
+        "admin-1",
+        "400000",
+        "2025-01-01",
+        "2025-12-31",
+    );
+    assert!(envelope.contains("<yuki:sessionID>session-1</yuki:sessionID>"));
+    assert!(envelope.contains("<yuki:administrationID>admin-1</yuki:administrationID>"));
+    assert!(envelope.contains("<yuki:GLAccountCode>400000</yuki:GLAccountCode>"));
+    assert!(envelope.contains("<yuki:StartDate>2025-01-01</yuki:StartDate>"));
+    assert!(envelope.contains("<yuki:EndDate>2025-12-31</yuki:EndDate>"));
+    assert!(envelope.contains("<yuki:financialMode>0</yuki:financialMode>"));
+    assert!(!envelope.to_lowercase().contains("transactionid"));
+}
+
+#[test]
+fn parses_transaction_details_as_returned_by_the_api() {
+    // Shape per the AccountingInfo WSDL: TransactionInfo directly under the result.
+    let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetTransactionDetailsResponse xmlns="http://www.theyukicompany.com/">
+      <GetTransactionDetailsResult>
+        <TransactionInfo>
+          <id>tx-1</id>
+          <hID>101</hID>
+          <transactionDate>2025-03-15T00:00:00</transactionDate>
+          <description>Invoice 2025-001</description>
+          <transactionAmount>121.00</transactionAmount>
+          <currency>EUR</currency>
+          <fullName>Acme B.V.</fullName>
+          <glAccountCode>400000</glAccountCode>
+        </TransactionInfo>
+        <TransactionInfo>
+          <id>tx-2</id>
+          <transactionDate>2025-04-01T00:00:00</transactionDate>
+          <description>Invoice 2025-002</description>
+          <transactionAmount>-50.00</transactionAmount>
+          <currency>EUR</currency>
+          <glAccountCode>400000</glAccountCode>
+        </TransactionInfo>
+      </GetTransactionDetailsResult>
+    </GetTransactionDetailsResponse>
+  </soap:Body>
+</soap:Envelope>"#;
+
+    let details = AccountingInfoClient::parse_transaction_details(xml).unwrap();
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].id, "tx-1");
+    assert_eq!(details[0].contact_name, "Acme B.V.");
+    assert_eq!(details[1].id, "tx-2");
+    assert_eq!(details[1].contact_name, "");
+    assert_eq!(details[1].amount, "-50.00");
 }
 
 #[test]
@@ -374,6 +491,89 @@ fn parses_outstanding_creditor_items() {
     assert_eq!(items[0].contact_name, "Supplier X");
     assert_eq!(items[0].amount, "250.00");
     assert_eq!(items[0].open_amount, "250.00");
+    assert_eq!(items[0].country, "");
+}
+
+#[test]
+fn parses_the_supplier_country_of_outstanding_items() {
+    // Real shape: the address block follows the amounts, empty fields as <X />.
+    let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <OutstandingCreditorItemsResponse xmlns="http://www.theyukicompany.com/">
+      <OutstandingCreditorItemsResult>
+        <Item ID="item-1">
+          <Date>2026-09-07</Date>
+          <Contact>Hosting Inc</Contact>
+          <OpenAmount>16.40</OpenAmount>
+          <OriginalAmount>16.40</OriginalAmount>
+          <Type ID="2">Aankoopfactuur</Type>
+          <PaymentMethod>Creditcard</PaymentMethod>
+          <Postcode />
+          <Country>US</Country>
+        </Item>
+      </OutstandingCreditorItemsResult>
+    </OutstandingCreditorItemsResponse>
+  </soap:Body>
+</soap:Envelope>"#;
+    let items =
+        AccountingClient::parse_outstanding_items(xml, "OutstandingCreditorItemsResult").unwrap();
+    assert_eq!(items[0].country, "US");
+    assert_eq!(items[0].open_amount, "16.40");
+    assert_eq!(items[0].payment_method, "Creditcard");
+}
+
+#[test]
+fn parses_unsettled_payments_among_outstanding_creditor_items() {
+    // Real shape of OutstandingCreditorItemsByDateOutstanding with
+    // includeBankTransactions: a card payment's Type has an empty ID.
+    let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <OutstandingCreditorItemsByDateOutstandingResponse xmlns="http://www.theyukicompany.com/">
+      <OutstandingCreditorItemsByDateOutstandingResult>
+        <OutstandingCreditorItems xmlns="">
+          <Item ID="pay-1"><Date>2026-08-07</Date><Description>VERCEL INC. COVINA C</Description>
+            <Contact>Vercel Inc</Contact><ContactID>c-1</ContactID><OpenAmount>-17.65</OpenAmount>
+            <OriginalAmount>-17.65</OriginalAmount><Type ID="">Creditcardbetaling</Type>
+            <Reference /><DueDate /><DocumentID>stmt-1</DocumentID><PaymentMethod /></Item>
+          <Item ID="inv-1"><Date>2026-09-07</Date><Description>Factuur van Vercel Inc</Description>
+            <Contact>Vercel Inc</Contact><OpenAmount>17.22</OpenAmount>
+            <OriginalAmount>17.22</OriginalAmount><Type ID="2">Aankoopfactuur</Type>
+            <Reference>2E81616A-0008</Reference><DocumentID>doc-1</DocumentID>
+            <PaymentMethod>Bancontact</PaymentMethod></Item>
+        </OutstandingCreditorItems>
+      </OutstandingCreditorItemsByDateOutstandingResult>
+    </OutstandingCreditorItemsByDateOutstandingResponse>
+  </soap:Body>
+</soap:Envelope>"#;
+    let items = AccountingClient::parse_outstanding_items(
+        xml,
+        "OutstandingCreditorItemsByDateOutstandingResult",
+    )
+    .unwrap();
+    assert_eq!(items.len(), 2);
+    let (pay, inv) = (&items[0], &items[1]);
+    assert_eq!(pay.id, "pay-1");
+    assert!(pay.is_payment());
+    assert_eq!(pay.type_name, "Creditcardbetaling");
+    assert_eq!(pay.open_amount, "-17.65");
+    assert_eq!(pay.reference, "");
+    assert_eq!(pay.document_id, "stmt-1");
+    assert!(!inv.is_payment());
+    assert_eq!(inv.type_id, "2");
+    assert_eq!(inv.reference, "2E81616A-0008");
+    assert_eq!(inv.document_id, "doc-1");
+    assert_eq!(inv.payment_method, "Bancontact");
+}
+
+#[test]
+fn outstanding_with_payments_envelope_includes_bank_transactions() {
+    let xml = AccountingClient::outstanding_with_payments_envelope("sid", "admin-1", "2026-10-02");
+    assert!(xml.contains("<yuki:includeBankTransactions>true</yuki:includeBankTransactions>"));
+    assert!(xml.contains("<yuki:sortOrder>ContactAsc</yuki:sortOrder>"));
+    assert!(xml.contains("<yuki:dateOutstanding>2026-10-02</yuki:dateOutstanding>"));
+    assert!(xml.contains("<yuki:administrationID>admin-1</yuki:administrationID>"));
 }
 
 #[test]
@@ -453,4 +653,22 @@ fn parses_start_balances_with_account_id_fields() {
     assert_eq!(balances[0].description, "Inventaris en inrichting");
     assert_eq!(balances[1].gl_account_code, "20200");
     assert_eq!(balances[1].description, "RC Ruben Jongejan");
+}
+
+#[test]
+fn transaction_type_codes_map_to_journals() {
+    assert_eq!(
+        TransactionType::from_code(" 9 "),
+        Some(TransactionType::Purchase)
+    );
+    assert_eq!(TransactionType::from_code("0"), Some(TransactionType::Bank));
+    assert_eq!(
+        TransactionType::from_code("10"),
+        Some(TransactionType::Bank)
+    );
+    assert_eq!(
+        TransactionType::from_code("42"),
+        Some(TransactionType::Unknown("42".into()))
+    );
+    assert_eq!(TransactionType::from_code(""), None);
 }

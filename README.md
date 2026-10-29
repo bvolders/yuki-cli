@@ -4,7 +4,7 @@
 
 CLI client for the [Yuki](https://www.yukiworks.nl) bookkeeping SOAP API.
 
-[Yuki](https://www.yukiworks.nl) is a Dutch bookkeeping SaaS used for accounting, VAT returns, and document archiving. This CLI lets you query your administration, find missing invoices, and upload documents — from the terminal or as part of automated workflows.
+[Yuki](https://www.yukiworks.nl) is a Dutch bookkeeping SaaS used for accounting, VAT returns, and document archiving. This CLI lets you query your administration, find missing invoices, upload documents, and create sales invoices — from the terminal or as part of automated workflows.
 
 > **Note:** This project is not affiliated with or endorsed by Yuki Software.
 
@@ -28,7 +28,7 @@ PyPI and Cargo installations provide both `yuki` and `yuki-cli` as executable na
 ## Setup
 
 1. Get a Yuki API key from your Yuki portal under **Settings > API keys**.
-2. Run `yuki init` and paste your key when prompted. The CLI discovers your administrations and writes the config to `~/.config/yuki/config.toml`.
+2. Run `yuki init` and paste your key when prompted. The CLI detects the key's region (Netherlands or Belgium), discovers your administrations and writes the config to `~/.config/yuki/config.toml`.
 
 ```sh
 yuki init
@@ -48,6 +48,55 @@ To rotate your API key later:
 ```sh
 yuki init --api-key <new-key>
 ```
+
+### Regions
+
+Yuki runs a separate API host per country — `api.yukiworks.nl` and
+`api.yukiworks.be` — and an access key only works on its own country's host.
+`yuki init` finds out which by trying the key on every known host at once, and
+records the answer in the config, so later commands need nothing extra:
+
+```text
+Detecting region... ✔
+Detected Yuki Belgium (api.yukiworks.be)
+```
+
+A host answering "Invalid access key" is simply not the key's region. Any other
+failure (unreachable, blocked, rate limited) is reported rather than skipped, and
+`init` stops. If no known host accepts the key, or more than one does, `init` asks
+`Yuki region [nl/be/other]:` with no default when run at a terminal; `other` takes a
+full API root for a deployment outside the known ones, verifies the key there, and
+stores it as `base_url`. Without a terminal it stops instead: an unknown key is the
+usual authentication error (exit 2), an ambiguous one a configuration error asking
+for `--region`.
+
+Passing `--region nl|be` or `--base-url <root>` (or exporting `YUKI_REGION` /
+`YUKI_BASE_URL`) skips detection. A fresh `init` — nothing exists yet to protect
+from the environment — persists whichever endpoint was actually used, whether it
+came from the flag or from `YUKI_REGION`/`YUKI_BASE_URL`, exactly like a typed
+`--region`/`--base-url`; a URL matching no known region is stored as `base_url`,
+one that does is stored as `region` instead. Re-running `init` on an *existing*
+config, rotating the key, or `--add` is different: only the flag is persisted
+there, since an exported `YUKI_REGION`/`YUKI_BASE_URL` is a per-shell choice and
+must not silently rewrite a configuration that already exists. `yuki init --add` detects per
+key and records the region (or `base_url`) on the administrations that key reaches,
+so Dutch and Belgian books can live in one config. Re-running `yuki init` keeps the
+per-administration settings (region, and any other keys in its table) of every
+administration the key still reaches.
+
+The endpoint is resolved in this order, highest first:
+
+1. `--base-url` / `YUKI_BASE_URL`, then `--region` / `YUKI_REGION` — for this run,
+   for every administration and every key (so `admin list` in a mixed config reports
+   the other deployment's keys as failing);
+2. the administration's own `base_url`, then its own `region`;
+3. `base_url` in the config file (replaces the default endpoint only);
+4. the top-level `region`;
+5. `nl` — a legacy fallback, only for a config written before `init` recorded the
+   region.
+
+Country conventions (chart of accounts, bank formats) follow the same order; a base
+URL that is not a known Yuki root (a proxy, a mock) is skipped for that purpose.
 
 ### Reaching more than one administration
 
@@ -109,17 +158,21 @@ yuki upload file invoice.pdf --folder inkoop --amount 7.28 --remarks "Hetzner ho
 
 ```sh
 yuki vat returns                          # List all VAT return periods
-yuki vat returns --year 2025              # Filter by year
+yuki vat returns 2025                     # Filter by year
 yuki vat codes                            # List active VAT codes
 
-yuki invoices list --invoice-type purchase # Outstanding purchase invoices
-yuki invoices show <transaction-id>       # Transaction details
-yuki invoices document <transaction-id>   # Document linked to a transaction
+yuki invoices list                        # Outstanding sales invoices (debtor items)
+yuki invoices list --invoice-type purchase # Outstanding purchase invoices (creditor items)
+yuki invoices list --period 2025-Q1       # Only items dated in the period
+yuki invoices show <transaction-id> --account 400000 --period 2025-Q1  # One transaction
+yuki invoices document <transaction-id>   # Save the document linked to a transaction
+yuki sales items                          # Sales item catalogue (products/services)
 
-yuki contacts search "Hetzner"            # Search contacts
+yuki contacts search "Hetzner"            # Search contacts on every field
+yuki contacts search BE0123456789 --by VATNumber  # One field: Name, City, Code, HID, ...
 yuki contacts list                        # List all suppliers and customers
 
-yuki accounts balance --account 11001 --period 2025-Q1
+yuki accounts balance --account 11001 --period 2025-Q1  # Balance on 2025-03-31 (or today, if earlier)
 yuki accounts transactions --account 11001 --period 2025-Q1
 yuki accounts scheme                      # Chart of accounts (GL scheme)
 yuki accounts revenue --period 2025-Q1    # Net revenue for a period
@@ -131,10 +184,21 @@ yuki projects balance <code> --period 2025  # Project balance
 yuki documents list --folder inkoop       # List documents in a folder
 yuki documents search "factuur"           # Full-text search
 yuki documents exists --amount 7.28 --date 2025-03  # Check if invoice exists
+yuki documents download <id> [--out <path>]  # Save the file, under its own name by default
 
 yuki admin list                           # List administrations
 yuki admin switch <name>                  # Change default administration
 ```
+
+`invoices show` needs the GL account the transaction is booked on: Yuki has no
+lookup by transaction ID, so the CLI fetches that account's lines for `--period`
+(default: the current year) in one API call and keeps the matching one. A
+narrower period means a smaller response.
+
+`accounts balance` reports the balance at the **end** of `--period` (today, in
+the local time zone, while the period is still running) and says which date in
+an `As Of` column. Releases up to 0.1.13 reported the balance at the period's start,
+without that column.
 
 ### Authentication and configuration
 
@@ -162,6 +226,8 @@ a shared key used by other profiles.
 ```sh
 yuki check btw 2025-Q4                    # VAT period check: outstanding items
 yuki check unmatched --period 2026-Q1     # Bank debits without matching invoices
+yuki check matches                        # Payments that may settle open purchase invoices
+yuki check missing --period 2026-Q3       # Payments Yuki has no invoice for, per supplier
 yuki check outstanding <reference>        # Check if a reference is still outstanding
 ```
 
@@ -178,14 +244,263 @@ yuki upload categories                                  # List cost category IDs
 yuki upload payment-methods                             # List payment method IDs
 ```
 
+#### A folder of receipts, uploaded once
+
+`upload dir` uploads the pdf, jpg, jpeg and png files under a directory that
+are not in Yuki yet. It records every file in `<dir>/.yuki-sync.json`, keyed by
+the file's sha256, so a renamed or moved file is not uploaded again. Run it on
+the root of the tree: a state file above or below the directory is refused. An
+OS lock on `.yuki-sync.json.lock` keeps two runs apart, and is released when a
+run ends or is killed.
+
+```sh
+yuki upload dir ~/Receipts --dry-run                    # The plan: no API calls, nothing written
+yuki upload dir ~/Receipts --seed-from-yuki             # Record files Yuki already has (by file name)
+yuki upload mark <file> --doc-id <id>                   # Record one file by hand
+yuki upload mark <file> --skip                          # Never upload this file
+yuki upload mark <file> --forget                        # Drop its record: upload it (again)
+yuki upload dir ~/Receipts                              # Show the plan, ask, then upload
+yuki upload dir ~/Receipts --yes --max 10 \
+  --exclude 2025                                         # Unattended, at most 10, skip any 2025/ directory
+```
+
+Dotfiles, dot-directories and `_to_delete` are always skipped, and symbolic
+links are never followed. Excludes are case-insensitive globs: one without `/`
+matches any path component (so `2025` skips that directory and everything in
+it), one with `/` the whole relative path.
+
+It prints the plan and asks before uploading; without a terminal it needs
+`--yes`. Before each upload the file is recorded as **pending**; when Yuki
+returns a document ID it becomes **uploaded**. Every other outcome, whether a
+timeout, a SOAP fault, a server error, a crash or a kill, leaves it pending,
+because the file may already be in Yuki. Pending files are never retried
+automatically and the exit code stays 1 until each is resolved: check Yuki,
+then `upload mark <file> --doc-id <id>`, or `--forget` to upload it again, or
+seed. Only a request that never reached Yuki (a refused connection) is
+recorded as **failed** and retried. A recorded path whose content changed is
+shown as **changed** and not uploaded until you `--forget` or `--skip` it. An
+authentication error, or the first 3 uploads of a run failing the same way,
+stops the run. `--max` (default 25) caps the uploads of one run.
+
+Seeding reads the upload folder and `inkoop` (or `--seed-folder`) and matches
+by file name only, because Yuki reports no size or hash: a different file
+uploaded under the same name is recorded as in Yuki, and a copy uploaded under
+another name is not found. A Yuki document is claimed at most once; names
+matching several documents, documents already recorded, and documents two local
+files claim are `ambiguous` and not recorded. Near matches (`possible-match`)
+are listed, never recorded. Seeding shows the matches and asks before writing,
+and records nothing if the listing pages look wrong. A state file that does not
+parse is refused rather than overwritten.
+
+### Sales invoices
+
+```sh
+yuki sales invoice create --file invoice.toml           # Ad-hoc invoice, created as a draft
+yuki sales invoice create --template acme-hosting       # From ~/.config/yuki/invoices/acme-hosting.toml
+yuki sales invoice create --template acme-consulting \
+  --qty 7.5 --subject "Consultancy October 2026"        # Monthly run: this month's hours
+yuki sales invoice create --file invoice.toml --dry-run # Preview and xmlDoc only; no API call
+yuki sales invoice prepare --template acme-hosting --number auto \
+  --date 2026-10-31 --out 2026-10-acme.json             # Reserve the number for this content
+yuki sales invoice create --prepared 2026-10-acme.json \
+  --pdf 2026-10-acme.pdf --send email                   # Book exactly that, with your PDF
+yuki sales invoice create --prepared 2026-10-acme.json \
+  --pdf 2026-10-acme.pdf --send email --yes --confirm 2026-20  # The same, unattended
+yuki sales invoice numbers                              # Invoice numbers given out (local ledger)
+yuki sales invoice numbers --resolve 2026-20 --as rejected  # Free a reservation, or a number Yuki did not create
+yuki sales invoice numbers --resolve 2026-20 --as booked    # Settle a pending number Yuki booked
+yuki sales invoice templates                            # List saved templates, each validated
+```
+
+`create --file` or `--template` makes a **draft** by default: it lands in
+Yuki's "To be sent" list, unbooked and without an invoice number, so you can
+still check or edit it in Yuki. `--send email|peppol|both` books it instead and
+sends it; `--book` books it without sending, for invoices you send yourself.
+Booking is immediate and fixes the number: there is no draft to review, and
+the preview says so. A booking needs a due date (`due_days` or `due_date`), and
+`--send email` an email address for a contact without a code. Yuki's answer
+says nothing about Peppol delivery: with `--send peppol` or `both`, the preview
+and the result's `Peppol` column say `requested (Yuki does not report
+delivery)`, never delivered.
+
+Before any write, the command prints a preview to stderr (customer, lines, net,
+VAT, gross total, and whether it creates a draft or books and sends) and asks
+for confirmation, which declines unless you answer `y`; the question names the
+invoice number. `--yes` skips the prompt and is required when stdin or stderr
+is not a terminal. A booking without the prompt also needs `--confirm
+<number>`, the invoice number repeated, so an unattended run books only the
+number it meant to; a booking Yuki numbers itself can only be confirmed at the
+prompt. `--dry-run` prints the preview, then the exact `xmlDoc` on stdout, and
+makes no API call. The command exits 1 with kind `invalid_input` for a bad
+file (every problem listed), `confirmation_required` when nothing was sent for
+want of a confirmation, `invoice_rejected` when Yuki fails or skips the invoice
+or does not book it (after printing Yuki's answer), `send_incomplete` when it
+booked the invoice but did not email it (send it from Yuki or yourself), and
+`outcome_unknown` or `reference_mismatch` as below. Totals must be positive:
+credit notes are not supported.
+
+#### Your own PDF with your own number
+
+Only a prepared invoice carries a CLI-given number, so the number, the PDF and
+the booking are tied to one file:
+
+1. `yuki sales invoice prepare --template acme-hosting --number auto --date
+   2026-10-31 --out 2026-10-acme.json` writes the fully resolved invoice to the
+   file (never over an existing one), prints it, and **reserves** its number in
+   the ledger for exactly that content. The JSON has the number, the dates in
+   ISO and Dutch (`31 oktober 2026`), the issuing firm (`firm`, from
+   `[seller]`), the customer with address and VAT number, the lines with their
+   remarks and unit, the totals per VAT rate, the `vat_mention`, and the
+   Belgian structured payment reference. The totals are the CLI's computation
+   (VAT per rate); Yuki books its own, and `totals.vat_rounded_per_line`
+   appears when rounding per line would differ.
+2. Render the PDF from that file.
+3. `yuki sales invoice create --prepared 2026-10-acme.json --pdf 2026-10-acme.pdf
+   --send email` books exactly the prepared content: it takes no `--file`,
+   `--template`, `--qty`, `--price`, `--date` or `--subject`, and is refused
+   unless the number is still reserved, in the selected administration, for a
+   file with the same content (reformatting it is fine; any edit is not). Yuki
+   stores the PDF as `Invoice <number>.pdf`, whatever the local file is called,
+   so the archive keeps showing the number; `--pdf` needs `--prepared`. The
+   lines are still sent: Yuki books the amounts, and builds a Peppol invoice,
+   from them. The PDF must start with `%PDF-` and be at most 3 MB.
+
+`--number <REF>` gives that number; `--number auto` reads the sales (`verkoop`)
+archive for the invoice year, where Yuki names each invoice PDF after its
+number (`Invoice 2026-19.pdf`; only `.pdf` files named `Invoice <year>-<seq>`
+or `Factuur <year>-<seq>` count), and takes the lowest number above the
+archive's highest that the ledger does not hold, padded like the existing
+numbers (`2026-20`, then `2026-21` for the next invoice, even before the first
+is booked). A number the archive or the ledger already has is refused. Yuki's
+own counter does not learn about numbers given this way, so once you start,
+number every invoice here.
+
+The ledger, `~/.config/yuki/invoice-numbers.json`, keeps each administration's
+numbers (`2026-01` is the same number as `2026-1`) from `prepare` until the
+archive shows the invoice. A number is `reserved` by `prepare --out`, `pending`
+from just before Yuki is called, then `booked`, or `rejected` (free again) when
+Yuki did not create it. If nothing reached Yuki (no connection, or refused
+unprocessed with HTTP 401, 403 or 429), it is `reserved` again for the same
+file: run the same `create --prepared` again. If the request went out but no
+usable answer came back (a timeout, a dropped connection, a SOAP fault or a
+server error), the command exits 1 with kind `outcome_unknown` and the number
+stays `pending`: check "To be sent" or Sales in Yuki, then settle it with
+`yuki sales invoice numbers --resolve <number> --as booked` (or `--as
+rejected`). If Yuki booked it under another `Reference` (`2026-020` counts as
+`2026-20`), or none, the command exits 1 with kind `reference_mismatch` and a
+`REFERENCE MISMATCH` message, even with `--quiet`, saying whether the email
+was requested and sent and whether Peppol was requested; the number stays
+pending with a note naming both. Correct the booking in Sales in Yuki, then
+settle ours as `booked` if the customer may have the invoice under it, else as
+`rejected`. A reservation that will not be sent is freed with `--resolve
+<number> --as rejected` (it can never be `--as booked`); the next `auto` gives
+the number out again. `prepare`, `create` and `numbers` warn about a
+reservation older than 7 days: with continuous numbering, a number never booked
+is a gap. Even with `--quiet --yes`, a booking prints one line to stderr:
+`BOOKS IMMEDIATELY: <number> <customer> <gross>`. The request may take 60
+seconds plus 30 per megabyte of PDF.
+
+The structured reference (`+++DDD/DDDD/DDDCC+++`) has ten base digits: the
+year, then the sequence padded to six digits, for a `<year>-<seq>` number
+(`2026-20` → `2026000020`), or else every digit of the number, left-padded with
+zeros. `CC` is the base modulo 97, or 97 when that is 0: `2026-20` gives
+`+++202/6000/02014+++`.
+
+Recurring invoices are templates you run yourself: one file per customer in
+`~/.config/yuki/invoices/<name>.toml`, prepared each month with `prepare
+--template <name> --number auto --out <file>` (or created as a draft with
+`create --template`). `--qty` and `--price` replace the quantity and
+price of a single-line invoice, `--date` the invoice date (default: the file's,
+else today) and `--subject` its subject. An invoice file has the same format:
+
+```toml
+# ~/.config/yuki/invoices/acme-hosting.toml
+subject = "Managed hosting"
+due_days = 30                     # or: due_date = 2026-11-01; required to book
+# vat_mention = "Btw verlegd"     # printed on a rendered invoice; the preview warns at 0% without one
+# date = 2026-10-01               # default: today
+# payment_method = "ElectronicTransfer"
+# layout = "Standard"             # a layout name from Yuki; default layout if unknown
+# currency = "EUR"                # without it, none is sent (prepared files too): Yuki's default
+# notes = "Thank you for your business."   # printed on the invoice, max 500 characters
+# remarks = "internal"            # stored, not printed
+
+[contact]
+# Yuki matches an existing contact by name and address, or creates it.
+name = "Acme BV"
+country = "BE"                    # required without a code (ISO 3166-1 alpha-2)
+address = "Kerkstraat 1"
+zipcode = "9000"
+city = "Gent"
+vat_number = "BE0123456789"
+email = "billing@acme.example"    # needed for --send email
+type = "company"                  # or "person" (Yuki's default)
+# address_2 = "bus 2"
+# code = "C0042"                  # a contact code, if yours has one
+
+[[lines]]
+description = "Managed hosting"
+qty = 1                           # default 1, up to 4 decimals
+price = 100.00                    # unit price excluding VAT, up to 2 decimals
+vat_percentage = 21               # with vat_type, selects the VAT code
+vat_type = 1                      # your administration's VAT type number
+gl_account = "700000"             # optional revenue account
+# vat_description = "BTW 21%"     # optional, to pick between VAT codes
+# product_code = "HOST"           # optional item number of a Yuki sales item
+# remarks = "waarvan overdracht auteursrecht van 25% of €{pct_of_net:25}"  # shown under the line
+# unit = "u"                      # unit of qty, for prepare's JSON (a rendered PDF) only
+```
+
+The `subject`, `notes`, `remarks` and `vat_mention`, and each line's
+`description` and `remarks`, may hold placeholders, filled in for the invoice
+date when the invoice is read (so `prepare` already shows the final text):
+`{month}` (the Dutch month name, `oktober`), `{year}` (`2026`), `{month_num}`
+(`10`) and, in a line only, `{pct_of_net:25}`: 25% of that line's net, rounded
+to the cent, in Belgian notation (`4.312,50`). `{{` and `}}` are literal
+braces; any other text between braces, or a brace on its own, is an error.
+
+A rendered invoice also prints the firm that issues it. `prepare` gives it as
+`firm`, from a `[seller]` table in `~/.config/yuki/config.toml` (`bic`,
+`legal_form` and `rpr` are optional and come out as `null` when unset);
+`prepare --out` needs it, while `create --prepared` reads the firm from the
+file:
+
+```toml
+[seller]
+name = "Your Firm"
+address = "Street 1"
+zipcode = "1000"
+city = "Brussel"
+country = "BE"
+phone = "0400000000"
+enterprise_number = "0123.456.789"
+vat_number = "BE0123.456.789"
+iban = "BE00000000000000"
+# bic = "GEBABEBB"
+# legal_form = "BV"
+# rpr = "RPR Brussel"
+```
+
+Real Yuki contacts often have an empty `Code`, so match on name, address and VAT
+number. `yuki contacts search <name>` shows each contact's HID, city and VAT
+number to copy into a template.
+
+The example uses Belgian 21% VAT; nothing in the CLI assumes a country. The VAT
+percentage and type must match a VAT code of your administration, or Yuki
+rejects the invoice: check Settings > VAT rates in Yuki or `yuki vat codes`. The
+preview's VAT is computed per rate on the summed net and rounded once; the
+booked figure is Yuki's own.
+
 ### Global flags
 
 | Flag | Description |
 |------|-------------|
 | `--profile <name>` / `--admin <name>` | Override default administration profile |
-| `--output text\|json` | Output format (auto-detects TTY) |
+| `--output auto\|text\|json` | Output format (default auto: table on a TTY, JSON when piped) |
 | `--quiet` | Suppress informational output |
 | `--yes` | Confirm destructive operations |
+| `--region nl\|be` | Yuki deployment; `init` detects it from the key when omitted (env `YUKI_REGION`; stored by `init` on a fresh config, flag-only on an existing one) |
+| `--base-url <root>` | Full API root, overrides `--region` (env `YUKI_BASE_URL`; same storage rule as `--region`) |
 
 ## Periods
 
@@ -229,8 +544,141 @@ name = "Example Holding B.V."
 api_key = "second-api-key"
 ```
 
+### `check unmatched` per administration
+
+`check unmatched` scans the bank GL account(s) given with `--bank-account`
+(repeat it or comma-separate), else the administration's `bank_accounts`, else
+the region default: `11001` (nl) or `550000` (be). For Belgian administrations it
+also reads the supplier ledger (`440000`, three months back) to name the
+counterparty and check whether a purchase invoice of that supplier covers the
+payment, treats a same-day counter-entry on `580000` or another scanned bank
+account as an own transfer, and skips loans, credit fees, card settlements,
+salaries and tax payments by description. On the supplier ledger, purchase
+credit notes reduce that supplier's open invoices and refunds received never
+count as invoices; payments are matched oldest first, including those before the
+period, so an invoice already paid cannot cover a later payment. A bank line
+booked straight to a GL account is skipped only when that account never has a
+document (`no_document_accounts`, default `65`: interest, bank costs `657xxx`,
+exchange differences); one booked straight to any other account, such as a
+`6xxxxx` expense, is reported. The archive is searched in the administration's
+own domain (the session that ran `SetCurrentDomain`), whereas `documents` and
+`upload` use the API key's default domain. All of it can be tuned per
+administration:
+
+```toml
+[administrations.example_bv]
+domain_id = "domain-uuid"
+admin_id = "admin-uuid"
+region = "be"
+bank_accounts = ["550002", "550003"]
+creditor_accounts = ["440000"]       # [] turns the supplier ledger off
+transfer_accounts = ["580000"]
+# Replaces the Belgian defaults; matched against the full bank description.
+unmatched_ignore_descriptions = ["Lening op korte termijn", "Betaling lonen"]
+# GL prefixes a bank line may be booked to without a document; [] reports all.
+no_document_accounts = ["657", "650"]
+```
+
+Dutch administrations keep the original behaviour unless these are set.
+
+### `check matches`: which open invoices are already paid
+
+`check matches` pairs open purchase invoices (the outstanding creditor items,
+as `invoices list --invoice-type purchase` shows them) with payments already
+made. It only suggests: Yuki's API cannot link a payment to an invoice, so each
+pair is confirmed in the Yuki UI. It reads the same accounts as `check
+unmatched` (bank, supplier ledger, transfers) from the oldest open invoice's
+date minus 90 days up to today; `--period` only narrows which invoices are
+considered. A payment is a candidate when no closed invoice explains it: a bank
+debit booked to the supplier but not linked to its invoice, a supplier-ledger
+payment from an account that is not scanned (e.g. a credit card), or a bank debit
+not booked to a supplier at all (a card payment or direct debit). Own
+transfers, ignored descriptions and no-document bookings are skipped as in
+`check unmatched`.
+
+| Confidence | When |
+|---|---|
+| `high` | same amount and supplier, at most 30 days apart; or one payment to a supplier adding up several of its invoices (within 7 days) |
+| `medium` | same amount and supplier, 31 to 90 days apart; several supplier payments adding up to one invoice; or one payment adding up invoices of several suppliers, at least one of them the payment's (its own within 7 days, the others dated that day, as with a marketplace order invoiced per seller); a payment naming another supplier never adds them up |
+| `low` | same amount, the payment names no supplier, at most 30 days apart; or such a payment adding up invoices dated that day |
+| `card` | no candidate, and either the invoice's payment method is a card (`Creditcard`), or the supplier ledger shows the supplier paid in the window from an account that is not scanned (in practice the credit card, whose purchases have no bank line of their own) |
+| `none` | no candidate, but the supplier was paid from a scanned bank account in the window, so its payment would show: probably unpaid |
+| `unseen` | no candidate, and no payment to the supplier at all in the window: a new supplier, or one paid by a card payment or direct debit whose bank line names nobody. Not evidence of either card or unpaid |
+| `credit` | an open credit note no payment settled together with the supplier's invoices: nothing to pay |
+
+Amounts must match to the cent; sums add up to four items. A payment to a
+supplier can settle its invoices net of its open credit notes (dated within
+90 days of the payment), as `medium`: 480.00 invoiced, 195.50 credited, 284.50
+paid. The exception is an
+invoice of a supplier outside the euro area (the open item carries the
+supplier's country, not the currency): Yuki books it at its own exchange rate
+and the card is charged at another, so a payment of that supplier within 3% or
+1.00 (whichever is larger) and 30 days is suggested as `medium`, with a reason
+starting `FX:`. Each payment and each
+invoice is used once, strongest confidence first; at equal confidence an exact
+1:1 match before an FX match or a sum, then closest in date.
+`--unallocated` adds the supplier payments no open invoice took.
+
+```sh
+yuki check matches                     # every open purchase invoice
+yuki check matches --period 2026-Q2    # only invoices dated in Q2
+yuki check matches --unallocated -o json
+```
+
+Known limitation: individual credit-card purchases are not visible. The bank GL
+account only shows the monthly card settlement ("Afrekening kredietkaarten"),
+which is skipped, so a card purchase without an invoice is not reported.
+`check missing` does list them.
+
 `name` and the per-administration `api_key` are optional. An administration without
 its own key uses the shared one, so rotating the shared key keeps reaching it.
+
+### `check missing`: payments Yuki has no invoice for
+
+`check missing` is Yuki's "Betalingen waarvan factuur nog ontbreekt" with
+"Toon openstaande facturen" ticked: per supplier, the bank and card payments
+booked to it that no invoice settles yet, then that supplier's open invoices
+and credit notes. It is one read, `OutstandingCreditorItemsByDateOutstanding`
+with bank transactions included, as of today (3 API calls with authentication);
+`invoices list --invoice-type purchase` leaves the payments out. Card lines
+count too, because Yuki books each one to a supplier. It pairs nothing: see
+`check matches` for suggestions.
+
+`--period` keeps the payments dated in it (a supplier's open invoices are
+listed whatever their date), `--contact` the suppliers whose name contains the
+text. A card line's foreign amount shows in `FX`: `20.00 USD` when the
+description states it (`Bedrag 20 USD`), `~20.00 USD` when worked out from its
+`Koers`. The output ends with a summary per supplier and a total line; JSON adds
+them as `suppliers` and `summary`.
+
+`--receipts <dir>` adds a `Local receipt` column. It is read only: nothing in
+the folder is written. Each file `upload dir` would take (not `_to_delete` or
+dot files) is a receipt of the vendor its folder is named after
+(`2026/vercel/…`; a file at the top takes it from a `date_vendor_ref` name),
+dated by the `YYYY-MM-DD` its name starts with. A `receipts-log.csv` at the
+root, with a `filename` column relative to the root and `amount`, `currency`
+and `invoice_date` columns, gives amounts and dates.
+
+A receipt matches a payment of its vendor within 5 days when the amount is the
+same: in EUR, or in the foreign currency the card line states, or works out
+from its rate (to within half a euro cent at that rate). The vendor is the
+payment's supplier; only when no receipt is that supplier's is it looked for
+in the description, as for a card line booked to a catch-all supplier. When
+the amounts cannot be compared (no amount in the log, or a USD receipt for a
+line that states no USD amount) the match is labelled `vendor and date only`.
+Each receipt goes to one payment: as many payments as possible get an amount
+match, then a date-only one, the closest date winning a tie.
+
+The `.yuki-sync.json` of the folder (or of the synced folder above it) labels a
+file `uploaded, awaiting Yuki` (Yuki has it but has not booked it), `already in
+Yuki`, `upload outcome unknown` or `skipped`. An unreadable state file only
+hides these labels.
+
+```sh
+yuki check missing                              # every supplier, every date
+yuki check missing --period 2026-Q3 --contact vercel
+yuki check missing --receipts ~/Documents/Receipts -o json
+```
 
 ## Development
 

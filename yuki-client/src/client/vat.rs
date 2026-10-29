@@ -4,9 +4,9 @@ use quick_xml::events::Event;
 use crate::error::YukiError;
 
 use super::soap_client::{SoapClient, SoapEnvelope};
-use super::{local_name, unescape_text};
+use super::{ElementText, Region, local_name, service_url};
 
-const BASE_URL: &str = "https://api.yukiworks.nl/ws/Vat.asmx";
+const SERVICE: &str = "Vat.asmx";
 
 /// A VAT return record for a specific period.
 #[derive(Debug, Clone)]
@@ -32,7 +32,7 @@ pub struct VatClient {
 impl VatClient {
     pub fn new() -> Self {
         Self {
-            soap: SoapClient::new(BASE_URL),
+            soap: SoapClient::new(&service_url(Region::default().api_root(), SERVICE)),
         }
     }
 
@@ -40,8 +40,24 @@ impl VatClient {
     /// share a single pooled client across all service clients.
     pub fn with_client(http: reqwest::Client) -> Self {
         Self {
-            soap: SoapClient::with_client(BASE_URL, http),
+            soap: SoapClient::with_client(
+                &service_url(Region::default().api_root(), SERVICE),
+                http,
+            ),
         }
+    }
+
+    /// Target another Yuki deployment, e.g. `Region::Be.api_root()`, or any root
+    /// such as a local mock. The service path is appended to `api_root`.
+    #[must_use]
+    pub fn with_api_root(mut self, api_root: &str) -> Self {
+        self.soap.retarget(api_root, SERVICE);
+        self
+    }
+
+    /// The endpoint this client posts to.
+    pub fn base_url(&self) -> &str {
+        self.soap.base_url()
     }
 
     fn require_session(&self) -> Result<&str, YukiError> {
@@ -86,7 +102,6 @@ impl VatClient {
     /// Parse a VatReturnList SOAP response into a list of `VatReturn` values.
     pub fn parse_vat_returns(xml: &str) -> Result<Vec<VatReturn>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut returns = Vec::new();
         let mut in_item = false;
@@ -97,6 +112,7 @@ impl VatClient {
             start_date: String::new(),
             end_date: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -119,24 +135,20 @@ impl VatClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if let Some(ref f) = field {
-                        let text = unescape_text(e)
-                            .map_err(|e| YukiError::Xml(e.to_string()))?
-                            .trim()
-                            .to_string();
-                        match f.as_str() {
-                            "startDate" => current.start_date = text,
-                            "endDate" => current.end_date = text,
-                            "status" => current.status = text,
-                            _ => {}
-                        }
-                    }
-                }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
-                        "startDate" | "endDate" | "status" => field = None,
+                        "startDate" | "endDate" | "status" => {
+                            let text = content.take();
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "startDate" => current.start_date = text,
+                                    "endDate" => current.end_date = text,
+                                    "status" => current.status = text,
+                                    _ => {}
+                                }
+                            }
+                        }
                         "VATReturnInfo" if in_item => {
                             // Derive period from start/end dates
                             current.period = format!(
@@ -160,7 +172,7 @@ impl VatClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(field.is_some(), event)?,
             }
             buf.clear();
         }
@@ -171,7 +183,6 @@ impl VatClient {
     /// Parse an ActiveVatCodes SOAP response into a list of `VatCode` values.
     pub fn parse_vat_codes(xml: &str) -> Result<Vec<VatCode>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut codes = Vec::new();
         let mut in_item = false;
@@ -180,6 +191,7 @@ impl VatClient {
             code: String::new(),
             description: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -200,23 +212,19 @@ impl VatClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if let Some(ref f) = field {
-                        let text = unescape_text(e)
-                            .map_err(|e| YukiError::Xml(e.to_string()))?
-                            .trim()
-                            .to_string();
-                        match f.as_str() {
-                            "type" => current.code = text,
-                            "description" => current.description = text,
-                            _ => {}
-                        }
-                    }
-                }
                 Ok(Event::End(ref e)) => {
                     let local = local_name(e.name().as_ref()).to_string();
                     match local.as_str() {
-                        "type" | "description" => field = None,
+                        "type" | "description" => {
+                            let text = content.take();
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "type" => current.code = text,
+                                    "description" => current.description = text,
+                                    _ => {}
+                                }
+                            }
+                        }
                         "VATCode" if in_item => {
                             codes.push(current.clone());
                             in_item = false;
@@ -226,7 +234,7 @@ impl VatClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(field.is_some(), event)?,
             }
             buf.clear();
         }

@@ -44,7 +44,7 @@ pub async fn run(
         .unwrap_or(file);
 
     let target = config.target(admin)?;
-    let mut client = ArchiveClient::new();
+    let mut client = ArchiveClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
 
     let doc_id = match options.amount {
@@ -94,7 +94,7 @@ pub async fn categories(
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = ArchiveClient::new();
+    let mut client = ArchiveClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let cats = client.cost_categories().await?;
 
@@ -120,7 +120,7 @@ pub async fn payment_methods(
     format: Option<&str>,
 ) -> Result<(), YukiError> {
     let target = config.target(admin)?;
-    let mut client = ArchiveClient::new();
+    let mut client = ArchiveClient::new().with_api_root(target.api_root);
     client.authenticate(target.api_key).await?;
     let methods = client.payment_methods().await?;
 

@@ -100,10 +100,9 @@ impl OutputFormat {
     }
 }
 
-/// Format rows as a clispec v0.2 items envelope: `{"items": [...], "total": N}`.
-pub fn format_json(headers: &[String], rows: &[Vec<String>]) -> String {
-    let items: Vec<Value> = rows
-        .iter()
+/// Rows as JSON objects keyed by header, as [`format_json`] lists them.
+pub fn json_items(headers: &[String], rows: &[Vec<String>]) -> Vec<Value> {
+    rows.iter()
         .map(|row| {
             let mut map = Map::new();
             for (i, header) in headers.iter().enumerate() {
@@ -112,7 +111,12 @@ pub fn format_json(headers: &[String], rows: &[Vec<String>]) -> String {
             }
             Value::Object(map)
         })
-        .collect();
+        .collect()
+}
+
+/// Format rows as a clispec v0.2 items envelope: `{"items": [...], "total": N}`.
+pub fn format_json(headers: &[String], rows: &[Vec<String>]) -> String {
+    let items = json_items(headers, rows);
     let total = items.len();
     serde_json::to_string_pretty(&json!({
         "items": items,
@@ -151,6 +155,15 @@ pub fn format_error_json(message: &str, kind: &str) -> String {
         }
     }))
     .unwrap_or_else(|_| format!(r#"{{"error":{{"kind":"{kind}","message":"{message}"}}}}"#))
+}
+
+/// `2048` → `2.0 KB`, for a human.
+pub fn human_size(bytes: u64) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} bytes"),
+        b if b < 1024 * 1024 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+    }
 }
 
 pub fn is_tty() -> bool {

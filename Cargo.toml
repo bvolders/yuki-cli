@@ -26,17 +26,22 @@ name = "yuki-cli"
 path = "src/yuki_cli_alias.rs"
 
 [dependencies]
-yuki-client = { path = "yuki-client", version = "0.2.1" }
+yuki-client = { path = "yuki-client", version = "0.3.0", features = ["serde"] }
 anyhow = "1"
 base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 comfy-table = "7"
+# Already in the tree via reqwest; used for try_join_all.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 owo-colors = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toml = "0.8"
+glob = "0.3"
+sha2 = "0.10"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -3,10 +3,10 @@ use quick_xml::events::Event;
 
 use crate::error::YukiError;
 
-use super::soap_client::{SoapClient, SoapEnvelope};
-use super::{local_name, unescape_text};
+use super::soap_client::{SoapClient, SoapEnvelope, payload_timeout};
+use super::{ElementText, Region, local_name, service_url};
 
-const BASE_URL: &str = "https://api.yukiworks.nl/ws/Archive.asmx";
+const SERVICE: &str = "Archive.asmx";
 
 /// A Yuki cost category.
 #[derive(Debug, Clone)]
@@ -35,6 +35,14 @@ pub struct ArchiveDocument {
     pub reference: String,
 }
 
+/// The widest date range `DocumentsInFolder` takes: from `DateTime.MinValue`,
+/// which the WSDL documents (for SearchDocuments) as "all years", so
+/// undated documents are not left out.
+pub const ALL_DATES: (&str, &str) = ("0001-01-01", "9999-12-31");
+
+/// Pages [`ArchiveClient::documents_in_folder_all`] reads at most.
+pub const ALL_MAX_PAGES: usize = 40;
+
 /// Client for the Yuki Archive SOAP service.
 pub struct ArchiveClient {
     soap: SoapClient,
@@ -43,7 +51,7 @@ pub struct ArchiveClient {
 impl ArchiveClient {
     pub fn new() -> Self {
         Self {
-            soap: SoapClient::new(BASE_URL),
+            soap: SoapClient::new(&service_url(Region::default().api_root(), SERVICE)),
         }
     }
 
@@ -51,8 +59,39 @@ impl ArchiveClient {
     /// share a single pooled client across all service clients.
     pub fn with_client(http: reqwest::Client) -> Self {
         Self {
-            soap: SoapClient::with_client(BASE_URL, http),
+            soap: SoapClient::with_client(
+                &service_url(Region::default().api_root(), SERVICE),
+                http,
+            ),
         }
+    }
+
+    /// Target another Yuki deployment, e.g. `Region::Be.api_root()`, or any root
+    /// such as a local mock. The service path is appended to `api_root`.
+    #[must_use]
+    pub fn with_api_root(mut self, api_root: &str) -> Self {
+        self.soap.retarget(api_root, SERVICE);
+        self
+    }
+
+    /// SOAP requests sent so far in this process (see [`SoapClient::calls`]).
+    pub fn calls(&self) -> usize {
+        self.soap.calls()
+    }
+
+    /// The endpoint this client posts to.
+    pub fn base_url(&self) -> &str {
+        self.soap.base_url()
+    }
+
+    /// Reuse a session opened by another service client instead of calling
+    /// [`authenticate`](Self::authenticate) again. A Yuki session is not tied
+    /// to the service it was opened on: one from `Accounting.asmx` is accepted
+    /// by `Archive.asmx` (verified on Yuki Belgium).
+    #[must_use]
+    pub fn with_session(mut self, session_id: &str) -> Self {
+        self.soap = self.soap.with_session(session_id);
+        self
     }
 
     fn require_session(&self) -> Result<&str, YukiError> {
@@ -136,6 +175,88 @@ impl ArchiveClient {
         Ok(collected)
     }
 
+    /// Every document in an archive folder, dated or not, read strictly: pages
+    /// advance by what came back and end with an empty page, and a document
+    /// listed twice or more than [`ALL_MAX_PAGES`] pages are an error rather
+    /// than a listing that may be incomplete.
+    pub async fn documents_in_folder_all(
+        &self,
+        folder_id: i32,
+    ) -> Result<Vec<ArchiveDocument>, YukiError> {
+        let (start, end) = ALL_DATES;
+        self.documents_in_folder_strict(folder_id, start, end).await
+    }
+
+    /// [`documents_in_folder_all`](Self::documents_in_folder_all), for the
+    /// documents dated `start` to `end` (inclusive, `YYYY-MM-DD`).
+    pub async fn documents_in_folder_strict(
+        &self,
+        folder_id: i32,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<ArchiveDocument>, YukiError> {
+        let mut docs: Vec<ArchiveDocument> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..ALL_MAX_PAGES {
+            let page = self
+                .documents_in_folder_page(folder_id, start, end, Self::FOLDER_PAGE_SIZE, docs.len())
+                .await?;
+            if page.is_empty() {
+                return Ok(docs);
+            }
+            for doc in page {
+                if !seen.insert(doc.id.clone()) {
+                    return Err(YukiError::Config(format!(
+                        "Yuki listed document {} twice while paging folder {folder_id}; \
+                         the listing cannot be trusted",
+                        doc.id
+                    )));
+                }
+                docs.push(doc);
+            }
+        }
+        Err(YukiError::Config(format!(
+            "folder {folder_id} still had documents after {ALL_MAX_PAGES} pages"
+        )))
+    }
+
+    /// The metadata of one archive document, `None` when Yuki returns none.
+    pub async fn find_document(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<ArchiveDocument>, YukiError> {
+        let session = self.require_session()?;
+        let envelope = SoapEnvelope::new("FindDocument")
+            .session(session)
+            .param("documentID", document_id)
+            .build();
+        let body = self.soap.call("FindDocument", envelope).await?;
+        Ok(Self::parse_archive_documents(&body)?.into_iter().next())
+    }
+
+    /// The file of one archive document, base64-encoded as Yuki sends it.
+    pub async fn document_binary_data(&self, document_id: &str) -> Result<String, YukiError> {
+        let session = self.require_session()?;
+        let envelope = SoapEnvelope::new("DocumentBinaryData")
+            .session(session)
+            .param("documentID", document_id)
+            .build();
+        let body = self.soap.call("DocumentBinaryData", envelope).await?;
+        Self::parse_document_binary_data(&body, document_id)
+    }
+
+    /// The base64 text of a `DocumentBinaryData` response; an empty or
+    /// missing result means the document has no file.
+    pub fn parse_document_binary_data(xml: &str, document_id: &str) -> Result<String, YukiError> {
+        match SoapClient::parse_single_result(xml, "DocumentBinaryDataResult") {
+            Ok(data) => Ok(data),
+            Err(YukiError::Xml(_)) => Err(YukiError::NotFound(format!(
+                "document {document_id} has no file in the archive"
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
     /// List all documents of a given document type.
     pub async fn documents_by_type(&self, doc_type: i32) -> Result<String, YukiError> {
         let session = self.require_session()?;
@@ -206,7 +327,14 @@ impl ArchiveClient {
             .param("folder", &folder_id.to_string())
             .param("administrationID", admin_id)
             .build();
-        let body = self.soap.call("UploadDocument", envelope).await?;
+        let body = self
+            .soap
+            .call_with_timeout(
+                "UploadDocument",
+                envelope,
+                Some(payload_timeout(data_base64)),
+            )
+            .await?;
         SoapClient::parse_single_result(&body, "UploadDocumentResult")
     }
 
@@ -242,7 +370,14 @@ impl ArchiveClient {
             .param("project", project.unwrap_or(""))
             .param("remarks", remarks.unwrap_or(""))
             .build();
-        let body = self.soap.call("UploadDocumentWithData", envelope).await?;
+        let body = self
+            .soap
+            .call_with_timeout(
+                "UploadDocumentWithData",
+                envelope,
+                Some(payload_timeout(data_base64)),
+            )
+            .await?;
         SoapClient::parse_single_result(&body, "UploadDocumentWithDataResult")
     }
 
@@ -268,11 +403,10 @@ impl ArchiveClient {
     /// The document ID is an XML attribute; all other fields are child text nodes.
     pub fn parse_archive_documents(xml: &str) -> Result<Vec<ArchiveDocument>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut documents = Vec::new();
         let mut in_document = false;
-        let mut current_field = String::new();
+        let mut field: Option<String> = None;
         let mut doc = ArchiveDocument {
             id: String::new(),
             subject: String::new(),
@@ -283,6 +417,7 @@ impl ArchiveClient {
             file_name: String::new(),
             reference: String::new(),
         };
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -312,24 +447,8 @@ impl ArchiveClient {
                         | "FileName" | "Reference"
                             if in_document =>
                         {
-                            current_field = local;
+                            field = Some(local);
                         }
-                        _ => {}
-                    }
-                }
-                Ok(Event::Text(ref e)) if in_document && !current_field.is_empty() => {
-                    let text = unescape_text(e)
-                        .map_err(|e| YukiError::Xml(e.to_string()))?
-                        .trim()
-                        .to_string();
-                    match current_field.as_str() {
-                        "Subject" => doc.subject = text,
-                        "DocumentDate" => doc.document_date = text,
-                        "Amount" => doc.amount = text,
-                        "Folder" => doc.folder = text,
-                        "ContactName" => doc.contact_name = text,
-                        "FileName" => doc.file_name = text,
-                        "Reference" => doc.reference = text,
                         _ => {}
                     }
                 }
@@ -339,7 +458,19 @@ impl ArchiveClient {
                     match local {
                         "Subject" | "DocumentDate" | "Amount" | "Folder" | "ContactName"
                         | "FileName" | "Reference" => {
-                            current_field.clear();
+                            let text = content.take();
+                            if let Some(f) = field.take() {
+                                match f.as_str() {
+                                    "Subject" => doc.subject = text,
+                                    "DocumentDate" => doc.document_date = text,
+                                    "Amount" => doc.amount = text,
+                                    "Folder" => doc.folder = text,
+                                    "ContactName" => doc.contact_name = text,
+                                    "FileName" => doc.file_name = text,
+                                    "Reference" => doc.reference = text,
+                                    _ => {}
+                                }
+                            }
                         }
                         "Document" => {
                             if !doc.id.is_empty() {
@@ -352,7 +483,7 @@ impl ArchiveClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(field.is_some(), event)?,
             }
             buf.clear();
         }
@@ -366,13 +497,13 @@ impl ArchiveClient {
     /// `<CostCategory ID="45100"><Description>...</Description></CostCategory>`
     pub fn parse_cost_categories(xml: &str) -> Result<Vec<CostCategory>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut categories = Vec::new();
         let mut current_id = String::new();
         let mut current_desc = String::new();
         let mut in_category = false;
         let mut in_description = false;
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -396,17 +527,14 @@ impl ArchiveClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) if in_description => {
-                    current_desc = unescape_text(e)
-                        .map_err(|e| YukiError::Xml(e.to_string()))?
-                        .trim()
-                        .to_string();
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
                     match local {
-                        "Description" => in_description = false,
+                        "Description" if in_description => {
+                            in_description = false;
+                            current_desc = content.take();
+                        }
                         "CostCategory" => {
                             if !current_id.is_empty() {
                                 categories.push(CostCategory {
@@ -421,7 +549,7 @@ impl ArchiveClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(in_description, event)?,
             }
             buf.clear();
         }
@@ -435,13 +563,13 @@ impl ArchiveClient {
     /// `<PaymentMethod ID="4"><Description>...</Description></PaymentMethod>`
     pub fn parse_payment_methods(xml: &str) -> Result<Vec<PaymentMethod>, YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut methods = Vec::new();
         let mut current_id = String::new();
         let mut current_desc = String::new();
         let mut in_method = false;
         let mut in_description = false;
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -465,17 +593,14 @@ impl ArchiveClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) if in_description => {
-                    current_desc = unescape_text(e)
-                        .map_err(|e| YukiError::Xml(e.to_string()))?
-                        .trim()
-                        .to_string();
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
                     match local {
-                        "Description" => in_description = false,
+                        "Description" if in_description => {
+                            in_description = false;
+                            current_desc = content.take();
+                        }
                         "PaymentMethod" => {
                             if !current_id.is_empty() {
                                 methods.push(PaymentMethod {
@@ -490,7 +615,7 @@ impl ArchiveClient {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(in_description, event)?,
             }
             buf.clear();
         }

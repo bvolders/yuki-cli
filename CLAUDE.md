@@ -30,11 +30,18 @@ src/config.rs            TOML config (~/.config/yuki/config.toml)
 src/error.rs             YukiError enum with exit codes (0/1/2/3/4)
 src/output.rs            TTY-aware table (comfy-table) / JSON output
 src/period.rs            Period string → (start_date, end_date) conversion
+src/money.rs             Exact decimal amounts (Cents) for invoice totals
+src/ledger.rs            Ledger<S: LedgerFormat>: local JSON record, OS lock, versioned load, atomic write, write-ahead
+src/sync.rs              upload dir's .yuki-sync.json (a Ledger) + scan/excludes/hashing
+src/cli/sales_invoice.rs   sales invoice create/prepare: TOML → xmlDoc for ProcessSalesInvoices
+src/cli/invoice_ledger.rs  invoice-numbers.json (a Ledger), locked only per read-write
 ```
+
+Local records go through `ledger::Ledger`: `open` (lock + load), `peek` (read only), `save`, and `write_ahead` → `commit`/`undo`. Record a call as pending before making it. A failed call is classified by `YukiError::delivery()`: `NotSent` (never left) and `Refused` (401/403/429) may be retried or freed; `Unknown` (timeout, fault, 5xx) stays pending until the user resolves it. Requests time out after 15s connect / 60s total; one carrying a file uses `call_with_timeout` with `payload_timeout` (60s + 30s/MB, max 10 min).
 
 ### SOAP Client Pattern
 
-Each service client (accounting, archive, vat, contact, sales) wraps `SoapClient` with a specific base URL (`https://api.yukiworks.nl/ws/{Service}.asmx`). The flow is always: `authenticate()` → `set_current_domain()` → operation calls. The `setup_domain()` helper in `cli/mod.rs` handles the first two steps.
+Each service client (accounting, archive, vat, contact, sales) wraps `SoapClient` with a service URL `{api_root}/{Service}.asmx`. Regions are list-driven: `Region::ALL` plus the one `Region::info()` table (code, country, host) in `yuki-client`; nothing else may hardcode an nl/be pair. `yuki init` detects a key's region by authenticating on every `Region::ALL` root concurrently (`cli::init::detect`; "Invalid access key" = not this region, any other error is reported) and records it; `--region`/`--base-url` skip detection. CLI handlers pass `target.api_root` via `.with_api_root()`, resolved by `Config::endpoint()` (override flag/env > admin `base_url` > admin `region` > top-level `base_url` > top-level `region` > nl, the last only as a legacy fallback for configs written before init recorded the region), which also yields the region for country conventions; `api_root()`/`region()` are its shorthands. Tests point detection at a local mock with the hidden `YUKI_PROBE_ROOTS=code=root,...`. The flow is always: `authenticate()` → `set_current_domain()` → operation calls. The `setup_domain()` helper in `cli/mod.rs` handles the first two steps.
 
 `SoapEnvelope` is a builder: `.new("Op").session(sid).param("key", "val").build()` produces the XML envelope. All operations require `administrationID` as a parameter.
 

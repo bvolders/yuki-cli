@@ -1,49 +1,75 @@
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::Client;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::error::YukiError;
 
-use super::{local_name, unescape_text};
+use super::{ElementText, local_name, service_url};
 
 const YUKI_NS: &str = "http://www.theyukicompany.com/";
 const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 /// Builder for SOAP XML request envelopes.
 pub struct SoapEnvelope {
     operation: String,
-    session_id: Option<String>,
-    params: Vec<(String, String)>,
+    /// Name and value of each parameter; `None` is an explicit `xsi:nil`.
+    params: Vec<(String, Option<String>)>,
 }
 
 impl SoapEnvelope {
     pub fn new(operation: &str) -> Self {
         Self {
             operation: operation.to_string(),
-            session_id: None,
             params: Vec::new(),
         }
     }
 
+    /// Add the session ID, which Yuki expects as the first parameter.
     pub fn session(mut self, session_id: &str) -> Self {
-        self.session_id = Some(session_id.to_string());
+        self.params
+            .insert(0, ("sessionID".into(), Some(escape_text(session_id))));
         self
     }
 
+    /// Add a text parameter. `value` is XML-escaped, so a file name such as
+    /// `Tom & Jerry <x>.pdf` reaches Yuki unchanged.
     pub fn param(mut self, name: &str, value: &str) -> Self {
-        self.params.push((name.to_string(), value.to_string()));
+        self.params
+            .push((name.to_string(), Some(escape_text(value))));
+        self
+    }
+
+    /// Add a nillable parameter sent as `xsi:nil="true"`: for elements the
+    /// schema requires (`minOccurs="1"`) but that may carry no value, such as
+    /// `modifiedAfter` of `SearchContacts`.
+    pub fn nil_param(mut self, name: &str) -> Self {
+        self.params.push((name.to_string(), None));
+        self
+    }
+
+    /// Add a parameter whose value is raw XML, inserted unescaped as child
+    /// elements: for `s:any` parameters such as the `xmlDoc` of
+    /// `ProcessSalesInvoices`, which take a document rather than text. The
+    /// caller guarantees the fragment is well-formed and escaped inside.
+    pub fn param_xml(mut self, name: &str, xml: &str) -> Self {
+        self.params.push((name.to_string(), Some(xml.to_string())));
         self
     }
 
     pub fn build(self) -> String {
         let mut body = String::new();
-
-        if let Some(sid) = &self.session_id {
-            body.push_str(&format!("      <yuki:sessionID>{sid}</yuki:sessionID>\n"));
-        }
-
         for (name, value) in &self.params {
-            body.push_str(&format!("      <yuki:{name}>{value}</yuki:{name}>\n"));
+            match value {
+                Some(value) => {
+                    body.push_str(&format!("      <yuki:{name}>{value}</yuki:{name}>\n"));
+                }
+                None => body.push_str(&format!(
+                    "      <yuki:{name} xsi:nil=\"true\" xmlns:xsi=\"{XSI_NS}\" />\n"
+                )),
+            }
         }
 
         format!(
@@ -60,18 +86,61 @@ impl SoapEnvelope {
     }
 }
 
+/// Escape the five XML special characters for use in element text.
+pub fn escape_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// How long establishing a connection may take.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long one SOAP request may take in total, unless the call says otherwise.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long sending `payload` may take: [`REQUEST_TIMEOUT`] plus 30 seconds
+/// per megabyte, at most 10 minutes. For requests that carry a file.
+pub fn payload_timeout(payload: &str) -> std::time::Duration {
+    let mb = payload.len() as u64 / 1_000_000;
+    std::time::Duration::from_secs((REQUEST_TIMEOUT.as_secs() + 30 * mb).min(600))
+}
+
+/// Requests sent by every transport in this process, counted by [`SoapClient::calls`].
+fn process_calls() -> Arc<AtomicUsize> {
+    static CALLS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    Arc::clone(CALLS.get_or_init(Arc::default))
+}
+
 /// HTTP transport client for the Yuki SOAP API.
 pub struct SoapClient {
     http: Client,
-    pub(super) base_url: String,
+    base_url: String,
     pub(super) session_id: Option<String>,
+    calls: Arc<AtomicUsize>,
 }
 
 impl SoapClient {
     /// Create a transport with its own default HTTP client. Convenient for
     /// short-lived consumers such as the CLI, where each invocation is fresh.
+    /// Connecting times out after [`CONNECT_TIMEOUT`], a whole request after
+    /// [`REQUEST_TIMEOUT`].
     pub fn new(base_url: &str) -> Self {
-        Self::with_client(base_url, Client::new())
+        let http = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("build the HTTP client");
+        Self::with_client(base_url, http)
     }
 
     /// Create a transport over a caller-provided HTTP client. Long-running
@@ -82,7 +151,14 @@ impl SoapClient {
             http,
             base_url: base_url.to_string(),
             session_id: None,
+            calls: process_calls(),
         }
+    }
+
+    /// SOAP requests sent so far by every transport in this process, so
+    /// clients that share a session through `with_session` count together.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
     }
 
     pub fn with_session(mut self, session_id: &str) -> Self {
@@ -94,6 +170,17 @@ impl SoapClient {
         self.session_id.as_deref()
     }
 
+    /// Point this transport at `service` (e.g. `Accounting.asmx`) under
+    /// `api_root`, such as `Region::Be.api_root()` or a local mock.
+    pub fn retarget(&mut self, api_root: &str, service: &str) {
+        self.base_url = service_url(api_root, service);
+    }
+
+    /// The endpoint this transport posts to.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Build the SOAPAction header value for a given operation.
     pub fn soap_action(_service: &str, operation: &str) -> String {
         format!("{YUKI_NS}{operation}")
@@ -101,15 +188,28 @@ impl SoapClient {
 
     /// POST a SOAP envelope and return the raw response body.
     pub async fn call(&self, operation: &str, envelope: String) -> Result<String, YukiError> {
+        self.call_with_timeout(operation, envelope, None).await
+    }
+
+    /// [`call`](Self::call) with its own total timeout, e.g. for a large upload.
+    pub async fn call_with_timeout(
+        &self,
+        operation: &str,
+        envelope: String,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<String, YukiError> {
         let action = Self::soap_action("", operation);
-        let response = self
+        let mut request = self
             .http
             .post(&self.base_url)
             .header("Content-Type", "text/xml; charset=utf-8")
             .header("SOAPAction", format!("\"{action}\""))
-            .body(envelope)
-            .send()
-            .await?;
+            .body(envelope);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let response = request.send().await?;
 
         let status = response.status();
         let body = response.text().await?;
@@ -123,7 +223,7 @@ impl SoapClient {
         }
 
         if status == 401 || status == 403 {
-            return Err(YukiError::AuthFailed(format!("HTTP {status}")));
+            return Err(YukiError::Unauthorized(status.as_u16()));
         }
         if status == 429 {
             return Err(YukiError::RateLimited);
@@ -164,9 +264,9 @@ impl SoapClient {
         }
 
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut inside_target = false;
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -178,25 +278,20 @@ impl SoapClient {
                         inside_target = true;
                     }
                 }
-                Ok(Event::Text(ref e)) if inside_target => {
-                    let text = unescape_text(e)
-                        .map_err(|e| YukiError::Xml(e.to_string()))?
-                        .trim()
-                        .to_string();
-                    if !text.is_empty() {
-                        return Ok(text);
-                    }
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
                     if local == result_tag {
                         inside_target = false;
+                        let text = content.take();
+                        if !text.is_empty() {
+                            return Ok(text);
+                        }
                     }
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(YukiError::Xml(e.to_string())),
-                _ => {}
+                Ok(ref event) => content.push_if(inside_target, event)?,
             }
             buf.clear();
         }
@@ -211,13 +306,13 @@ impl SoapClient {
     /// Returns `None` if no fault is present.
     pub fn parse_soap_fault(xml: &str) -> Option<YukiError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
 
         let mut in_fault = false;
         let mut in_faultcode = false;
         let mut in_faultstring = false;
         let mut faultcode = String::new();
         let mut faultstring = String::new();
+        let mut content = ElementText::default();
         let mut buf = Vec::new();
 
         loop {
@@ -232,19 +327,18 @@ impl SoapClient {
                         _ => {}
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if in_faultcode {
-                        faultcode = unescape_text(e).unwrap_or_default().trim().to_string();
-                    } else if in_faultstring {
-                        faultstring = unescape_text(e).unwrap_or_default().trim().to_string();
-                    }
-                }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
                     let local = local_name(name.as_ref());
                     match local {
-                        "faultcode" => in_faultcode = false,
-                        "faultstring" => in_faultstring = false,
+                        "faultcode" if in_faultcode => {
+                            in_faultcode = false;
+                            faultcode = content.take();
+                        }
+                        "faultstring" if in_faultstring => {
+                            in_faultstring = false;
+                            faultstring = content.take();
+                        }
                         "Fault" => {
                             if !faultstring.is_empty() {
                                 let msg_lower = faultstring.to_lowercase();
@@ -266,7 +360,7 @@ impl SoapClient {
                     }
                 }
                 Ok(Event::Eof) | Err(_) => break,
-                _ => {}
+                Ok(ref event) => content.push_lossy_if(in_faultcode || in_faultstring, event),
             }
             buf.clear();
         }
