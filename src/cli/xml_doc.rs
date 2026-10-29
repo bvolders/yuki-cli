@@ -4,6 +4,9 @@
 
 use std::fmt::Write as _;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
 use crate::client::escape_text;
 
 /// The XML Schema instance namespace; Yuki rejects an invoice document
@@ -53,17 +56,18 @@ impl XmlWriter {
         }
     }
 
-    /// `DocumentBase64` with the `encoded` file, or, for a human (`embed`
-    /// false), a comment giving its size instead.
-    pub fn base64(&mut self, encoded: &str, file_bytes: usize, embed: bool) {
+    /// `DocumentBase64` with the file `bytes` encoded, or, for a human
+    /// (`embed` false), a comment giving the sizes instead.
+    pub fn base64(&mut self, bytes: &[u8], embed: bool) {
         if embed {
-            self.leaf("DocumentBase64", encoded);
+            self.leaf("DocumentBase64", &BASE64.encode(bytes));
         } else {
             self.indent();
             let _ = writeln!(
                 self.out,
-                "<DocumentBase64><!-- {} bytes base64 ({file_bytes}-byte PDF) --></DocumentBase64>",
-                encoded.len()
+                "<DocumentBase64><!-- {} bytes base64 ({}-byte PDF) --></DocumentBase64>",
+                bytes.len().div_ceil(3) * 4,
+                bytes.len()
             );
         }
     }

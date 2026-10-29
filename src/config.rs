@@ -461,47 +461,53 @@ impl Config {
     ) -> Result<Option<ApiClient>, YukiError> {
         let name = admin.unwrap_or(&self.default_admin);
         let entry = self.administrations.get(name);
+        /// Where an API client may be given, and what the two halves are
+        /// called there.
+        struct Layer {
+            id: Option<String>,
+            secret: Option<String>,
+            source: String,
+            names: (&'static str, &'static str),
+        }
         let nonempty = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+        let config_names = ("client_id", "client_secret");
         let layers = [
-            (
-                nonempty(env("YUKI_CLIENT_ID")),
-                nonempty(env("YUKI_CLIENT_SECRET")),
-                "YUKI_CLIENT_ID/YUKI_CLIENT_SECRET".to_string(),
-                "YUKI_CLIENT_ID",
-                "YUKI_CLIENT_SECRET",
-            ),
-            (
-                nonempty(entry.and_then(|e| e.client_id.clone())),
-                nonempty(entry.and_then(|e| e.client_secret.clone())),
-                format!("[administrations.{name}]"),
-                "client_id",
-                "client_secret",
-            ),
-            (
-                nonempty(self.client_id.clone()),
-                nonempty(self.client_secret.clone()),
-                "the top level of the config".to_string(),
-                "client_id",
-                "client_secret",
-            ),
+            Layer {
+                id: nonempty(env("YUKI_CLIENT_ID")),
+                secret: nonempty(env("YUKI_CLIENT_SECRET")),
+                source: "YUKI_CLIENT_ID/YUKI_CLIENT_SECRET".to_string(),
+                names: ("YUKI_CLIENT_ID", "YUKI_CLIENT_SECRET"),
+            },
+            Layer {
+                id: nonempty(entry.and_then(|e| e.client_id.clone())),
+                secret: nonempty(entry.and_then(|e| e.client_secret.clone())),
+                source: format!("[administrations.{name}]"),
+                names: config_names,
+            },
+            Layer {
+                id: nonempty(self.client_id.clone()),
+                secret: nonempty(self.client_secret.clone()),
+                source: "the top level of the config".to_string(),
+                names: config_names,
+            },
         ];
-        for (id, secret, source, id_name, secret_name) in layers {
-            match (id, secret) {
+        for layer in layers {
+            let (has, lacks) = match (layer.id, layer.secret) {
                 (None, None) => continue,
                 (Some(id), Some(secret)) => {
-                    return Ok(Some(ApiClient { id, secret, source }));
+                    return Ok(Some(ApiClient {
+                        id,
+                        secret,
+                        source: layer.source,
+                    }));
                 }
-                (Some(_), None) => {
-                    return Err(YukiError::Config(format!(
-                        "{source} has {id_name} but no {secret_name}: give both or neither"
-                    )));
-                }
-                (None, Some(_)) => {
-                    return Err(YukiError::Config(format!(
-                        "{source} has {secret_name} but no {id_name}: give both or neither"
-                    )));
-                }
-            }
+                (Some(_), None) => layer.names,
+                (None, Some(_)) => (layer.names.1, layer.names.0),
+            };
+            return Err(YukiError::Config(format!(
+                "{} has {has} but no {lacks}: give both or neither",
+                layer.source
+            )));
         }
         Ok(None)
     }

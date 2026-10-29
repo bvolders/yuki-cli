@@ -1,5 +1,9 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
 use super::*;
 use crate::client::sales::ImportedInvoice;
+use crate::sync::Entry as SyncEntry;
 
 fn pdf_in(dir: &Path, name: &str) -> PathBuf {
     let path = dir.join(name);
@@ -10,7 +14,7 @@ fn pdf_in(dir: &Path, name: &str) -> PathBuf {
 fn args(file: PathBuf) -> BookArgs {
     BookArgs {
         file,
-        contact: "Leverancier BV".into(),
+        contact: Some("Leverancier BV".into()),
         reference: "F2026-0042".into(),
         date: "2026-10-20".into(),
         total: Cents(12100),
@@ -18,7 +22,7 @@ fn args(file: PathBuf) -> BookArgs {
         gl_account: Some("612000".into()),
         vat_type: Some(1),
         vat_description: Some("VAT 21%".into()),
-        payment_method: Some(PaymentMethod::CreditCard),
+        payment_method: PaymentMethod::CreditCard,
         ..BookArgs::default()
     }
 }
@@ -47,7 +51,7 @@ fn the_single_line_shortcut_books_total_minus_vat_in_xsd_order() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
     a.due_date = Some("2026-11-19".into());
-    a.payment_method = Some(PaymentMethod::CreditCard);
+    a.payment_method = PaymentMethod::CreditCard;
     a.remarks = Some("Tom & Jerry <x>".into());
     a.description = Some("Hosting oktober".into());
     let invoice = build(&a).unwrap();
@@ -135,7 +139,7 @@ fn yuki_contact(code: &str, name: &str) -> Contact {
 fn a_contact_matched_by_code_gets_only_its_code_and_bank_account() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
-    a.contact = String::new();
+    a.contact = None;
     a.contact_code = Some("SUP001".into());
     a.iban = Some("be68 5390 0754 7034".into());
     let mut invoice = build(&a).unwrap();
@@ -167,7 +171,7 @@ fn a_contact_matched_by_code_gets_only_its_code_and_bank_account() {
     );
 
     // A --contact that is not Yuki's name for the code is ignored, said so.
-    a.contact = "Someone Else".into();
+    a.contact = Some("Someone Else".into());
     let mut invoice = build(&a).unwrap();
     match_supplier(&mut invoice.supplier, &yuki, &mut problems, &mut notes);
     assert!(
@@ -188,7 +192,7 @@ fn a_contact_matched_by_code_gets_only_its_code_and_bank_account() {
 fn a_contact_matched_by_name_gets_yukis_spelling_and_no_details() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
-    a.contact = "leverancier bv".into();
+    a.contact = Some("leverancier bv".into());
     a.country = Some("BE".into());
     a.vat_number = Some("BE0123456789".into());
     let mut invoice = build(&a).unwrap();
@@ -224,7 +228,7 @@ fn a_contact_matched_by_name_gets_yukis_spelling_and_no_details() {
 fn a_new_supplier_needs_a_country_and_is_a_company_unless_a_person() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
-    a.contact = "Nieuwe Leverancier".into();
+    a.contact = Some("Nieuwe Leverancier".into());
     let mut invoice = build(&a).unwrap();
     let (mut problems, mut notes) = (Vec::new(), Vec::new());
     match_supplier(&mut invoice.supplier, &[], &mut problems, &mut notes);
@@ -257,12 +261,11 @@ fn a_new_supplier_needs_a_country_and_is_a_company_unless_a_person() {
 }
 
 #[test]
-fn payment_method_is_required_and_transfer_needs_a_valid_iban() {
+fn transfer_needs_a_valid_iban() {
+    // clap requires --payment-method itself (see the end-to-end tests).
     let dir = tempfile::tempdir().unwrap();
     let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
-    a.payment_method = None;
-    assert!(invalid(&a).contains("--payment-method is required"));
-    a.payment_method = Some(PaymentMethod::Transfer);
+    a.payment_method = PaymentMethod::Transfer;
     assert!(invalid(&a).contains("--payment-method transfer needs --iban"));
     a.iban = Some("BE68 5390 0754 7035".into());
     assert!(invalid(&a).contains("check digits are wrong"));
@@ -676,9 +679,9 @@ fn yukis_answer_is_judged() {
 #[test]
 fn a_refusal_under_the_access_key_alone_hints_at_an_api_client() {
     let refused = "Client not authorized for this webservice".to_string();
-    assert!(with_hint(refused.clone(), true).contains("support.accounting@nmbrs.com"));
-    assert_eq!(with_hint(refused.clone(), false), refused);
-    assert_eq!(with_hint("Unknown GL".into(), true), "Unknown GL");
-    let e = hinted(YukiError::Unauthorized(403), true).to_string();
+    assert!(hint_text(refused.clone(), true).contains("support.accounting@nmbrs.com"));
+    assert_eq!(hint_text(refused.clone(), false), refused);
+    assert_eq!(hint_text("Unknown GL".into(), true), "Unknown GL");
+    let e = hint(YukiError::Unauthorized(403), true).to_string();
     assert!(e.contains("HTTP 403") && e.contains("Client ID"), "{e}");
 }

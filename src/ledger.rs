@@ -51,7 +51,7 @@ impl<S: LedgerFormat> Ledger<S> {
     /// Lock and load the ledger at `path`; a missing file is an empty state.
     /// Refused while another process holds the lock.
     pub fn open(path: &Path) -> Result<Self, YukiError> {
-        Self::locked(path, lock(path, Some(Duration::ZERO))?)
+        Self::open_within(path, Duration::ZERO)
     }
 
     /// [`open`](Self::open), waiting up to `patience` for another

@@ -12,9 +12,6 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
-
 use serde::{Deserialize, Serialize};
 
 use crate::cli::contacts::{yes_no, yes_no_unknown};
@@ -703,7 +700,7 @@ impl Invoice {
                 "DocumentFileName",
                 &self.document_file_name().unwrap_or_default(),
             );
-            x.base64(&BASE64.encode(&pdf.bytes), pdf.bytes.len(), embed_pdf);
+            x.base64(&pdf.bytes, embed_pdf);
         }
 
         let c = &self.contact;

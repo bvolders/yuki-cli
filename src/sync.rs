@@ -107,6 +107,32 @@ impl Entry {
     }
 }
 
+/// A file another command put in Yuki (or may have), which `upload dir`
+/// records as such and never uploads: `status` is `AlreadyInYuki` or
+/// `Pending`, `note` says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub status: Status,
+    pub note: String,
+}
+
+/// The record of `hash`, a file of `size` bytes at `rel`, as `status`
+/// with `note`: the existing record updated (see [`Entry::update`]), or a
+/// fresh one.
+pub fn record(
+    state: &State,
+    hash: &str,
+    rel: &str,
+    size: u64,
+    status: Status,
+    note: String,
+) -> Entry {
+    Entry {
+        note: Some(note),
+        ..Entry::update(state, hash, rel, size, status)
+    }
+}
+
 /// The whole state file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct State {

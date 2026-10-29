@@ -359,7 +359,7 @@ pub fn generate() -> Value {
                     {"name": "--due-date", "type": "string", "required": false, "description": "Due date, YYYY-MM-DD."},
                     {"name": "--total", "type": "number", "required": true, "description": "Total including VAT, up to 2 decimals."},
                     {"name": "--vat-amount", "type": "number", "required": true, "description": "VAT amount, up to 2 decimals."},
-                    {"name": "--payment-method", "type": "string", "required": true, "enum": ["transfer", "direct-debit", "cash", "debit-card", "credit-card", "received-electronically", "received-cash", "to-settle", "paid-by-employee"], "description": "How the invoice is paid; transfer needs --iban."},
+                    {"name": "--payment-method", "type": "string", "required": true, "enum": crate::cli::purchase_invoice::PaymentMethod::names(), "description": "How the invoice is paid; transfer needs --iban."},
                     {"name": "--subject", "type": "string", "required": false, "description": "Title of the invoice."},
                     {"name": "--remarks", "type": "string", "required": false, "description": "Notes kept with the invoice."},
                     {"name": "--gl-account", "type": "string", "required": false, "description": "GL account of the single line."},

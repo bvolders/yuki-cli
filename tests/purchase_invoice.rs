@@ -304,10 +304,10 @@ fn a_confirmed_booking_is_written_ahead_settled_and_recorded_for_upload_dir() {
         .iter()
         .position(|a| a == "ProcessPurchaseInvoices")
         .unwrap();
-    // The purchase service authenticates on its own, with the key alone.
-    assert_eq!(calls[process_at - 1], "Authenticate");
-    let requests = log.lock().unwrap().clone();
-    assert!(requests[process_at - 1].path.ends_with("/Purchase.asmx"));
+    // One session for the run, opened with the key alone, before anything else.
+    assert_eq!(calls[0], "Authenticate");
+    assert_eq!(calls.iter().filter(|a| *a == "Authenticate").count(), 1);
+    assert!(process_at > 0);
     let body = &bodies(&log, "ProcessPurchaseInvoices")[0];
     for fragment in [
         "<yuki:sessionId>session-1</yuki:sessionId>",
@@ -646,8 +646,10 @@ fn a_configured_api_client_authenticates_with_authenticate_client() {
         bodies(&log, "ProcessPurchaseInvoices")[0]
             .contains("<yuki:sessionId>session-2</yuki:sessionId>")
     );
-    // The checks keep the plain key: only the purchase service changes.
-    assert_eq!(bodies(&log, "Authenticate").len(), 1);
+    // One session, as the API client, for the checks and the booking.
+    assert!(bodies(&log, "Authenticate").is_empty());
+    assert_eq!(bodies(&log, "AuthenticateClient").len(), 1);
+    assert!(bodies(&log, "ActiveVATCodesList")[0].contains("session-2"));
     let printed = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
     assert!(!printed.contains("s3cret-value"), "{printed}");
 

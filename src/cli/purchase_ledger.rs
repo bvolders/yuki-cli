@@ -28,7 +28,7 @@ use crate::cli::keys::{contact_key, reference_key};
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::ledger::{Ledger, LedgerFormat};
-use crate::sync::now_utc;
+use crate::sync::{Held, Status as SyncStatus, now_utc};
 
 /// What happened to a purchase invoice sent to Yuki.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +103,27 @@ impl Entry {
     fn same_reference(&self, reference: &str) -> bool {
         let key = reference_key(reference);
         !key.is_empty() && reference_key(&self.reference) == key
+    }
+
+    /// How `upload dir` records the PDF of an entry that holds it.
+    fn held(&self) -> Held {
+        let what = format!(
+            "purchase invoice {} from {} ({})",
+            self.reference, self.contact, self.file
+        );
+        match self.status {
+            Status::Booked => Held {
+                status: SyncStatus::AlreadyInYuki,
+                note: format!("booked by `yuki purchase book` as {what}: in Yuki, not uploaded"),
+            },
+            _ => Held {
+                status: SyncStatus::Pending,
+                note: format!(
+                    "sent by `yuki purchase book` as {what}, outcome unknown: not uploaded; settle it with `yuki purchase bookings --resolve {}`",
+                    self.reference
+                ),
+            },
+        }
     }
 
     /// One line naming the invoice, for messages.
@@ -190,31 +211,21 @@ impl PurchaseLedger {
         for entry in held {
             let supplier = entry.same_supplier(&claim.contact, claim.contact_code.as_deref());
             let reference = entry.same_reference(&claim.reference);
-            let date = entry.date == claim.date;
-            let total = entry.total == claim.total;
-            let alike = [supplier, reference, date, total]
-                .iter()
-                .filter(|m| **m)
-                .count();
+            let marks = [
+                (supplier, "supplier"),
+                (reference, "reference"),
+                (entry.date == claim.date, "date"),
+                (entry.total == claim.total, "total"),
+            ];
+            let alike: Vec<&str> = marks.iter().filter(|(m, _)| *m).map(|(_, w)| *w).collect();
             let why = if entry.hash == claim.hash {
                 "this PDF".to_string()
             } else if reference && supplier {
                 "this supplier's reference".to_string()
-            } else if alike >= 3 && !allow_duplicate {
-                let mut same = Vec::new();
-                for (matched, what) in [
-                    (supplier, "supplier"),
-                    (reference, "reference"),
-                    (date, "date"),
-                    (total, "total"),
-                ] {
-                    if matched {
-                        same.push(what);
-                    }
-                }
+            } else if alike.len() >= 3 && !allow_duplicate {
                 format!(
                     "an invoice with the same {} (pass --allow-duplicate if it really is another invoice)",
-                    same.join(", ")
+                    alike.join(", ")
                 )
             } else {
                 continue;
@@ -256,19 +267,28 @@ impl PurchaseLedger {
         Ok(self.file.save()?)
     }
 
-    /// Settle the pending entry for the PDF `hash` as `to`, with `note`.
-    pub fn settle(&mut self, hash: &str, to: Status, note: Option<&str>) -> Result<(), YukiError> {
+    /// This administration's latest pending entry for the PDF `hash`.
+    fn pending_mut(&mut self, hash: &str) -> Option<&mut Entry> {
         let admin = &self.admin;
-        let entry = self
-            .file
+        self.file
             .state_mut()
             .entries
             .iter_mut()
             .rev()
             .find(|e| e.admin == *admin && e.status == Status::Pending && e.hash == hash)
-            .ok_or_else(|| {
-                YukiError::NotFound("no pending purchase invoice for this PDF".into())
-            })?;
+    }
+
+    /// Settle the pending entry for the PDF `hash` as `to`, with `note`;
+    /// returns it as settled.
+    pub fn settle(
+        &mut self,
+        hash: &str,
+        to: Status,
+        note: Option<&str>,
+    ) -> Result<Entry, YukiError> {
+        let entry = self.pending_mut(hash).ok_or_else(|| {
+            YukiError::NotFound("no pending purchase invoice for this PDF".into())
+        })?;
         entry.status = to;
         if to == Status::Booked {
             entry.booked_at = Some(now_utc());
@@ -276,20 +296,14 @@ impl PurchaseLedger {
         if let Some(note) = note {
             entry.note = Some(note.to_string());
         }
-        self.file.save()
+        let settled = entry.clone();
+        self.file.save()?;
+        Ok(settled)
     }
 
     /// Note on the pending entry for `hash`, leaving it pending.
     pub fn note(&mut self, hash: &str, note: &str) -> Result<(), YukiError> {
-        let admin = &self.admin;
-        if let Some(entry) = self
-            .file
-            .state_mut()
-            .entries
-            .iter_mut()
-            .rev()
-            .find(|e| e.admin == *admin && e.status == Status::Pending && e.hash == hash)
-        {
+        if let Some(entry) = self.pending_mut(hash) {
             entry.note = Some(note.to_string());
         }
         self.file.save()
@@ -330,32 +344,25 @@ impl PurchaseLedger {
             Resolution::Booked => (Status::Booked, "resolved by hand as booked"),
             Resolution::Rejected => (Status::Rejected, "resolved by hand as not in Yuki"),
         };
-        self.settle(&hash, to, Some(note))?;
-        let settled = self
-            .entries()
-            .filter(|e| e.hash == hash)
-            .last()
-            .cloned()
-            .expect("the entry just settled");
-        Ok(settled)
+        Ok(self.settle(&hash, to, Some(note))?)
     }
 }
 
 /// Every PDF the ledger still holds (booked or pending), in any
-/// administration, by hash: `upload dir` never uploads one.
-pub fn held_pdfs() -> Result<HashMap<String, Entry>, YukiError> {
+/// administration, by hash, as `upload dir` records it: never uploaded.
+pub fn held_pdfs() -> Result<HashMap<String, Held>, YukiError> {
     held_pdfs_at(&ledger_path())
 }
 
 /// [`held_pdfs`] of the ledger at `path`.
-pub fn held_pdfs_at(path: &Path) -> Result<HashMap<String, Entry>, YukiError> {
+pub fn held_pdfs_at(path: &Path) -> Result<HashMap<String, Held>, YukiError> {
     let file = Ledger::<Bookings>::peek(path)?;
     Ok(file
         .state()
         .entries
         .iter()
         .filter(|e| e.holds())
-        .map(|e| (e.hash.clone(), e.clone()))
+        .map(|e| (e.hash.clone(), e.held()))
         .collect())
 }
 

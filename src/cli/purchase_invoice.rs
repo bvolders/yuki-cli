@@ -11,30 +11,33 @@
 //! second booking is refused rather than undone. [`book`] previews, asks
 //! and sends; nothing else contacts Yuki with a write.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use clap::ValueEnum as _;
 
 use crate::cli::contacts::{yes_no, yes_no_unknown};
-use crate::cli::invoice_common::{InvoiceError, Pdf, xml_text};
+use crate::cli::invoice_common::{InvoiceError, Pdf, classify, parse_date, rejection, xml_text};
 use crate::cli::invoice_ledger::Resolution;
 use crate::cli::keys::{contact_key, reference_key};
 use crate::cli::purchase_ledger::{Claim, PurchaseLedger, Status as LedgerStatus};
 use crate::cli::xml_doc::{XmlWriter, bool_text};
+use crate::cli::{PurchaseCommands, ask_yes_no, can_prompt};
+use crate::client::accounting::AccountingClient;
 use crate::client::accounting_info::AccountingInfoClient;
 use crate::client::archive::{ALL_DATES, ArchiveClient, ArchiveDocument};
 use crate::client::contact::{Contact, ContactClient};
 use crate::client::purchase::{PurchaseClient, PurchaseInvoicesImport};
 use crate::client::vat::{VatClient, VatCode};
 use crate::config::{ApiClient, Config, Target};
-use crate::error::{Delivery, YukiError};
-use crate::ledger::Ledger;
+use crate::error::YukiError;
+use crate::ledger::{Ledger, WriteAhead};
 use crate::money::Cents;
 use crate::output::{format_table, human_size, print_table};
 use crate::period::{days_between, shift_date};
-use crate::sync::{self, Entry as SyncEntry, State as SyncState, Status as SyncStatus};
+use crate::sync::{self, State as SyncState, Status as SyncStatus};
 
 /// Namespace of the `PurchaseInvoices` document; Yuki rejects one without it.
 pub const NAMESPACE: &str = "urn:xmlns:http://www.theyukicompany.com:purchaseinvoices";
@@ -44,15 +47,16 @@ const AMOUNT_MAX: i64 = 10_i64.pow(12);
 const FILE_NAME_MIN: usize = 5;
 
 /// How long `--resolve` waits for a running `upload dir` to release the sync state.
-const SYNC_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+const SYNC_PATIENCE: Duration = Duration::from_secs(5);
 
 /// Where to ask for an API client when Yuki refuses the access key alone.
 pub const CLIENT_HINT: &str = "If Yuki refuses purchase invoices for this access key, ask Yuki support (support.accounting@nmbrs.com) for an API Client ID and Client Secret, and set client_id and client_secret in the config (or YUKI_CLIENT_ID and YUKI_CLIENT_SECRET)";
 
 /// `PaymentMethod`: how the invoice is (to be) paid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum PaymentMethod {
     /// ElectronicTransfer: you pay it by bank transfer (Yuki's default).
+    #[default]
     Transfer,
     /// DirectCollection: the supplier collects it by direct debit.
     DirectDebit,
@@ -74,19 +78,6 @@ pub enum PaymentMethod {
 }
 
 impl PaymentMethod {
-    /// The names `--payment-method` takes.
-    pub const NAMES: &[&str] = &[
-        "transfer",
-        "direct-debit",
-        "cash",
-        "debit-card",
-        "credit-card",
-        "received-electronically",
-        "received-cash",
-        "to-settle",
-        "paid-by-employee",
-    ];
-
     /// The value as the XSD spells it.
     pub fn xsd(self) -> &'static str {
         match self {
@@ -101,9 +92,18 @@ impl PaymentMethod {
             Self::PaidByEmployee => "PaidByEmployee",
         }
     }
+
+    /// The names `--payment-method` takes, as clap lists them.
+    pub fn names() -> Vec<String> {
+        Self::value_variants()
+            .iter()
+            .filter_map(|v| v.to_possible_value())
+            .map(|v| v.get_name().to_string())
+            .collect()
+    }
 }
 
-/// One invoice line as `--line` gives it.
+/// One invoice line, as `--line` gives it, or the single-line shortcut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineArg {
     pub description: Option<String>,
@@ -111,6 +111,7 @@ pub struct LineArg {
     /// Excluding VAT.
     pub amount: Cents,
     pub vat_type: i64,
+    /// Once checked against the active VAT codes, as Yuki spells it.
     pub vat_description: String,
 }
 
@@ -143,42 +144,129 @@ pub fn parse_line(text: &str) -> Result<LineArg, String> {
     })
 }
 
-/// What `purchase book` was asked.
-#[derive(Debug, Clone, Default)]
+/// What `purchase book` is asked: its flags.
+#[derive(Debug, Clone, Default, clap::Args)]
 pub struct BookArgs {
+    /// The supplier's invoice PDF (max 3 MB); Yuki stores it under this file name.
+    #[arg(value_name = "FILE")]
     pub file: PathBuf,
-    pub contact: String,
+
+    /// Supplier name. Looked up in Yuki's contacts (case, punctuation and
+    /// legal form aside): an existing one is matched by its name as Yuki
+    /// has it, otherwise Yuki creates the supplier (needs --country).
+    #[arg(long, value_name = "NAME", required_unless_present = "contact_code")]
+    pub contact: Option<String>,
+
+    /// Supplier's contact code in Yuki, which must exist: only the code (and
+    /// --iban) is sent, because Yuki overwrites a contact matched by code
+    /// with everything sent.
+    #[arg(long, value_name = "CODE")]
     pub contact_code: Option<String>,
+
+    /// Country (ISO 3166-1 alpha-2) of a supplier Yuki has to create.
+    #[arg(long, value_name = "CC", conflicts_with = "contact_code")]
     pub country: Option<String>,
+
+    /// VAT number of a supplier Yuki has to create.
+    #[arg(long, value_name = "VAT", conflicts_with = "contact_code")]
     pub vat_number: Option<String>,
-    pub iban: Option<String>,
-    pub reference: String,
-    pub date: String,
-    pub due_date: Option<String>,
-    pub total: Cents,
-    pub vat: Cents,
-    pub payment_method: Option<PaymentMethod>,
-    pub subject: Option<String>,
-    pub remarks: Option<String>,
-    /// The single-line shortcut; the line amount is total − VAT.
-    pub gl_account: Option<String>,
-    pub vat_type: Option<i64>,
-    pub vat_description: Option<String>,
-    pub description: Option<String>,
-    /// `--line`, instead of the shortcut.
-    pub lines: Vec<LineArg>,
-    /// Mark it processed instead of leaving a proposal.
-    pub process: bool,
-    pub dry_run: bool,
-    /// The reference, repeated, for a booking without a prompt.
-    pub confirm: Option<String>,
-    /// Book even when the archive holds a document that looks like it.
-    pub allow_archive_match: bool,
-    /// Book even when the ledger holds an invoice with three of the same
-    /// supplier, reference, date and total.
-    pub allow_duplicate: bool,
-    /// A supplier Yuki creates is a person, not a company.
+
+    /// A supplier Yuki has to create is a person (default: a company).
+    #[arg(long, conflicts_with = "contact_code")]
     pub person: bool,
+
+    /// The supplier's IBAN, added to the contact; required with
+    /// --payment-method transfer.
+    #[arg(long, value_name = "IBAN")]
+    pub iban: Option<String>,
+
+    /// The supplier's invoice number (Reference).
+    #[arg(long, value_name = "REF")]
+    pub reference: String,
+
+    /// Invoice date, YYYY-MM-DD.
+    #[arg(long, value_parser = parse_date)]
+    pub date: String,
+
+    /// Due date, YYYY-MM-DD. Default: the supplier's term in Yuki.
+    #[arg(long, value_parser = parse_date)]
+    pub due_date: Option<String>,
+
+    /// Total including VAT, e.g. 121.00.
+    #[arg(long, value_name = "AMOUNT", value_parser = Cents::parse_exact)]
+    pub total: Cents,
+
+    /// VAT amount on the invoice, e.g. 21.00 (0 for none).
+    #[arg(long = "vat-amount", alias = "vat", value_name = "AMOUNT", value_parser = Cents::parse_exact)]
+    pub vat: Cents,
+
+    /// How the invoice is paid; transfer needs --iban.
+    #[arg(long, value_enum)]
+    pub payment_method: PaymentMethod,
+
+    /// Title of the invoice. Default: Yuki's "Invoice from <supplier>, <GL accounts>".
+    #[arg(long)]
+    pub subject: Option<String>,
+
+    /// Notes kept with the invoice.
+    #[arg(long)]
+    pub remarks: Option<String>,
+
+    /// GL account of the single line, e.g. 612000.
+    #[arg(long, alias = "gl", value_name = "CODE", conflicts_with = "lines")]
+    pub gl_account: Option<String>,
+
+    /// Yuki's VAT type number of the single line (`yuki vat codes`).
+    #[arg(
+        long,
+        alias = "vat-code",
+        value_name = "TYPE",
+        conflicts_with = "lines"
+    )]
+    pub vat_type: Option<i64>,
+
+    /// The VAT code's description, which with the type picks one code,
+    /// e.g. "VAT 21%".
+    #[arg(
+        long,
+        alias = "vat-desc",
+        value_name = "TEXT",
+        conflicts_with = "lines"
+    )]
+    pub vat_description: Option<String>,
+
+    /// Description of the single line. Default: the subject.
+    #[arg(long, conflicts_with = "lines")]
+    pub description: Option<String>,
+
+    /// One line, repeatable: "description;gl_account;amount_excl_vat;vat_type;vat_description"
+    /// (the description may be empty).
+    #[arg(long = "line", value_name = "LINE", value_parser = parse_line)]
+    pub lines: Vec<LineArg>,
+
+    /// Mark the invoice processed instead of leaving a proposal.
+    #[arg(long)]
+    pub process: bool,
+
+    /// Check (reading Yuki only), print the preview and the xmlDoc; send nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// The reference, repeated: required with --yes, so an unattended
+    /// run books only the invoice it meant to.
+    #[arg(long, value_name = "REF")]
+    pub confirm: Option<String>,
+
+    /// Book even though the Yuki archive holds a document with the same
+    /// file name, or the same reference from the same supplier.
+    #[arg(long)]
+    pub allow_archive_match: bool,
+
+    /// Book even though the ledger holds an invoice with three of the same
+    /// supplier, reference, invoice date and total (Yuki's duplicate rule).
+    /// The same PDF, or the same supplier's reference, is always refused.
+    #[arg(long)]
+    pub allow_duplicate: bool,
 }
 
 /// The supplier: matched by `code`, else by `name`, else created from the
@@ -197,12 +285,12 @@ pub struct Supplier {
 }
 
 /// What Yuki's contacts say about the supplier, read by [`verify`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Match {
     /// Not looked up (yet).
     Unchecked,
     /// An existing contact, found by its code or by its name.
-    Existing { by_code: bool },
+    Existing,
     /// No such contact: Yuki creates it from what is sent.
     New,
 }
@@ -224,23 +312,8 @@ impl Supplier {
 
     /// Whether Yuki is to create the contact.
     fn is_new(&self) -> bool {
-        match self.matched {
-            Match::New => true,
-            Match::Existing { .. } => false,
-            Match::Unchecked => self.code.is_none(),
-        }
+        self.matched == Match::New || (self.matched == Match::Unchecked && !self.by_code())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Line {
-    pub description: Option<String>,
-    pub gl_account: String,
-    /// Excluding VAT.
-    pub amount: Cents,
-    pub vat_type: i64,
-    /// As Yuki lists it once checked against the active VAT codes.
-    pub vat_description: String,
 }
 
 /// A validated purchase invoice and its PDF.
@@ -257,11 +330,11 @@ pub struct PurchaseInvoice {
     /// Including VAT.
     pub total: Cents,
     pub vat: Cents,
-    pub payment_method: Option<PaymentMethod>,
+    pub payment_method: PaymentMethod,
     pub subject: Option<String>,
     pub remarks: Option<String>,
     pub supplier: Supplier,
-    pub lines: Vec<Line>,
+    pub lines: Vec<LineArg>,
     pub process: bool,
     /// What the checks against Yuki found worth saying, for the preview.
     pub notes: Vec<String>,
@@ -299,7 +372,7 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
         String::new()
     });
     let code = xml_text("--contact-code", args.contact_code.as_deref(), &mut p);
-    let name = xml_text("--contact", Some(&args.contact), &mut p).unwrap_or_else(|| {
+    let name = xml_text("--contact", args.contact.as_deref(), &mut p).unwrap_or_else(|| {
         if code.is_none() {
             p.push("--contact (the supplier's name) is empty: give it, or --contact-code".into());
         }
@@ -320,15 +393,10 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
     {
         p.push(format!("--iban {i}: {why}"));
     }
-    match args.payment_method {
-        None => p.push(format!(
-            "--payment-method is required: one of {}",
-            PaymentMethod::NAMES.join(", ")
-        )),
-        Some(PaymentMethod::Transfer) if iban.is_none() => p.push(
+    if args.payment_method == PaymentMethod::Transfer && iban.is_none() {
+        p.push(
             "--payment-method transfer needs --iban: Yuki requires the supplier's bank account to pay by transfer".into(),
-        ),
-        Some(_) => {}
+        );
     }
     let supplier = Supplier {
         name,
@@ -371,26 +439,17 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
         args.vat_description.is_some(),
         args.description.is_some(),
     ];
-    let lines: Vec<Line> = if !args.lines.is_empty() {
+    let lines: Vec<LineArg> = if !args.lines.is_empty() {
         if shortcut.iter().any(|given| *given) {
             p.push("give the lines with --line, or one line with --gl-account, --vat-type and --vat-description; not both".into());
         }
-        args.lines
-            .iter()
-            .map(|l| Line {
-                description: l.description.clone(),
-                gl_account: l.gl_account.clone(),
-                amount: l.amount,
-                vat_type: l.vat_type,
-                vat_description: l.vat_description.clone(),
-            })
-            .collect()
+        args.lines.clone()
     } else {
         let gl = xml_text("--gl-account", args.gl_account.as_deref(), &mut p);
         let vat_description =
             xml_text("--vat-description", args.vat_description.as_deref(), &mut p);
         match (gl, args.vat_type, vat_description) {
-            (Some(gl_account), Some(vat_type), Some(vat_description)) => vec![Line {
+            (Some(gl_account), Some(vat_type), Some(vat_description)) => vec![LineArg {
                 description: xml_text("--description", args.description.as_deref(), &mut p),
                 gl_account,
                 amount: Cents(args.total.0 - args.vat.0),
@@ -523,16 +582,10 @@ impl PurchaseInvoice {
         x.leaf("InvoiceVATAmount", &self.vat.to_string());
         x.leaf("Currency", "EUR");
         x.opt("Subject", &self.subject);
-        if let Some(method) = self.payment_method {
-            x.leaf("PaymentMethod", method.xsd());
-        }
+        x.leaf("PaymentMethod", self.payment_method.xsd());
         x.opt("Remarks", &self.remarks);
         x.leaf("DocumentFileName", &self.pdf.name);
-        x.base64(
-            &BASE64.encode(&self.pdf.bytes),
-            self.pdf.bytes.len(),
-            embed_pdf,
-        );
+        x.base64(&self.pdf.bytes, embed_pdf);
 
         // Yuki overwrites a contact it matches with every element sent, so
         // an existing one gets its code (or exactly its name) and the bank
@@ -655,9 +708,7 @@ impl PurchaseInvoice {
             .as_deref()
             .unwrap_or("the supplier's default term");
         row("Date", &format!("{}, due {due}", self.date));
-        if let Some(method) = self.payment_method {
-            row("Payment", method.xsd());
-        }
+        row("Payment", self.payment_method.xsd());
         if let Some(subject) = &self.subject {
             row("Subject", subject);
         }
@@ -696,6 +747,140 @@ impl PurchaseInvoice {
             let _ = write!(out, "\n  note: {note}");
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One session.
+
+/// The run's one Yuki session, opened as the API client when one is
+/// configured, else with the access key alone (`plain`), on the target's
+/// domain; every service client is built on it.
+pub struct Session {
+    api_root: String,
+    id: String,
+    /// Opened with the access key alone: a refusal hints at an API client.
+    plain: bool,
+}
+
+impl Session {
+    /// Authenticate once and select the target's domain.
+    pub async fn open(
+        target: &Target<'_>,
+        api_client: Option<&ApiClient>,
+    ) -> Result<Self, YukiError> {
+        let plain = api_client.is_none();
+        let id = match api_client {
+            Some(c) => {
+                PurchaseClient::new()
+                    .with_api_root(target.api_root)
+                    .authenticate_client(&c.id, &c.secret, target.api_key)
+                    .await
+            }
+            None => {
+                AccountingClient::new()
+                    .with_api_root(target.api_root)
+                    .authenticate(target.api_key)
+                    .await
+            }
+        }
+        .map_err(|e| hint(e, plain))?;
+        AccountingClient::new()
+            .with_api_root(target.api_root)
+            .with_session(&id)
+            .set_current_domain(target.domain_id)
+            .await?;
+        Ok(Self {
+            api_root: target.api_root.to_string(),
+            id,
+            plain,
+        })
+    }
+
+    fn vat(&self) -> VatClient {
+        VatClient::new()
+            .with_api_root(&self.api_root)
+            .with_session(&self.id)
+    }
+
+    fn accounting_info(&self) -> AccountingInfoClient {
+        AccountingInfoClient::new()
+            .with_api_root(&self.api_root)
+            .with_session(&self.id)
+    }
+
+    fn contacts(&self) -> ContactClient {
+        ContactClient::new()
+            .with_api_root(&self.api_root)
+            .with_session(&self.id)
+    }
+
+    fn archive(&self) -> ArchiveClient {
+        ArchiveClient::new()
+            .with_api_root(&self.api_root)
+            .with_session(&self.id)
+    }
+
+    fn purchase(&self) -> PurchaseClient {
+        PurchaseClient::new()
+            .with_api_root(&self.api_root)
+            .with_session(&self.id)
+    }
+}
+
+/// Whether `message` reads like Yuki refusing the access key or the client.
+fn sounds_unauthorized(message: &str) -> bool {
+    let m = message.to_lowercase();
+    [
+        "auth",
+        "client",
+        "permission",
+        "not allowed",
+        "access",
+        "rights",
+        "denied",
+    ]
+    .iter()
+    .any(|w| m.contains(w))
+}
+
+/// `message` with [`CLIENT_HINT`] when it reads like a refusal of the
+/// access key alone (`plain`).
+fn hint_text(message: String, plain: bool) -> String {
+    if plain && sounds_unauthorized(&message) {
+        format!("{message}. {CLIENT_HINT}")
+    } else {
+        message
+    }
+}
+
+/// A Yuki error with [`CLIENT_HINT`] when the session was opened with the
+/// access key alone (`plain`) and the error is, or reads like, a refusal.
+fn hint(e: YukiError, plain: bool) -> YukiError {
+    if !plain {
+        return e;
+    }
+    match e {
+        YukiError::AuthFailed(m) => YukiError::AuthFailed(format!("{m}. {CLIENT_HINT}")),
+        YukiError::Unauthorized(code) => {
+            YukiError::AuthFailed(format!("HTTP {code}. {CLIENT_HINT}"))
+        }
+        e @ (YukiError::SoapFault { .. } | YukiError::Http { .. })
+            if sounds_unauthorized(&e.to_string()) =>
+        {
+            match e {
+                YukiError::SoapFault { code, message } => YukiError::SoapFault {
+                    code,
+                    message: format!("{message}. {CLIENT_HINT}"),
+                },
+                YukiError::Http { status, body } => YukiError::Http {
+                    status,
+                    body: format!("{body}. {CLIENT_HINT}"),
+                },
+                other => other,
+            }
+        }
+        other => other,
     }
 }
 
@@ -784,7 +969,7 @@ fn file_key(name: &str) -> String {
 fn archive_matches(invoice: &PurchaseInvoice, docs: &[ArchiveDocument]) -> Vec<String> {
     let name = file_key(&invoice.pdf.name);
     let reference = reference_key(&invoice.reference);
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     docs.iter()
         .filter(|d| seen.insert(d.id.clone()))
         .filter_map(|d| {
@@ -829,14 +1014,13 @@ async fn archive_candidates(
     let shift = |days| shift_date(&invoice.date, days).unwrap_or_else(|| invoice.date.clone());
     let (from, to) = (shift(-WINDOW_DAYS), shift(WINDOW_DAYS));
     let by_supplier = async {
-        match invoice.supplier.matched {
-            Match::Existing { .. } => {
-                let text = contact_key(&invoice.supplier.name);
-                archive
-                    .search_documents(&text, ALL_DATES.0, ALL_DATES.1)
-                    .await
-            }
-            _ => Ok(Vec::new()),
+        if invoice.supplier.matched == Match::Existing {
+            let text = contact_key(&invoice.supplier.name);
+            archive
+                .search_documents(&text, ALL_DATES.0, ALL_DATES.1)
+                .await
+        } else {
+            Ok(Vec::new())
         }
     };
     let (by_supplier, around) = tokio::join!(by_supplier, archive.search_documents("", &from, &to));
@@ -851,40 +1035,35 @@ fn vat_code<'a>(
     description: &str,
 ) -> Result<&'a VatCode, String> {
     let wanted = vat_type.to_string();
-    let same_type: Vec<&VatCode> = codes.iter().filter(|c| c.code.trim() == wanted).collect();
-    if let Some(code) = same_type.iter().find(|c| {
+    let same_desc = |c: &VatCode| {
         c.description
             .trim()
             .eq_ignore_ascii_case(description.trim())
-    }) {
+    };
+    let same_type: Vec<&VatCode> = codes.iter().filter(|c| c.code.trim() == wanted).collect();
+    if let Some(code) = same_type.iter().find(|c| same_desc(c)) {
         return Ok(code);
     }
-    let quote = |v: Vec<String>| v.join(", ");
-    let by_description: Vec<String> = codes
+    let by_description: Vec<&str> = codes
         .iter()
-        .filter(|c| {
-            c.description
-                .trim()
-                .eq_ignore_ascii_case(description.trim())
-        })
-        .map(|c| c.code.clone())
+        .filter(|c| same_desc(c))
+        .map(|c| c.code.as_str())
         .collect();
     let mut why =
         format!("VAT type {vat_type} with description '{description}' is not an active VAT code");
     if !same_type.is_empty() {
-        let _ = write!(
-            why,
-            "; type {vat_type} is: {}",
-            quote(
-                same_type
-                    .iter()
-                    .map(|c| format!("'{}'", c.description))
-                    .collect()
-            )
-        );
+        let listed: Vec<String> = same_type
+            .iter()
+            .map(|c| format!("'{}'", c.description))
+            .collect();
+        let _ = write!(why, "; type {vat_type} is: {}", listed.join(", "));
     }
     if !by_description.is_empty() {
-        let _ = write!(why, "; '{description}' is type {}", quote(by_description));
+        let _ = write!(
+            why,
+            "; '{description}' is type {}",
+            by_description.join(", ")
+        );
     }
     why.push_str(" (see `yuki vat codes`)");
     Err(why)
@@ -914,7 +1093,7 @@ fn match_supplier(
                     ));
                 }
                 s.name = one.name.trim().to_string();
-                s.matched = Match::Existing { by_code: true };
+                s.matched = Match::Existing;
             }
             [] => problems.push(format!(
                 "no contact has code {code} in Yuki (see `yuki contacts search <name>`)"
@@ -961,7 +1140,7 @@ fn match_supplier(
                 ));
             }
             s.name = contact.name.trim().to_string();
-            s.matched = Match::Existing { by_code: false };
+            s.matched = Match::Existing;
         }
         None => {
             s.matched = Match::New;
@@ -1009,29 +1188,16 @@ fn check_vat_amount(invoice: &mut PurchaseInvoice, problems: &mut Vec<String>) {
     }
 }
 
-/// Check the invoice against Yuki, reading only: the VAT code pairs (and
-/// take Yuki's spelling of each description), the GL accounts, and the
-/// archive. Opens one session on the accounting service and shares it.
+/// Check the invoice against Yuki, reading only, on `session`: the VAT code
+/// pairs (and take Yuki's spelling of each description), the GL accounts,
+/// the supplier, and the archive.
 pub async fn verify(
-    config: &Config,
-    admin: Option<&str>,
+    session: &Session,
+    target: &Target<'_>,
     invoice: &mut PurchaseInvoice,
     allow_archive_match: bool,
 ) -> Result<(), InvoiceError> {
-    let (accounting, archive, target) = crate::cli::setup_archive(config, admin).await?;
-    let session = accounting
-        .session_id()
-        .map(str::to_string)
-        .ok_or_else(|| YukiError::AuthFailed("no session after authenticating".into()))?;
-    let vat = VatClient::new()
-        .with_api_root(target.api_root)
-        .with_session(&session);
-    let info = AccountingInfoClient::new()
-        .with_api_root(target.api_root)
-        .with_session(&session);
-    let contacts = ContactClient::new()
-        .with_api_root(target.api_root)
-        .with_session(&session);
+    let (vat, info, contacts) = (session.vat(), session.accounting_info(), session.contacts());
     let (option, value) = match &invoice.supplier.code {
         Some(code) => ("Code", code.clone()),
         // Without the legal form, so `Leverancier BV` finds `Leverancier B.V.`.
@@ -1072,7 +1238,7 @@ pub async fn verify(
         )));
     }
     // The supplier is known now: search the archive by it.
-    let docs = archive_candidates(&archive, invoice).await?;
+    let docs = archive_candidates(&session.archive(), invoice).await?;
     let matches = archive_matches(invoice, &docs);
     if !matches.is_empty() {
         let listed = matches.join("\n  - ");
@@ -1110,44 +1276,6 @@ pub fn check_confirm(
     }
 }
 
-/// Whether `message` reads like Yuki refusing the access key or the client.
-fn sounds_unauthorized(message: &str) -> bool {
-    let m = message.to_lowercase();
-    [
-        "auth",
-        "client",
-        "permission",
-        "not allowed",
-        "access",
-        "rights",
-        "denied",
-    ]
-    .iter()
-    .any(|w| m.contains(w))
-}
-
-/// [`CLIENT_HINT`] appended to `message` when Yuki was asked with the access
-/// key alone and the message reads like a refusal.
-fn with_hint(message: String, plain: bool) -> String {
-    if plain && sounds_unauthorized(&message) {
-        format!("{message}. {CLIENT_HINT}")
-    } else {
-        message
-    }
-}
-
-/// A Yuki error, with [`CLIENT_HINT`] when it is an authentication failure
-/// under the access key alone.
-fn hinted(e: YukiError, plain: bool) -> YukiError {
-    match e {
-        YukiError::AuthFailed(m) if plain => YukiError::AuthFailed(format!("{m}. {CLIENT_HINT}")),
-        YukiError::Unauthorized(code) if plain => {
-            YukiError::AuthFailed(format!("HTTP {code}. {CLIENT_HINT}"))
-        }
-        other => other,
-    }
-}
-
 /// What Yuki's answer means for the invoice it was sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -1161,12 +1289,8 @@ pub enum Verdict {
 
 /// Judge Yuki's `import` of `invoice`.
 pub fn verdict(import: &PurchaseInvoicesImport, invoice: &PurchaseInvoice) -> Verdict {
-    if let Some(failure) = import.failure() {
-        let freed = import.nothing_created();
-        return Verdict::Rejected {
-            message: failure,
-            freed,
-        };
+    if let Some((message, freed)) = rejection(import) {
+        return Verdict::Rejected { message, freed };
     }
     let mut note = None;
     for booked in &import.invoices {
@@ -1217,180 +1341,201 @@ fn print_import(import: &PurchaseInvoicesImport, invoice: &PurchaseInvoice, form
     print_table(format, &headers, &rows);
 }
 
-/// The sync record of a PDF being booked.
+/// The sync record of a PDF being booked (`Pending`) or booked.
 fn sync_entry(
     state: &SyncState,
     spot: &SyncSpot,
     invoice: &PurchaseInvoice,
     status: SyncStatus,
-) -> SyncEntry {
+) -> sync::Entry {
     let what = format!(
         "purchase invoice {} from {}",
         invoice.reference, invoice.supplier.name
     );
-    let base = SyncEntry::update(
+    let note = match status {
+        SyncStatus::Pending => format!("being booked by `yuki purchase book` as {what}"),
+        _ => format!("booked by `yuki purchase book` as {what}"),
+    };
+    sync::record(
         state,
         &invoice.hash,
         &spot.rel,
         invoice.pdf.bytes.len() as u64,
         status,
-    );
-    SyncEntry {
-        note: Some(match status {
-            SyncStatus::Pending => format!("being booked by `yuki purchase book` as {what}"),
-            _ => format!("booked by `yuki purchase book` as {what}"),
-        }),
-        ..base
-    }
+        note,
+    )
 }
 
-/// Send the invoice: authenticate (as the API client when one is
-/// configured), write ahead (the sync state, locked until the end, and the
-/// purchase ledger, locked only to write), call `ProcessPurchaseInvoices`,
-/// and settle both by the answer.
-async fn submit(
+/// The governing sync state, locked from the write-ahead until the
+/// outcome is recorded, so `upload dir` cannot upload the PDF meanwhile.
+struct SyncAhead<'a> {
+    spot: &'a SyncSpot,
+    ledger: Ledger<SyncState>,
+    ahead: WriteAhead<SyncState>,
+}
+
+/// Write ahead: the PDF pending in the sync state (if one governs it),
+/// then in the purchase ledger (locked only to write); the first is undone
+/// when the second is refused.
+fn write_ahead<'a>(
     target: &Target<'_>,
     invoice: &PurchaseInvoice,
-    spot: Option<&SyncSpot>,
-    api_client: Option<&ApiClient>,
+    spot: Option<&'a SyncSpot>,
     allow_duplicate: bool,
-    format: Option<&str>,
-    quiet: bool,
-) -> Result<(), InvoiceError> {
-    let plain = api_client.is_none();
-    let mut client = PurchaseClient::new().with_api_root(target.api_root);
-    let auth = match api_client {
-        Some(c) => {
-            client
-                .authenticate_client(&c.id, &c.secret, target.api_key)
-                .await
-        }
-        None => client.authenticate(target.api_key).await,
-    };
-    auth.map_err(|e| InvoiceError::Yuki(hinted(e, plain)))?;
-
-    // Write ahead. The sync state stays locked until the outcome is
-    // recorded, so `upload dir` cannot upload the PDF meanwhile.
-    let mut sync_ledger = spot.map(|s| sync::open(&s.root)).transpose()?;
-    let sync_ahead = match (&mut sync_ledger, spot) {
-        (Some(ledger), Some(spot)) => {
+) -> Result<Option<SyncAhead<'a>>, InvoiceError> {
+    let mut sync_ahead = match spot {
+        Some(spot) => {
+            let mut ledger = sync::open(&spot.root)?;
             check_sync(ledger.state(), spot, &invoice.hash)?;
             let entry = sync_entry(ledger.state(), spot, invoice, SyncStatus::Pending);
             let hash = invoice.hash.clone();
-            Some(ledger.write_ahead(|s| {
+            let ahead = ledger.write_ahead(|s| {
                 s.files.insert(hash, entry);
-            })?)
+            })?;
+            Some(SyncAhead {
+                spot,
+                ledger,
+                ahead,
+            })
         }
-        _ => None,
+        None => None,
     };
     let claim = invoice.claim();
     if let Err(e) = PurchaseLedger::open(target.admin_id)
         .map_err(InvoiceError::from)
         .and_then(|mut l| l.send(&claim, allow_duplicate))
     {
-        if let (Some(ledger), Some(ahead)) = (&mut sync_ledger, sync_ahead) {
+        if let Some(SyncAhead {
+            mut ledger, ahead, ..
+        }) = sync_ahead.take()
+        {
             let _ = ledger.undo(ahead);
         }
         return Err(e);
     }
+    Ok(sync_ahead)
+}
 
-    let result = client
-        .process_purchase_invoices(target.admin_id, &invoice.to_xml())
-        .await;
-    if let Ok(import) = &result
-        && !quiet
-    {
-        print_import(import, invoice, format);
+/// How a sent invoice ends: its ledger status (booked, free again, or
+/// still pending), the note on it, and the run's result.
+struct Outcome {
+    status: LedgerStatus,
+    note: Option<String>,
+    result: Result<(), InvoiceError>,
+}
+
+/// Judge the import call's `result`; `resolve` says how to settle a
+/// pending invoice by hand.
+fn settle_outcome(
+    result: Result<PurchaseInvoicesImport, YukiError>,
+    invoice: &PurchaseInvoice,
+    plain: bool,
+    resolve: &str,
+) -> Outcome {
+    let outcome = |status, note: String, result| Outcome {
+        status,
+        note: Some(note),
+        result,
+    };
+    match result {
+        Err(e) => {
+            // Classified on the error as Yuki gave it; the hint only adds words.
+            let shown = hint_text(e.to_string(), plain);
+            let what_now =
+                format!("the purchase invoice may already be in Yuki. It stays pending: {resolve}");
+            match classify(e, &what_now) {
+                InvoiceError::Yuki(e) => outcome(
+                    LedgerStatus::Rejected,
+                    format!("nothing reached Yuki: {e}"),
+                    Err(InvoiceError::Yuki(hint(e, plain))),
+                ),
+                _ => outcome(
+                    LedgerStatus::Pending,
+                    format!("outcome unknown: {shown}"),
+                    Err(InvoiceError::OutcomeUnknown(format!("{shown}: {what_now}"))),
+                ),
+            }
+        }
+        Ok(import) => match verdict(&import, invoice) {
+            Verdict::Done(note) => {
+                if let Some(note) = &note {
+                    eprintln!("warning: {note}");
+                }
+                Outcome {
+                    status: LedgerStatus::Booked,
+                    note,
+                    result: Ok(()),
+                }
+            }
+            Verdict::Rejected {
+                message,
+                freed: true,
+            } => outcome(
+                LedgerStatus::Rejected,
+                message.clone(),
+                Err(InvoiceError::Rejected(hint_text(message, plain))),
+            ),
+            // Not provably nothing created: as good as no answer.
+            Verdict::Rejected {
+                message,
+                freed: false,
+            } => outcome(
+                LedgerStatus::Pending,
+                message.clone(),
+                Err(InvoiceError::OutcomeUnknown(format!(
+                    "{}. Yuki's answer does not prove nothing was created, so it stays pending: {resolve}",
+                    hint_text(message, plain)
+                ))),
+            ),
+            Verdict::ReferenceMismatch(message) => outcome(
+                LedgerStatus::Pending,
+                message.clone(),
+                Err(InvoiceError::ReferenceMismatch(message)),
+            ),
+        },
     }
-    let reference = &invoice.reference;
-    let resolve = format!(
-        "check Yuki, then `yuki purchase bookings --resolve {reference} --as booked` (or `--as rejected` if Yuki has nothing)"
-    );
-    // (purchase ledger status and note, whether the sync record becomes
-    // booked (Some(true)), is undone (Some(false)) or stays pending (None),
-    // and the run's result)
-    let (status, note, sync_booked, outcome): (_, Option<String>, _, Result<(), InvoiceError>) =
-        match result {
-            Err(e) => match e.delivery() {
-                Delivery::NotSent | Delivery::Refused => (
-                    LedgerStatus::Rejected,
-                    Some(format!("nothing reached Yuki: {e}")),
-                    Some(false),
-                    Err(InvoiceError::Yuki(hinted(e, plain))),
-                ),
-                Delivery::Unknown => {
-                    let message = with_hint(e.to_string(), plain);
-                    (
-                        LedgerStatus::Pending,
-                        Some(format!("outcome unknown: {message}")),
-                        None,
-                        Err(InvoiceError::OutcomeUnknown(format!(
-                            "{message}: the purchase invoice may already be in Yuki. It stays pending: {resolve}"
-                        ))),
-                    )
-                }
-            },
-            Ok(import) => match verdict(&import, invoice) {
-                Verdict::Done(note) => {
-                    if let Some(note) = &note {
-                        eprintln!("warning: {note}");
-                    }
-                    (LedgerStatus::Booked, note, Some(true), Ok(()))
-                }
-                Verdict::Rejected {
-                    message,
-                    freed: true,
-                } => (
-                    LedgerStatus::Rejected,
-                    Some(message.clone()),
-                    Some(false),
-                    Err(InvoiceError::Rejected(with_hint(message, plain))),
-                ),
-                Verdict::Rejected {
-                    message,
-                    freed: false,
-                } => (
-                    LedgerStatus::Pending,
-                    Some(message.clone()),
-                    None,
-                    // Not provably nothing created: as good as no answer.
-                    Err(InvoiceError::OutcomeUnknown(format!(
-                        "{}. Yuki's answer does not prove nothing was created, so it stays pending: {resolve}",
-                        with_hint(message, plain)
-                    ))),
-                ),
-                Verdict::ReferenceMismatch(message) => (
-                    LedgerStatus::Pending,
-                    Some(message.clone()),
-                    None,
-                    Err(InvoiceError::ReferenceMismatch(message)),
-                ),
-            },
-        };
+}
 
-    let settled = PurchaseLedger::open(target.admin_id).and_then(|mut l| match status {
-        LedgerStatus::Pending => l.note(&invoice.hash, note.as_deref().unwrap_or_default()),
-        to => l.settle(&invoice.hash, to, note.as_deref()),
+/// Record the outcome: the purchase ledger settled (or noted, while
+/// pending), and the sync record booked, undone when the invoice is free
+/// again, or left pending with why. Failures are warnings.
+fn record(
+    target: &Target<'_>,
+    invoice: &PurchaseInvoice,
+    sync_ahead: Option<SyncAhead<'_>>,
+    outcome: &Outcome,
+    resolve: &str,
+) {
+    let reference = &invoice.reference;
+    let settled = PurchaseLedger::open(target.admin_id).and_then(|mut l| match outcome.status {
+        LedgerStatus::Pending => l.note(&invoice.hash, outcome.note.as_deref().unwrap_or_default()),
+        to => l
+            .settle(&invoice.hash, to, outcome.note.as_deref())
+            .map(drop),
     });
     if let Err(e) = settled {
         eprintln!(
             "warning: could not update the purchase invoice ledger: {e}; purchase invoice {reference} stays pending there: {resolve}"
         );
     }
-    if let (Some(ledger), Some(spot), Some(ahead)) = (&mut sync_ledger, spot, sync_ahead) {
-        let recorded = match sync_booked {
-            Some(true) => {
+    if let Some(SyncAhead {
+        spot,
+        mut ledger,
+        ahead,
+    }) = sync_ahead
+    {
+        let hash = invoice.hash.clone();
+        let recorded = match outcome.status {
+            LedgerStatus::Booked => {
                 let entry = sync_entry(ledger.state(), spot, invoice, SyncStatus::AlreadyInYuki);
-                let hash = invoice.hash.clone();
                 ledger.commit(ahead, |s| {
                     s.files.insert(hash, entry);
                 })
             }
-            Some(false) => ledger.undo(ahead),
+            LedgerStatus::Rejected => ledger.undo(ahead),
             // Pending stays, with why: `upload dir` never retries it.
-            None => {
-                let error = note.clone();
-                let hash = invoice.hash.clone();
+            LedgerStatus::Pending => {
+                let error = outcome.note.clone();
                 ledger.commit(ahead, |s| {
                     if let Some(e) = s.files.get_mut(&hash) {
                         e.error = error;
@@ -1405,10 +1550,64 @@ async fn submit(
             );
         }
     }
-    if status == LedgerStatus::Pending {
+    if outcome.status == LedgerStatus::Pending {
         eprintln!("purchase invoice {reference} stays pending in the ledger: {resolve}");
     }
-    outcome
+}
+
+/// Send the invoice on `session`: write ahead, call
+/// `ProcessPurchaseInvoices`, and settle both records by the answer.
+async fn submit(
+    session: &Session,
+    target: &Target<'_>,
+    invoice: &PurchaseInvoice,
+    spot: Option<&SyncSpot>,
+    allow_duplicate: bool,
+    format: Option<&str>,
+    quiet: bool,
+) -> Result<(), InvoiceError> {
+    let sync_ahead = write_ahead(target, invoice, spot, allow_duplicate)?;
+    let result = session
+        .purchase()
+        .process_purchase_invoices(target.admin_id, &invoice.to_xml())
+        .await;
+    if let Ok(import) = &result
+        && !quiet
+    {
+        print_import(import, invoice, format);
+    }
+    let resolve = format!(
+        "check Yuki, then `yuki purchase bookings --resolve {} --as booked` (or `--as rejected` if Yuki has nothing)",
+        invoice.reference
+    );
+    let outcome = settle_outcome(result, invoice, session.plain, &resolve);
+    record(target, invoice, sync_ahead, &outcome, &resolve);
+    outcome.result
+}
+
+/// `purchase book` and `purchase bookings`.
+pub async fn run(
+    command: PurchaseCommands,
+    load_config: impl FnOnce() -> Result<Config, YukiError>,
+    admin: Option<&str>,
+    yes: bool,
+    quiet: bool,
+    format: Option<&str>,
+) -> Result<(), InvoiceError> {
+    match command {
+        PurchaseCommands::Book(args) => book(load_config, admin, *args, yes, quiet, format).await,
+        PurchaseCommands::Bookings {
+            resolve,
+            resolution,
+            contact,
+        } => bookings(
+            &load_config()?,
+            admin,
+            resolve.as_deref().zip(resolution),
+            contact.as_deref(),
+            format,
+        ),
+    }
 }
 
 /// `purchase book`.
@@ -1437,14 +1636,15 @@ pub async fn book(
     // Refuse an unconfirmable booking before reading Yuki.
     if !args.dry_run {
         check_confirm(&invoice.reference, args.confirm.as_deref(), yes)?;
-        if !yes && !crate::cli::can_prompt() {
+        if !yes && !can_prompt() {
             return Err(InvoiceError::ConfirmationRequired(format!(
                 "purchase book writes to Yuki; pass --yes --confirm {} to confirm in non-interactive mode, or --dry-run to preview only",
                 invoice.reference
             )));
         }
     }
-    verify(&config, admin, &mut invoice, args.allow_archive_match).await?;
+    let session = Session::open(&target, api_client.as_ref()).await?;
+    verify(&session, &target, &mut invoice, args.allow_archive_match).await?;
 
     if args.dry_run {
         if !quiet {
@@ -1459,16 +1659,16 @@ pub async fn book(
     } else {
         eprintln!("{}", invoice.booking_line());
     }
-    if !yes && !crate::cli::ask_yes_no(&invoice.question()) {
+    if !yes && !ask_yes_no(&invoice.question()) {
         return Err(InvoiceError::ConfirmationRequired(
             "not confirmed: nothing was sent to Yuki".into(),
         ));
     }
     submit(
+        &session,
         &target,
         &invoice,
         spot.as_ref(),
-        api_client.as_ref(),
         args.allow_duplicate,
         format,
         quiet,
@@ -1541,41 +1741,47 @@ fn settle_sync_by_hand(file: &str, hash: &str, resolution: Resolution) {
         Err(e) => return warn(&e),
     };
     let result = (|| -> Result<(), YukiError> {
-        let mut ledger: Ledger<SyncState> = sync::open_within(&spot.root, SYNC_PATIENCE)?;
-        let note = "booked by `yuki purchase book` (resolved by hand)";
-        let status = ledger.state().files.get(hash).map(|e| e.status);
-        match (status, resolution) {
-            (Some(SyncStatus::Pending), Resolution::Booked) => {
-                let entry = ledger.state_mut().files.get_mut(hash).expect("present");
-                entry.status = SyncStatus::AlreadyInYuki;
-                entry.error = None;
-                entry.recorded_at = sync::now_utc();
-                entry.note = Some(note.into());
-            }
-            (Some(SyncStatus::Pending), Resolution::Rejected) => {
+        let mut ledger = sync::open_within(&spot.root, SYNC_PATIENCE)?;
+        let note = || "booked by `yuki purchase book` (resolved by hand)".to_string();
+        let held = ledger
+            .state()
+            .files
+            .get(hash)
+            .map(|e| (e.status, e.path.clone(), e.size));
+        let entry = match (held, resolution) {
+            (Some((SyncStatus::Pending, path, size)), Resolution::Booked) => sync::record(
+                ledger.state(),
+                hash,
+                &path,
+                size,
+                SyncStatus::AlreadyInYuki,
+                note(),
+            ),
+            (Some((SyncStatus::Pending, ..)), Resolution::Rejected) => {
                 ledger.state_mut().files.remove(hash);
+                return ledger.save();
             }
             // No record (the PDF moved into a synced directory since, or the
-            // write-ahead was lost): booked, it is in Yuki.
-            (None | Some(SyncStatus::Failed), Resolution::Booked) => {
+            // write-ahead was lost), or a failed upload: booked, it is in Yuki.
+            (None | Some((SyncStatus::Failed, ..)), Resolution::Booked) => {
                 let Ok(bytes) = std::fs::read(file) else {
                     return Ok(());
                 };
                 if sync::sha256_hex(&bytes) != hash {
                     return Ok(());
                 }
-                let mut entry = SyncEntry::update(
+                sync::record(
                     ledger.state(),
                     hash,
                     &spot.rel,
                     bytes.len() as u64,
                     SyncStatus::AlreadyInYuki,
-                );
-                entry.note = Some(note.into());
-                ledger.state_mut().files.insert(hash.to_string(), entry);
+                    note(),
+                )
             }
             _ => return Ok(()),
-        }
+        };
+        ledger.state_mut().files.insert(hash.to_string(), entry);
         ledger.save()
     })();
     if let Err(e) = result {

@@ -36,11 +36,13 @@ src/sync.rs              upload dir's .yuki-sync.json (a Ledger) + scan/excludes
 src/cli/sales_invoice.rs   sales invoice create/prepare: TOML → xmlDoc for ProcessSalesInvoices
 src/cli/invoice_ledger.rs  invoice-numbers.json (a Ledger), locked only per read-write
 src/cli/xml_doc.rs         XmlWriter shared by the sales and purchase xmlDoc
+src/cli/invoice_common.rs  InvoiceError, Pdf, parse_date, xml_text, classify()/rejection() shared by sales and purchase
+src/cli/keys.rs            contact_key/reference_key: loose comparison of supplier names and references
 src/cli/purchase_invoice.rs  purchase book: flags → xmlDoc for ProcessPurchaseInvoices; duplicate guards (ledger, .yuki-sync.json, archive)
 src/cli/purchase_ledger.rs   purchase-invoices.json (a Ledger), keyed by supplier + reference + PDF sha256
 ```
 
-`purchase book` authenticates the Purchase client with `AuthenticateClient` when `Config::api_client()` finds `client_id`/`client_secret` (env `YUKI_CLIENT_ID`/`YUKI_CLIENT_SECRET` > admin > top level); every other service keeps plain `Authenticate`. Its read-only checks (VAT pairs, GL scheme, archive search) share one Accounting session via `with_session`. It holds the governing `.yuki-sync.json` lock from write-ahead until settled, so `upload dir` cannot upload the PDF meanwhile.
+`purchase book` opens one session (`purchase_invoice::Session`): `AuthenticateClient` when `Config::api_client()` finds `client_id`/`client_secret` (env `YUKI_CLIENT_ID`/`YUKI_CLIENT_SECRET` > admin > top level), else plain `Authenticate`; its read-only checks (contacts, VAT pairs, GL scheme, archive) and the booking share it via `with_session`. Other commands keep plain `Authenticate`. It holds the governing `.yuki-sync.json` lock from write-ahead until settled, so `upload dir` cannot upload the PDF meanwhile; `upload dir` itself never uploads a PDF `purchase-invoices.json` holds (`sync::Held`).
 
 Local records go through `ledger::Ledger`: `open` (lock + load), `peek` (read only), `save`, and `write_ahead` → `commit`/`undo`. Record a call as pending before making it. A failed call is classified by `YukiError::delivery()`: `NotSent` (never left) and `Refused` (401/403/429) may be retried or freed; `Unknown` (timeout, fault, 5xx) stays pending until the user resolves it. Requests time out after 15s connect / 60s total; one carrying a file uses `call_with_timeout` with `payload_timeout` (60s + 30s/MB, max 10 min).
 
