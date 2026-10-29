@@ -69,6 +69,8 @@ fn mock(archive: &'static str) -> (String, RequestLog, Process) {
             ),
         ),
         "ProcessPurchaseInvoices" => answer.lock().unwrap().clone(),
+        // For `upload dir` next to a booking.
+        "UploadDocument" => (200, response("UploadDocument", "doc-new")),
         other => panic!("unexpected call {other}"),
     });
     (root, log, process)
@@ -626,4 +628,99 @@ fn a_configured_api_client_authenticates_with_authenticate_client() {
     let shown = yuki(&home, &["config", "show", "--output", "json"]);
     let text = String::from_utf8_lossy(&shown.stdout).into_owned();
     assert!(!text.contains("secret-value"), "{text}");
+}
+
+/// `upload dir` on `dir`, confirmed, as JSON rows by path.
+fn upload_dir(home: &TempDir, dir: &Path) -> Vec<Value> {
+    let out = yuki(
+        home,
+        &[
+            "upload",
+            "dir",
+            dir.to_str().unwrap(),
+            "--yes",
+            "--output",
+            "json",
+        ],
+    );
+    // A pending file fails the run (it needs attention); the rows still come.
+    assert!(out.status.code().is_some(), "{}", stderr(&out));
+    json(&out)["items"].as_array().unwrap().clone()
+}
+
+fn row<'a>(rows: &'a [Value], path: &str) -> &'a Value {
+    rows.iter()
+        .find(|r| r["Path"] == path)
+        .unwrap_or_else(|| panic!("{path} in {rows:?}"))
+}
+
+#[test]
+fn upload_dir_never_uploads_a_pdf_purchase_book_sent() {
+    let (root, log, process) = mock("");
+    let (home, pdf) = setup(&root, "");
+    // Booked from outside any synced directory...
+    ok(&book(&home, &pdf, CONFIRMED));
+    // ...then copied into one, with another receipt.
+    let receipts = home.path().join("receipts");
+    std::fs::create_dir_all(&receipts).unwrap();
+    std::fs::copy(&pdf, receipts.join("copy.pdf")).unwrap();
+    std::fs::write(receipts.join("other.pdf"), b"%PDF-1.4 other").unwrap();
+    let rows = upload_dir(&home, &receipts);
+    assert_eq!(row(&rows, "copy.pdf")["Action"], "booked");
+    assert_eq!(row(&rows, "other.pdf")["Action"], "uploaded");
+    let uploads = bodies(&log, "UploadDocument");
+    assert_eq!(uploads.len(), 1);
+    assert!(uploads[0].contains("other.pdf"));
+    // Recorded as in Yuki, so it stays out for good.
+    let record = sync_record(&receipts).unwrap();
+    assert_eq!(record["status"], "already-in-yuki");
+    assert!(record["note"].as_str().unwrap().contains("F2026-0042"));
+
+    // A booking whose outcome is unknown is kept out too, as pending.
+    let second = home.path().join("inbox/second.pdf");
+    std::fs::write(&second, b"%PDF-1.4 second invoice").unwrap();
+    *process.lock().unwrap() = (0, String::new());
+    let out = book(
+        &home,
+        &second,
+        &[
+            "--reference",
+            "F2026-0050",
+            "--yes",
+            "--confirm",
+            "F2026-0050",
+        ],
+    );
+    fails(&out, 1, "outcome_unknown");
+    std::fs::copy(&second, receipts.join("second.pdf")).unwrap();
+    let rows = upload_dir(&home, &receipts);
+    assert_eq!(row(&rows, "second.pdf")["Action"], "pending");
+    assert_eq!(
+        bodies(&log, "UploadDocument").len(),
+        1,
+        "nothing more uploaded"
+    );
+}
+
+#[test]
+fn resolving_as_booked_records_a_pdf_without_a_sync_record() {
+    let (root, _, process) = mock("");
+    let (home, pdf) = setup(&root, "");
+    *process.lock().unwrap() = (0, String::new());
+    fails(&book(&home, &pdf, CONFIRMED), 1, "outcome_unknown");
+    // The directory became a synced one after the booking was sent.
+    sync_state(pdf.parent().unwrap(), "");
+    ok(&yuki(
+        &home,
+        &[
+            "purchase",
+            "bookings",
+            "--resolve",
+            "F2026-0042",
+            "--as",
+            "booked",
+        ],
+    ));
+    let record = sync_record(pdf.parent().unwrap()).expect("recorded");
+    assert_eq!(record["status"], "already-in-yuki");
 }

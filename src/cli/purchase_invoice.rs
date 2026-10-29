@@ -42,6 +42,9 @@ const FILE_NAME_MIN: usize = 5;
 /// `BankAccount` has at most 40.
 const BANK_ACCOUNT_MAX: usize = 40;
 
+/// How long `--resolve` waits for a running `upload dir` to release the sync state.
+const SYNC_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Where to ask for an API client when Yuki refuses the access key alone.
 pub const CLIENT_HINT: &str = "If Yuki refuses purchase invoices for this access key, ask Yuki support (support.accounting@nmbrs.com) for an API Client ID and Client Secret, and set client_id and client_secret in the config (or YUKI_CLIENT_ID and YUKI_CLIENT_SECRET)";
 
@@ -1164,15 +1167,13 @@ pub fn bookings(
     format: Option<&str>,
 ) -> Result<(), InvoiceError> {
     let admin_id = config.target(admin)?.admin_id;
-    let ledger = match resolve {
-        Some((reference, resolution)) => {
-            let mut ledger = PurchaseLedger::open(admin_id)?;
-            let entry = ledger.resolve(reference, contact, resolution)?;
-            settle_sync_by_hand(&entry.file, &entry.hash, resolution);
-            ledger
-        }
-        None => PurchaseLedger::peek(admin_id)?,
-    };
+    if let Some((reference, resolution)) = resolve {
+        // The purchase ledger's lock is released before the sync state's
+        // is waited for.
+        let entry = PurchaseLedger::open(admin_id)?.resolve(reference, contact, resolution)?;
+        settle_sync_by_hand(&entry.file, &entry.hash, resolution);
+    }
+    let ledger = PurchaseLedger::peek(admin_id)?;
     let headers: Vec<String> = [
         "Reference",
         "Contact",
@@ -1225,24 +1226,40 @@ fn settle_sync_by_hand(file: &str, hash: &str, resolution: Resolution) {
         Err(e) => return warn(&e),
     };
     let result = (|| -> Result<(), YukiError> {
-        let mut ledger: Ledger<SyncState> = sync::open(&spot.root)?;
-        let Some(entry) = ledger.state().files.get(hash) else {
-            return Ok(());
-        };
-        if entry.status != SyncStatus::Pending {
-            return Ok(());
-        }
-        match resolution {
-            Resolution::Booked => {
+        let mut ledger: Ledger<SyncState> = sync::open_within(&spot.root, SYNC_PATIENCE)?;
+        let note = "booked by `yuki purchase book` (resolved by hand)";
+        let status = ledger.state().files.get(hash).map(|e| e.status);
+        match (status, resolution) {
+            (Some(SyncStatus::Pending), Resolution::Booked) => {
                 let entry = ledger.state_mut().files.get_mut(hash).expect("present");
                 entry.status = SyncStatus::AlreadyInYuki;
                 entry.error = None;
                 entry.recorded_at = sync::now_utc();
-                entry.note = Some("booked by `yuki purchase book` (resolved by hand)".into());
+                entry.note = Some(note.into());
             }
-            Resolution::Rejected => {
+            (Some(SyncStatus::Pending), Resolution::Rejected) => {
                 ledger.state_mut().files.remove(hash);
             }
+            // No record (the PDF moved into a synced directory since, or the
+            // write-ahead was lost): booked, it is in Yuki.
+            (None | Some(SyncStatus::Failed), Resolution::Booked) => {
+                let Ok(bytes) = std::fs::read(file) else {
+                    return Ok(());
+                };
+                if sync::sha256_hex(&bytes) != hash {
+                    return Ok(());
+                }
+                let mut entry = SyncEntry::update(
+                    ledger.state(),
+                    hash,
+                    &spot.rel,
+                    bytes.len() as u64,
+                    SyncStatus::AlreadyInYuki,
+                );
+                entry.note = Some(note.into());
+                ledger.state_mut().files.insert(hash.to_string(), entry);
+            }
+            _ => return Ok(()),
         }
         ledger.save()
     })();

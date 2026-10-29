@@ -16,7 +16,7 @@
 //! [`Ledger`], locked only for each short read-and-write, never while Yuki
 //! is called.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -312,6 +312,24 @@ impl PurchaseLedger {
             .expect("the entry just settled");
         Ok(settled)
     }
+}
+
+/// Every PDF the ledger still holds (booked or pending), in any
+/// administration, by hash: `upload dir` never uploads one.
+pub fn held_pdfs() -> Result<HashMap<String, Entry>, YukiError> {
+    held_pdfs_at(&ledger_path())
+}
+
+/// [`held_pdfs`] of the ledger at `path`.
+pub fn held_pdfs_at(path: &Path) -> Result<HashMap<String, Entry>, YukiError> {
+    let file = Ledger::<Bookings>::peek(path)?;
+    Ok(file
+        .state()
+        .entries
+        .iter()
+        .filter(|e| e.holds())
+        .map(|e| (e.hash.clone(), e.clone()))
+        .collect())
 }
 
 /// The ledger file: `purchase-invoices.json` next to the config.

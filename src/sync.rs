@@ -147,6 +147,11 @@ pub fn open(root: &Path) -> Result<Ledger<State>, YukiError> {
     Ledger::open(&root.join(STATE_FILE))
 }
 
+/// [`open`], waiting up to `patience` for another run's lock.
+pub fn open_within(root: &Path, patience: std::time::Duration) -> Result<Ledger<State>, YukiError> {
+    Ledger::open_within(&root.join(STATE_FILE), patience)
+}
+
 /// The sync state of `root`, read without the lock: for a dry run.
 pub fn peek(root: &Path) -> Result<Ledger<State>, YukiError> {
     Ledger::peek(&root.join(STATE_FILE))

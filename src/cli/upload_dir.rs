@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use crate::cli::purchase_ledger::{self, Entry as PurchaseEntry, Status as PurchaseStatus};
 use crate::client::archive::{ArchiveClient, ArchiveDocument};
 use crate::config::Config;
 use crate::error::{Delivery, YukiError};
@@ -169,7 +170,15 @@ impl Plan {
     }
 }
 
-fn plan(root: PathBuf, mut ledger: Ledger<State>, excludes: &[String]) -> Result<Plan, YukiError> {
+/// Sort the files of `root` into a plan. `booked` holds the PDFs
+/// `purchase book` sent (by hash): those are in Yuki, or may be, whatever
+/// the sync state says, and are never uploaded.
+fn plan(
+    root: PathBuf,
+    mut ledger: Ledger<State>,
+    excludes: &[String],
+    booked: &HashMap<String, PurchaseEntry>,
+) -> Result<Plan, YukiError> {
     let excludes = Excludes::new(excludes)?;
     let state = ledger.state();
     let scan = sync::scan(&root, &excludes)?;
@@ -188,12 +197,49 @@ fn plan(root: PathBuf, mut ledger: Ledger<State>, excludes: &[String]) -> Result
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut synced, mut trouble) = (0, 0);
     let mut first_seen: HashMap<&str, &str> = HashMap::new();
+    // Records to add for PDFs `purchase book` sent.
+    let mut recorded: Vec<(String, Entry)> = Vec::new();
     for file in &scan.files {
         if let Some(first) = first_seen.get(file.hash.as_str()) {
             rows.push(Row::new(&file.rel, "duplicate").note(format!("same content as {first}")));
             continue;
         }
         first_seen.insert(&file.hash, &file.rel);
+        let unrecorded = state
+            .files
+            .get(&file.hash)
+            .is_none_or(|e| e.status == Status::Failed);
+        if let Some(purchase) = booked.get(&file.hash).filter(|_| unrecorded) {
+            let what = format!(
+                "purchase invoice {} from {} ({})",
+                purchase.reference, purchase.contact, purchase.file
+            );
+            let (status, row, note) = match purchase.status {
+                PurchaseStatus::Booked => (
+                    Status::AlreadyInYuki,
+                    "booked",
+                    format!("booked by `yuki purchase book` as {what}: in Yuki, not uploaded"),
+                ),
+                _ => (
+                    Status::Pending,
+                    "pending",
+                    format!(
+                        "sent by `yuki purchase book` as {what}, outcome unknown: not uploaded; settle it with `yuki purchase bookings --resolve {}`",
+                        purchase.reference
+                    ),
+                ),
+            };
+            let mut entry = Entry::update(state, &file.hash, &file.rel, file.size, status);
+            entry.note = Some(note.clone());
+            recorded.push((file.hash.clone(), entry));
+            if status == Status::Pending {
+                pending.push(file.clone());
+            } else {
+                synced += 1;
+            }
+            rows.push(Row::new(&file.rel, row).note(note));
+            continue;
+        }
         let Some(entry) = state.files.get(&file.hash) else {
             match state.stale_record_at(&file.rel, &scanned) {
                 Some((_, e)) => {
@@ -247,13 +293,14 @@ fn plan(root: PathBuf, mut ledger: Ledger<State>, excludes: &[String]) -> Result
         rows.push(Row::new(rel, "error").error(error.clone()));
     }
     new.extend(retries);
-    let any_moved = !moved.is_empty();
+    let any_moved = !moved.is_empty() || !recorded.is_empty();
     let state = ledger.state_mut();
     for (hash, rel) in moved {
         if let Some(entry) = state.files.get_mut(&hash) {
             entry.path = rel;
         }
     }
+    state.files.extend(recorded);
     Ok(Plan {
         root,
         ledger,
@@ -361,8 +408,9 @@ async fn run_dir(
     } else {
         sync::open(&root)?
     };
+    let booked = purchase_ledger::held_pdfs()?;
     // Accepted: concurrent first runs on /r and /r/sub can both pass these checks.
-    let mut plan = plan(root, ledger, opts.excludes)?;
+    let mut plan = plan(root, ledger, opts.excludes, &booked)?;
     if !quiet {
         print_plan(&plan, opts);
     }
