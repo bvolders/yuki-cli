@@ -1,0 +1,411 @@
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns="urn:xmlns:http://www.theyukicompany.com:purchaseinvoices" attributeFormDefault="qualified" elementFormDefault="qualified" targetNamespace="urn:xmlns:http://www.theyukicompany.com:purchaseinvoices">
+	<xs:element name="PurchaseInvoices">
+		<xs:annotation>
+			<xs:documentation> This rootnode can contain multiple invoices. This XML-document is rejected if the following attributes and their values are missing: xmlns="urn:xmlns:http://www.theyukicompany.com:purchaseinvoices" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance". </xs:documentation>
+		</xs:annotation>
+		<xs:complexType>
+			<xs:sequence>
+				<xs:element name="PurchaseInvoice" maxOccurs="unbounded">
+					<xs:annotation>
+						<xs:documentation> This node contains the information of one invoice. </xs:documentation>
+					</xs:annotation>
+					<xs:complexType>
+						<xs:sequence>
+							<xs:element name="Process" type="xs:boolean" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This boolean field determines whether the invoice is marked as processed. The value "false" will be used by default when this field is left empty. </xs:documentation>
+								</xs:annotation>
+							</xs:element>
+							<xs:element name="Reference" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This string field sets the invoice number. This field is mandatory. </xs:documentation>
+								</xs:annotation>
+								<xs:simpleType>
+									<xs:restriction base="xs:string">
+										<xs:minLength value="1"/>
+									</xs:restriction>
+								</xs:simpleType>
+							</xs:element>
+							<xs:element name="Date" type="xs:date" nillable="true" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This date field sets the date of the invoice. This field is mandatory. </xs:documentation>
+								</xs:annotation>
+							</xs:element>
+							<xs:element name="DueDate" type="xs:date" nillable="true" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This date field sets the date when this invoice is due. If left empty default values on contact level within Yuki will be applied. </xs:documentation>
+								</xs:annotation>
+							</xs:element>
+							<xs:element name="InvoiceAmount" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This decimal field sets the total invoice amount. This field is mandatory. </xs:documentation>
+								</xs:annotation>																			
+								<xs:simpleType>
+									<xs:restriction base="xs:decimal">
+										<xs:totalDigits value="12"/>
+										<xs:fractionDigits value="2"/>
+									</xs:restriction>
+								</xs:simpleType>
+							</xs:element>
+							<xs:element name="InvoiceVATAmount" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This decimal field sets the total VAT amount on the invoice. This field is mandatory. </xs:documentation>
+								</xs:annotation>
+								<xs:simpleType>
+									<xs:restriction base="xs:decimal">
+										<xs:totalDigits value="12"/>
+										<xs:fractionDigits value="2"/>
+									</xs:restriction>
+								</xs:simpleType>
+							</xs:element>
+							<xs:element name="Currency" type="xs:string" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This string field sets the ISO 4217 currencycode used in the invoice. If this field is empty or if the currencycode is not recognized, the currencycode "EUR" is used. </xs:documentation>
+								</xs:annotation>
+							</xs:element>							
+							<xs:element name="Subject" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This string field sets the title of the invoice. If this field is empty by default the following default Yuki structure will be used "Invoice from Contact, GLAccountName(S)". We encourage to make use of the default structure. </xs:documentation>
+								</xs:annotation>
+								<xs:simpleType>
+									<xs:restriction base="xs:string">
+										<xs:minLength value="1"/>
+									</xs:restriction>
+								</xs:simpleType>
+							</xs:element>
+							<xs:element name="PaymentMethod" default="ElectronicTransfer" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This field is used for the payment method of the invoice. If this field is empty or if the PaymenMethod is not recognized, the PaymenMethod "ElectronicTransfer" is used. </xs:documentation>
+								</xs:annotation>
+								<xs:simpleType>
+									<xs:restriction base="xs:string">
+										<xs:enumeration value="ElectronicTransfer"/>
+										<xs:enumeration value="DirectCollection"/>
+										<xs:enumeration value="Cash"/>
+										<xs:enumeration value="DebitCard"/>
+										<xs:enumeration value="CreditCard"/>
+										<xs:enumeration value="ReceivedElectronically"/>
+										<xs:enumeration value="ReceivedCash"/>
+										<xs:enumeration value="ToSettle"/>
+										<xs:enumeration value="PaidByEmployee"/>
+									</xs:restriction>
+								</xs:simpleType>
+							</xs:element>
+							<xs:element name="PaymentReference" type="xs:string" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This string field sets the non structured payment reference of this invoice. </xs:documentation>
+								</xs:annotation>
+							</xs:element>
+							<xs:element name="PaymentID" type="xs:string" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This string field sets the structured payment ID of this invoice. </xs:documentation>
+								</xs:annotation>
+							</xs:element>
+							<xs:element name="ProjectID" type="xs:string" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> The HID of the project you want to link the transactions with. If this value is supplied, the element ProjectCode is not used. The same HID can be formatted like: "001.234" or "1234" or "001234". </xs:documentation>
+								</xs:annotation>
+							</xs:element>
+							<xs:element name="ProjectCode" type="xs:string" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> The code of the project you want to link the transactions with. This value is only used if the element ProjectID is not supplied. </xs:documentation>
+								</xs:annotation>
+							</xs:element>
+							<xs:element name="Remarks" type="xs:string" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> This string field can be used for saving notes or remarks about the invoice. The webservice does not use this in any way. </xs:documentation>
+								</xs:annotation>
+							</xs:element>
+							<xs:element name="DocumentFileName" minOccurs="1">
+								<xs:annotation>
+									<xs:documentation> When supplying the document as base64 encoded byte[] This string field needs to be set with the filename (with extension) of the document. This field is mandatory. </xs:documentation>
+								</xs:annotation>
+								<xs:simpleType>
+									<xs:restriction base="xs:string">
+										<xs:minLength value="5"/>
+									</xs:restriction>
+								</xs:simpleType>								
+							</xs:element>
+							<xs:element name="DocumentBase64" minOccurs="1">
+								<xs:annotation>
+									<xs:documentation> This field contains a base64 encoded purchase document. This field is mandatory. </xs:documentation>
+								</xs:annotation>
+								<xs:simpleType>
+									<xs:restriction base="xs:base64Binary">
+										<xs:minLength value="1"/>
+									</xs:restriction>
+								</xs:simpleType>								
+							</xs:element>					
+							<xs:element name="Contact">
+								<xs:annotation>
+									<xs:documentation> If a contact with the same contactcode exists in our database, then the field "ContactCode" will be sufficient to match this contact. If a contact with the same name exists in our database, this contact will be automatically be matched. If no contact is found by matching contactcode or name and address, a new contact is created if all fields are given. </xs:documentation>
+								</xs:annotation>
+								<xs:complexType>
+									<xs:sequence>
+										<xs:element name="ContactCode" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field can be used to save the contact code given to the supplier. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="FullName" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's fullname. This field can be used for companies and persons and overrides the fields FirstName, MiddleName and LastName if filled. This field is mandatory. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="FirstName" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's firstname. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="MiddleName" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's middlename(s). </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="LastName" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's lastname. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="Gender" default="Unknown" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This enumeration field is the contact's gender. This enumeration has the following values: "Unknown", "Female", "Male". The value "Unknown" will be used by default when this field is left empty. </xs:documentation>
+											</xs:annotation>
+											<xs:simpleType>
+												<xs:restriction base="xs:string">
+													<xs:enumeration value="Female"/>
+													<xs:enumeration value="Male"/>
+													<xs:enumeration value="Unknown"/>
+												</xs:restriction>
+											</xs:simpleType>
+										</xs:element>
+										<xs:element name="CountryCode" nillable="true" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This mandatory string field sets the contact's ISO 3166-1-alpha-2 countrycode. This field is mandatory. </xs:documentation>
+											</xs:annotation>
+											<xs:simpleType>
+												<xs:restriction base="xs:string">
+													<xs:minLength value="2"/>
+													<xs:maxLength value="2"/>
+												</xs:restriction>
+											</xs:simpleType>
+										</xs:element>
+										<xs:element name="City" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's city. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="Zipcode" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's zipcode. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="AddressLine_1" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's first addressline. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="AddressLine_2" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's second addressline. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="EmailAddress" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's e-mailaddress. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="Website" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's website. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="CoCNumber" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's CoCnumber (Chamber of Commerce number). </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="VATNumber" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's VATnumber. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="ContactType" default="Person" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This enumeration field sets the type of the contact. The value "Person" will be used by default when this field is left empty. </xs:documentation>
+											</xs:annotation>
+											<xs:simpleType>
+												<xs:restriction base="xs:string">
+													<xs:enumeration value="Person"/>
+													<xs:enumeration value="Company"/>
+												</xs:restriction>
+											</xs:simpleType>
+										</xs:element>
+										<xs:element name="BankAccount" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's Bankaccount number. This field is mandatory when the PaymentMethod "ElectronicTransfer" is being used on the invoice. </xs:documentation>
+											</xs:annotation>
+											<xs:simpleType>
+												<xs:restriction base="xs:string">
+													<xs:maxLength value="40"/>
+												</xs:restriction>
+											</xs:simpleType>
+										</xs:element>
+										<xs:element name="BIC" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's Bankaccount Bic/Swift code. </xs:documentation>
+											</xs:annotation>
+											<xs:simpleType>
+												<xs:restriction base="xs:string">
+													<xs:maxLength value="40"/>
+												</xs:restriction>
+											</xs:simpleType>
+										</xs:element>
+										<xs:element name="PhoneHome" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's phone number </xs:documentation>
+											</xs:annotation>
+											<xs:simpleType>
+												<xs:restriction base="xs:string">
+													<xs:maxLength value="40"/>
+												</xs:restriction>
+											</xs:simpleType>
+										</xs:element>
+										<xs:element name="MobileHome" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's mobile phone number </xs:documentation>
+											</xs:annotation>
+											<xs:simpleType>
+												<xs:restriction base="xs:string">
+													<xs:maxLength value="40"/>
+												</xs:restriction>
+											</xs:simpleType>
+										</xs:element>
+									</xs:sequence>
+								</xs:complexType>
+							</xs:element>
+							<xs:element name="ContactPerson" minOccurs="0">
+								<xs:annotation>
+									<xs:documentation> If a contact with the same contactcode exists in our database, then the field "ContactCode" will be sufficient to match this contact. If a contact with the same name exists in our database, this contact will be automatically be matched. If no contact is found by matching contactcode or name and address, a new contact is created if all fields are given. </xs:documentation>
+								</xs:annotation>
+								<xs:complexType>
+									<xs:sequence>
+										<xs:element name="ContactCode" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field can be used to save the contact code. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="FullName" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's fullname. This field can be used for companies and persons and overrides the fields FirstName, MiddleName and LastName if filled. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="FirstName" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's firstname. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="MiddleName" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's middlename(s). </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="LastName" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's lastname. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+										<xs:element name="Gender" default="Unknown" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This enumeration field is the contact's gender. This enumeration has the following values: "Unknown", "Female", "Male". The value "Unknown" will be used by default when this field is left empty. </xs:documentation>
+											</xs:annotation>
+											<xs:simpleType>
+												<xs:restriction base="xs:string">
+													<xs:enumeration value="Female"/>
+													<xs:enumeration value="Male"/>
+													<xs:enumeration value="Unknown"/>
+												</xs:restriction>
+											</xs:simpleType>
+										</xs:element>
+										<xs:element name="EmailAddress" type="xs:string" minOccurs="0">
+											<xs:annotation>
+												<xs:documentation> This string field sets the contact's e-mailaddress. </xs:documentation>
+											</xs:annotation>
+										</xs:element>
+									</xs:sequence>
+								</xs:complexType>
+							</xs:element>
+							<xs:element name="InvoiceLines">
+								<xs:annotation>
+									<xs:documentation> Invoice line items. </xs:documentation>
+								</xs:annotation>
+								<xs:complexType>
+									<xs:sequence>
+										<xs:element maxOccurs="unbounded" name="InvoiceLine">
+											<xs:complexType>
+												<xs:sequence>
+													<xs:element name="Description" type="xs:string" minOccurs="0">
+														<xs:annotation>
+															<xs:documentation> This string field can be used to add a description to the invoiceline. If this field is left empty, the Subject of the invoice is used. </xs:documentation>
+														</xs:annotation>
+													</xs:element>
+													<xs:element name="GLAccountCode" type="xs:string" minOccurs="0">
+														<xs:annotation>
+															<xs:documentation> This string field determines the glaccountcode (General ledger). A default glaccount will be choosen by the webservice if this field is left empty or with a non-existing glaccountcode. </xs:documentation>
+														</xs:annotation>
+													</xs:element>			
+													<xs:element name="LineAmount" minOccurs="0">
+														<xs:annotation>
+															<xs:documentation> This decimal field sets the amount of the invoice line. This amount is VAT exclusive. </xs:documentation>
+														</xs:annotation>
+														<xs:simpleType>
+															<xs:restriction base="xs:decimal">
+																<xs:totalDigits value="12"/>
+																<xs:fractionDigits value="2"/>
+															</xs:restriction>
+														</xs:simpleType>
+													</xs:element>
+													<xs:element name="LineVATPercentage" minOccurs="0">
+														<xs:annotation>
+															<xs:documentation> This decimal field sets the VAT percentage of the invoice line. BEWARE: it is not preferred to supply this field but rather use the automated calculation based on the "InvoiceAmount" and "InvoiceVATPercentage". This field is only useful if there are different VAT percentages in use on one single invoice.</xs:documentation>
+														</xs:annotation>
+														<xs:simpleType>
+															<xs:restriction base="xs:decimal">
+																<xs:totalDigits value="12"/>
+																<xs:fractionDigits value="2"/>
+															</xs:restriction>
+														</xs:simpleType>	
+													</xs:element>		
+													<xs:element name="LineVATType" type="xs:integer" nillable="true" minOccurs="0">
+														  <xs:annotation>
+																<xs:documentation> This integer field determines which VAT code has to be used. The field is used in combination with the field "VATDescription" and "VATPercentage". Available options can be found in the Settings > VAT Rates page in the domain. This field is mandatory. </xs:documentation>
+														  </xs:annotation>
+													</xs:element>
+													<xs:element name="LineVATDescription" type="xs:string" minOccurs="0">
+														  <xs:annotation>
+																<xs:documentation> This string field determines which VAT code has to be used. This field is used in combination with the fields "VATType" and "VATPercentage". The VATCode description can be found in the Settings > VAT Rates page in the domain. This field is mandatory. </xs:documentation>
+														  </xs:annotation>
+													</xs:element>
+													<xs:element name="VATDeductibilityPercentage" type="xs:integer" minOccurs="0">
+														<xs:annotation>
+															<xs:documentation> This integer field sets the deductibility percentage of the "InvoiceVATAmount" or the "LineVATAmount". If this field is left empty, the default value within Yuki is used. </xs:documentation>
+														</xs:annotation>
+													</xs:element>
+													<xs:element name="ProfessionalPercentage" type="xs:integer" minOccurs="0">
+														<xs:annotation>
+															<xs:documentation> This integer field sets the professional percentage for the invoice line. Applicable only for Belgian sole proprietorship administrations. Acceptable range: 0–100. If this field is omitted, the professional percentage configured on the GL account is used. </xs:documentation>
+														</xs:annotation>
+													</xs:element>
+												</xs:sequence>
+											</xs:complexType>
+										</xs:element>
+									</xs:sequence>
+								</xs:complexType>
+							</xs:element>
+						</xs:sequence>
+					</xs:complexType>
+				</xs:element>
+			</xs:sequence>
+		</xs:complexType>
+	</xs:element>
+</xs:schema>
