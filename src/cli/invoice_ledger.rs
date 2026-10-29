@@ -29,12 +29,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cli::invoice_common::InvoiceError;
 use crate::cli::invoice_number::same_number;
-use crate::cli::sales_invoice::InvoiceError;
 use crate::config::Config;
 use crate::error::YukiError;
 use crate::ledger::{Ledger, LedgerFormat};
-use crate::output::{OutputFormat, format_json, format_table, is_tty};
+use crate::output::print_table;
 use crate::period::{epoch_days, today};
 use crate::sync::now_utc;
 
@@ -384,11 +384,9 @@ pub fn numbers(
         None => InvoiceLedger::peek(admin)?,
     };
     ledger.warn();
-    let headers: Vec<String> = [
+    let headers = [
         "Number", "Date", "Customer", "Gross", "Status", "Recorded", "Booked", "Note",
-    ]
-    .map(String::from)
-    .to_vec();
+    ];
     let rows: Vec<Vec<String>> = ledger
         .entries()
         .map(|e| {
@@ -404,10 +402,7 @@ pub fn numbers(
             ]
         })
         .collect();
-    match OutputFormat::from_flag(format, is_tty()) {
-        OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
-        OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
-    }
+    print_table(format, &headers, &rows);
     Ok(())
 }
 

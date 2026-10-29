@@ -18,11 +18,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::cli::contacts::{yes_no, yes_no_unknown};
+use crate::cli::invoice_common::{InvoiceError, Pdf, xml_text};
 use crate::cli::invoice_ledger::Resolution;
-use crate::cli::purchase_ledger::{
-    Claim, PurchaseLedger, Status as LedgerStatus, contact_key, reference_key,
-};
-use crate::cli::sales_invoice::{InvoiceError, Pdf};
+use crate::cli::keys::{contact_key, reference_key};
+use crate::cli::purchase_ledger::{Claim, PurchaseLedger, Status as LedgerStatus};
 use crate::cli::xml_doc::{XmlWriter, bool_text};
 use crate::client::accounting_info::AccountingInfoClient;
 use crate::client::archive::{ALL_DATES, ArchiveClient, ArchiveDocument};
@@ -33,7 +32,8 @@ use crate::config::{ApiClient, Config, Target};
 use crate::error::{Delivery, YukiError};
 use crate::ledger::Ledger;
 use crate::money::Cents;
-use crate::output::{OutputFormat, format_json, format_table, human_size, is_tty};
+use crate::output::{format_table, human_size, print_table};
+use crate::period::{days_between, shift_date};
 use crate::sync::{self, Entry as SyncEntry, State as SyncState, Status as SyncStatus};
 
 /// Namespace of the `PurchaseInvoices` document; Yuki rejects one without it.
@@ -267,20 +267,6 @@ pub struct PurchaseInvoice {
     pub notes: Vec<String>,
 }
 
-/// Trimmed text, `None` when empty; characters XML 1.0 cannot carry are a problem.
-fn text(field: &str, value: Option<&str>, problems: &mut Vec<String>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if value.chars().any(|c| {
-        (c.is_control() && !matches!(c, '\t' | '\n' | '\r')) || matches!(c, '\u{FFFE}' | '\u{FFFF}')
-    }) {
-        problems.push(format!("{field} contains a character XML cannot carry"));
-    }
-    Some(value.to_string())
-}
-
 fn amount(field: &str, value: Cents, problems: &mut Vec<String>) {
     if value.0.abs() >= AMOUNT_MAX {
         problems.push(format!("{field} {value} exceeds Yuki's 10 integer digits"));
@@ -308,18 +294,18 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
     }
     let hash = sync::sha256_hex(&pdf.bytes);
 
-    let reference = text("--reference", Some(&args.reference), &mut p).unwrap_or_else(|| {
+    let reference = xml_text("--reference", Some(&args.reference), &mut p).unwrap_or_else(|| {
         p.push("--reference (the supplier's invoice number) is empty".into());
         String::new()
     });
-    let code = text("--contact-code", args.contact_code.as_deref(), &mut p);
-    let name = text("--contact", Some(&args.contact), &mut p).unwrap_or_else(|| {
+    let code = xml_text("--contact-code", args.contact_code.as_deref(), &mut p);
+    let name = xml_text("--contact", Some(&args.contact), &mut p).unwrap_or_else(|| {
         if code.is_none() {
             p.push("--contact (the supplier's name) is empty: give it, or --contact-code".into());
         }
         String::new()
     });
-    let country = text("--country", args.country.as_deref(), &mut p).map(|c| c.to_uppercase());
+    let country = xml_text("--country", args.country.as_deref(), &mut p).map(|c| c.to_uppercase());
     if let Some(c) = &country
         && !(c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic()))
     {
@@ -328,7 +314,7 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
         ));
     }
     let iban =
-        text("--iban", args.iban.as_deref(), &mut p).map(|i| i.replace(' ', "").to_uppercase());
+        xml_text("--iban", args.iban.as_deref(), &mut p).map(|i| i.replace(' ', "").to_uppercase());
     if let Some(i) = &iban
         && let Err(why) = check_iban(i)
     {
@@ -348,7 +334,7 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
         name,
         code,
         country,
-        vat_number: text("--vat-number", args.vat_number.as_deref(), &mut p),
+        vat_number: xml_text("--vat-number", args.vat_number.as_deref(), &mut p),
         iban,
         person: args.person,
         matched: Match::Unchecked,
@@ -400,11 +386,12 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
             })
             .collect()
     } else {
-        let gl = text("--gl-account", args.gl_account.as_deref(), &mut p);
-        let vat_description = text("--vat-description", args.vat_description.as_deref(), &mut p);
+        let gl = xml_text("--gl-account", args.gl_account.as_deref(), &mut p);
+        let vat_description =
+            xml_text("--vat-description", args.vat_description.as_deref(), &mut p);
         match (gl, args.vat_type, vat_description) {
             (Some(gl_account), Some(vat_type), Some(vat_description)) => vec![Line {
-                description: text("--description", args.description.as_deref(), &mut p),
+                description: xml_text("--description", args.description.as_deref(), &mut p),
                 gl_account,
                 amount: Cents(args.total.0 - args.vat.0),
                 vat_type,
@@ -422,7 +409,7 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
         }
         amount(&format!("line {} amount", i + 1), line.amount, &mut p);
         if let Some(d) = &line.description {
-            text(&format!("line {} description", i + 1), Some(d), &mut p);
+            xml_text(&format!("line {} description", i + 1), Some(d), &mut p);
         }
     }
     let net: Cents = lines.iter().map(|l| l.amount).sum();
@@ -435,8 +422,8 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
             Cents(args.total.0 - net.0 - args.vat.0)
         ));
     }
-    let subject = text("--subject", args.subject.as_deref(), &mut p);
-    let remarks = text("--remarks", args.remarks.as_deref(), &mut p);
+    let subject = xml_text("--subject", args.subject.as_deref(), &mut p);
+    let remarks = xml_text("--remarks", args.remarks.as_deref(), &mut p);
     if !p.is_empty() {
         return Err(InvoiceError::InvalidInput(format!(
             "cannot book {}:\n  - {}",
@@ -797,26 +784,24 @@ fn file_key(name: &str) -> String {
 fn archive_matches(invoice: &PurchaseInvoice, docs: &[ArchiveDocument]) -> Vec<String> {
     let name = file_key(&invoice.pdf.name);
     let reference = reference_key(&invoice.reference);
-    let day = crate::period::epoch_days(&invoice.date);
     let mut seen = std::collections::BTreeSet::new();
     docs.iter()
         .filter(|d| seen.insert(d.id.clone()))
         .filter_map(|d| {
             let file = file_key(&d.file_name);
-            let doc_day = crate::period::epoch_days(d.document_date.get(..10).unwrap_or(""));
-            let near =
-                matches!((day, doc_day), (Some(a), Some(b)) if (a - b).abs() <= ARCHIVE_DAYS);
+            let near = days_between(&invoice.date, &d.document_date)
+                .is_some_and(|days| days.abs() <= ARCHIVE_DAYS);
             let why = if name.len() >= 6
                 && file.len() >= 6
                 && (file.contains(&name) || name.contains(&file))
             {
-                "same file name"
+                "same file name".to_string()
             } else if reference.len() >= 4
                 && (file.contains(&reference) || reference_key(&d.subject).contains(&reference))
             {
-                "reference in its file name or subject"
+                "reference in its file name or subject".to_string()
             } else if near && Cents::parse(&d.amount) == Some(invoice.total) {
-                "same amount within 3 days"
+                format!("same amount within {ARCHIVE_DAYS} days")
             } else {
                 return None;
             };
@@ -841,11 +826,7 @@ async fn archive_candidates(
     archive: &ArchiveClient,
     invoice: &PurchaseInvoice,
 ) -> Result<Vec<ArchiveDocument>, YukiError> {
-    let shift = |days: i64| {
-        crate::period::epoch_days(&invoice.date)
-            .map(|d| crate::period::date_from_epoch_days(d + days))
-            .unwrap_or_else(|| invoice.date.clone())
-    };
+    let shift = |days| shift_date(&invoice.date, days).unwrap_or_else(|| invoice.date.clone());
     let (from, to) = (shift(-WINDOW_DAYS), shift(WINDOW_DAYS));
     let by_supplier = async {
         match invoice.supplier.matched {
@@ -1211,16 +1192,14 @@ pub fn verdict(import: &PurchaseInvoicesImport, invoice: &PurchaseInvoice) -> Ve
 }
 
 fn print_import(import: &PurchaseInvoicesImport, invoice: &PurchaseInvoice, format: Option<&str>) {
-    let headers: Vec<String> = [
+    let headers = [
         "Succeeded",
         "Processed",
         "Reference",
         "Subject",
         "File",
         "Message",
-    ]
-    .map(String::from)
-    .to_vec();
+    ];
     let rows: Vec<Vec<String>> = import
         .invoices
         .iter()
@@ -1235,10 +1214,7 @@ fn print_import(import: &PurchaseInvoicesImport, invoice: &PurchaseInvoice, form
             ]
         })
         .collect();
-    match OutputFormat::from_flag(format, is_tty()) {
-        OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
-        OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
-    }
+    print_table(format, &headers, &rows);
 }
 
 /// The sync record of a PDF being booked.
@@ -1518,7 +1494,7 @@ pub fn bookings(
         settle_sync_by_hand(&entry.file, &entry.hash, resolution);
     }
     let ledger = PurchaseLedger::peek(admin_id)?;
-    let headers: Vec<String> = [
+    let headers = [
         "Reference",
         "Contact",
         "Date",
@@ -1528,9 +1504,7 @@ pub fn bookings(
         "Recorded",
         "Booked",
         "Note",
-    ]
-    .map(String::from)
-    .to_vec();
+    ];
     let rows: Vec<Vec<String>> = ledger
         .entries()
         .map(|e| {
@@ -1547,10 +1521,7 @@ pub fn bookings(
             ]
         })
         .collect();
-    match OutputFormat::from_flag(format, is_tty()) {
-        OutputFormat::Table => println!("{}", format_table(&headers, &rows)),
-        OutputFormat::Json => println!("{}", format_json(&headers, &rows)),
-    }
+    print_table(format, &headers, &rows);
     Ok(())
 }
 

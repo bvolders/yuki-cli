@@ -5,9 +5,11 @@ pub mod check;
 pub mod contacts;
 pub mod documents;
 pub mod init;
+pub mod invoice_common;
 pub mod invoice_ledger;
 pub mod invoice_number;
 pub mod invoices;
+pub mod keys;
 pub mod projects;
 pub mod purchase_invoice;
 pub mod purchase_ledger;
@@ -703,11 +705,11 @@ pub struct BookFlags {
     pub reference: String,
 
     /// Invoice date, YYYY-MM-DD.
-    #[arg(long, value_parser = sales_invoice::parse_date)]
+    #[arg(long, value_parser = invoice_common::parse_date)]
     pub date: String,
 
     /// Due date, YYYY-MM-DD. Default: the supplier's term in Yuki.
-    #[arg(long, value_parser = sales_invoice::parse_date)]
+    #[arg(long, value_parser = invoice_common::parse_date)]
     pub due_date: Option<String>,
 
     /// Total including VAT, e.g. 121.00.
@@ -829,7 +831,7 @@ pub struct InvoiceInputs {
     pub price: Option<crate::money::Cents>,
 
     /// Invoice date, YYYY-MM-DD. Default: the file's date, else today.
-    #[arg(long, value_parser = sales_invoice::parse_date)]
+    #[arg(long, value_parser = invoice_common::parse_date)]
     pub date: Option<String>,
 
     /// Subject (title) of the invoice, replacing the file's.

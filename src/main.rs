@@ -4,7 +4,7 @@ use std::process;
 use clap::{CommandFactory, Parser};
 use owo_colors::OwoColorize;
 use yuki_cli::cli::Commands;
-use yuki_cli::cli::sales_invoice::InvoiceError;
+use yuki_cli::cli::invoice_common::InvoiceError;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
     DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, PurchaseCommands,

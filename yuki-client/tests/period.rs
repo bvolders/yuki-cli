@@ -155,3 +155,14 @@ fn current_year_is_the_year_of_today() {
     use yuki_client::period::{current_year, today};
     assert_eq!(current_year().to_string(), today()[..4]);
 }
+
+#[test]
+fn dates_shift_and_differ_by_calendar_days() {
+    use yuki_client::period::{days_between, shift_date};
+    assert_eq!(shift_date("2026-03-01", -1).as_deref(), Some("2026-02-28"));
+    assert_eq!(shift_date("2024-02-28", 2).as_deref(), Some("2024-03-01"));
+    assert_eq!(shift_date("2026-13-01", 1), None);
+    assert_eq!(days_between("2026-08-07", "2026-08-10T00:00:00"), Some(3));
+    assert_eq!(days_between("2026-01-01", "2025-12-31"), Some(-1));
+    assert_eq!(days_between("x", "2026-01-01"), None);
+}

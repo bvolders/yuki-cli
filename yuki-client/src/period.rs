@@ -149,6 +149,18 @@ pub fn epoch_days(date: &str) -> Option<i64> {
     Some(era * 146_097 + doe - 719_468)
 }
 
+/// The ISO date `days` calendar days after `date` (before, when negative);
+/// `None` when `date` is not a date.
+pub fn shift_date(date: &str, days: i64) -> Option<String> {
+    epoch_days(date).map(|d| date_from_epoch_days(d + days))
+}
+
+/// Calendar days from `a` to `b` (negative when `b` is earlier); `None`
+/// when either is not a date. A time after the date is ignored.
+pub fn days_between(a: &str, b: &str) -> Option<i64> {
+    Some(epoch_days(b)? - epoch_days(a)?)
+}
+
 /// Return the number of days in the given month of the given year.
 fn days_in_month(year: u32, month: u32) -> u32 {
     match month {

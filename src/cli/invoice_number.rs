@@ -8,8 +8,8 @@
 //! existing numbers are. Yuki's own counter does not learn about numbers
 //! given this way, so once invoices are numbered here, number them all here.
 
+use crate::cli::invoice_common::InvoiceError;
 use crate::cli::invoice_ledger::{InvoiceLedger, given_out};
-use crate::cli::sales_invoice::InvoiceError;
 use crate::cli::setup_archive;
 use crate::config::Config;
 use crate::error::YukiError;
