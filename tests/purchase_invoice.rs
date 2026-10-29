@@ -267,7 +267,8 @@ fn booking_without_a_prompt_needs_the_reference_confirmed() {
     // Without a terminal and without --yes, nothing is sent either.
     let out = book(&home, &pdf, &[]);
     fails(&out, 1, "confirmation_required");
-    assert!(!actions(&log).iter().any(|a| a == "ProcessPurchaseInvoices"));
+    // Refused before Yuki is even read.
+    assert!(actions(&log).is_empty());
     assert!(ledger(&home).is_empty());
 }
 

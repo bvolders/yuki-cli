@@ -1111,6 +1111,16 @@ pub async fn book(
     if let Some(spot) = &spot {
         check_sync(sync::peek(&spot.root)?.state(), spot, &invoice.hash)?;
     }
+    // Refuse an unconfirmable booking before reading Yuki.
+    if !args.dry_run {
+        check_confirm(&invoice.reference, args.confirm.as_deref(), yes)?;
+        if !yes && !crate::cli::can_prompt() {
+            return Err(InvoiceError::ConfirmationRequired(format!(
+                "purchase book writes to Yuki; pass --yes --confirm {} to confirm in non-interactive mode, or --dry-run to preview only",
+                invoice.reference
+            )));
+        }
+    }
     verify(&config, admin, &mut invoice, args.allow_archive_match).await?;
 
     if args.dry_run {
@@ -1121,24 +1131,15 @@ pub async fn book(
         println!("{}", invoice.to_display_xml());
         return Ok(());
     }
-    check_confirm(&invoice.reference, args.confirm.as_deref(), yes)?;
     if !(quiet && yes) {
         eprintln!("{}\n", invoice.preview(target.config_name));
     } else {
         eprintln!("{}", invoice.booking_line());
     }
-    if !yes {
-        if !crate::cli::can_prompt() {
-            return Err(InvoiceError::ConfirmationRequired(format!(
-                "purchase book writes to Yuki; pass --yes --confirm {} to confirm in non-interactive mode, or --dry-run to preview only",
-                invoice.reference
-            )));
-        }
-        if !crate::cli::ask_yes_no(&invoice.question()) {
-            return Err(InvoiceError::ConfirmationRequired(
-                "not confirmed: nothing was sent to Yuki".into(),
-            ));
-        }
+    if !yes && !crate::cli::ask_yes_no(&invoice.question()) {
+        return Err(InvoiceError::ConfirmationRequired(
+            "not confirmed: nothing was sent to Yuki".into(),
+        ));
     }
     submit(
         &target,
