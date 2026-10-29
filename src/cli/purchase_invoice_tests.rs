@@ -685,3 +685,106 @@ fn a_refusal_under_the_access_key_alone_hints_at_an_api_client() {
     let e = hint(YukiError::Unauthorized(403), true).to_string();
     assert!(e.contains("HTTP 403") && e.contains("Client ID"), "{e}");
 }
+
+/// A Yuki stand-in on a local port answering Authenticate,
+/// AuthenticateClient and SetCurrentDomain, each authentication with a new
+/// session; returns its API root and the operations it was asked, in order.
+fn session_mock() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let root = format!("http://{}/ws", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let (mut action, mut length) = (String::new(), 0);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                } else if lower.starts_with("soapaction:") {
+                    action = line
+                        .trim()
+                        .trim_end_matches('"')
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_string();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).ok();
+            let n = {
+                let mut seen = log.lock().unwrap();
+                seen.push(action.clone());
+                seen.len()
+            };
+            let reply = format!(
+                "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><{action}Response xmlns=\"http://www.theyukicompany.com/\"><{action}Result>session-{n}</{action}Result></{action}Response></soap:Body></soap:Envelope>"
+            );
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .ok();
+        }
+    });
+    (root, seen)
+}
+
+fn target(root: &str) -> Target<'_> {
+    Target {
+        config_name: "example",
+        domain_id: "domain-1",
+        admin_id: "admin-1",
+        api_key: "test-key",
+        api_root: root,
+    }
+}
+
+#[tokio::test]
+async fn a_booking_after_a_prompt_gets_a_fresh_session_and_one_without_reuses_it() {
+    let (root, seen) = session_mock();
+    let target = target(&root);
+    let session = Session::open(&target, None).await.unwrap();
+    let first = session.id.clone();
+    // --yes --confirm: no prompt, the verify session books.
+    let session = session.for_booking(false, &target, None).await.unwrap();
+    assert_eq!(session.id, first);
+    let auths = |seen: &[String]| {
+        seen.iter()
+            .filter(|a| a.starts_with("Authenticate"))
+            .count()
+    };
+    assert_eq!(auths(&seen.lock().unwrap()), 1);
+    // A human answered the prompt: a fresh session, opened the same way.
+    let session = session.for_booking(true, &target, None).await.unwrap();
+    assert_ne!(session.id, first);
+    assert!(session.plain);
+    assert_eq!(auths(&seen.lock().unwrap()), 2);
+
+    let client = ApiClient {
+        id: "cid".into(),
+        secret: "s".into(),
+        source: "test".into(),
+    };
+    let session = Session::open(&target, Some(&client)).await.unwrap();
+    let session = session
+        .for_booking(true, &target, Some(&client))
+        .await
+        .unwrap();
+    assert!(!session.plain);
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.iter().filter(|a| *a == "AuthenticateClient").count(),
+        2,
+        "{seen:?}"
+    );
+}

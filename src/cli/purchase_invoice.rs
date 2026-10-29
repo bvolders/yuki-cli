@@ -797,6 +797,22 @@ impl Session {
         })
     }
 
+    /// The session to book on: after a prompt a human answered, which may
+    /// have taken long enough for this one to expire, a fresh one opened
+    /// the same way; otherwise (`--yes --confirm`) this one.
+    pub async fn for_booking(
+        self,
+        prompted: bool,
+        target: &Target<'_>,
+        api_client: Option<&ApiClient>,
+    ) -> Result<Self, YukiError> {
+        if prompted {
+            Self::open(target, api_client).await
+        } else {
+            Ok(self)
+        }
+    }
+
     fn vat(&self) -> VatClient {
         VatClient::new()
             .with_api_root(&self.api_root)
@@ -1659,11 +1675,17 @@ pub async fn book(
     } else {
         eprintln!("{}", invoice.booking_line());
     }
-    if !yes && !ask_yes_no(&invoice.question()) {
+    // The prompt is shown exactly when --yes is not given.
+    let prompted = !yes;
+    if prompted && !ask_yes_no(&invoice.question()) {
         return Err(InvoiceError::ConfirmationRequired(
             "not confirmed: nothing was sent to Yuki".into(),
         ));
     }
+    // Before the write-ahead: a failure here records nothing.
+    let session = session
+        .for_booking(prompted, &target, api_client.as_ref())
+        .await?;
     submit(
         &session,
         &target,
