@@ -9,6 +9,8 @@ pub mod invoice_ledger;
 pub mod invoice_number;
 pub mod invoices;
 pub mod projects;
+pub mod purchase_invoice;
+pub mod purchase_ledger;
 pub mod sales;
 pub mod sales_invoice;
 pub mod upload;
@@ -293,6 +295,12 @@ pub enum Commands {
     Sales {
         #[command(subcommand)]
         command: SalesCommands,
+    },
+
+    /// Book supplier (purchase) invoices.
+    Purchase {
+        #[command(subcommand)]
+        command: Box<PurchaseCommands>,
     },
 
     /// Work with projects.
@@ -607,6 +615,183 @@ pub enum SalesInvoiceCommands {
 
     /// List saved invoice templates (~/.config/yuki/invoices/*.toml).
     Templates,
+}
+
+#[derive(Subcommand)]
+pub enum PurchaseCommands {
+    /// Book a supplier's PDF invoice in Yuki (ProcessPurchaseInvoices).
+    ///
+    /// Without --process it lands as a proposal for the accountant to check
+    /// and process. Give the lines as one line (--gl-account, --vat-type,
+    /// --vat-description; its amount is --total minus --vat-amount) or as
+    /// repeated --line; the lines plus the VAT must make the total to the
+    /// cent. The VAT type and description must be an active pair (`yuki vat
+    /// codes`) and the GL account must exist (`yuki accounts scheme`).
+    /// Refused when the purchase ledger, the `upload dir` sync state of the
+    /// PDF's directory, or the Yuki archive suggests it is in Yuki already:
+    /// the API cannot delete a purchase invoice. Prints a preview and asks on
+    /// a terminal; --yes needs --confirm <reference>. --dry-run checks
+    /// (reading Yuki only) and prints the xmlDoc without sending.
+    Book(Box<BookFlags>),
+
+    /// List the purchase invoices `purchase book` sent, from the local ledger.
+    ///
+    /// An invoice is pending from just before Yuki is called until its
+    /// answer marks it booked or rejected. One left pending (no usable answer
+    /// came back) blocks booking the same PDF or reference again: check
+    /// Yuki, then settle it with --resolve <REFERENCE> --as booked|rejected,
+    /// which also settles the PDF's `upload dir` sync record.
+    Bookings {
+        /// Settle the pending invoice with this reference by hand, as --as says.
+        #[arg(long, value_name = "REFERENCE", requires = "resolution")]
+        resolve: Option<String>,
+
+        /// What --resolve settles it as: booked (it is in Yuki) or rejected (it is not).
+        #[arg(
+            long = "as",
+            id = "resolution",
+            value_name = "STATUS",
+            value_enum,
+            requires = "resolve"
+        )]
+        resolution: Option<invoice_ledger::Resolution>,
+
+        /// The supplier, when several have the --resolve reference pending.
+        #[arg(long, value_name = "NAME", requires = "resolve")]
+        contact: Option<String>,
+    },
+}
+
+/// The flags of `purchase book`.
+#[derive(clap::Args)]
+pub struct BookFlags {
+    /// The supplier's invoice PDF (max 3 MB); Yuki stores it under this file name.
+    #[arg(value_name = "FILE")]
+    pub file: String,
+
+    /// Supplier name (FullName): matched by name unless --contact-code is given.
+    #[arg(long, value_name = "NAME")]
+    pub contact: String,
+
+    /// Supplier's contact code in Yuki: matched by it, and then only the
+    /// code and the name are sent, so Yuki keeps the contact's details.
+    #[arg(long, value_name = "CODE")]
+    pub contact_code: Option<String>,
+
+    /// Country (ISO 3166-1 alpha-2) for a supplier Yuki has to create.
+    #[arg(long, value_name = "CC", conflicts_with = "contact_code")]
+    pub country: Option<String>,
+
+    /// VAT number for a supplier Yuki has to create.
+    #[arg(long, value_name = "VAT", conflicts_with = "contact_code")]
+    pub vat_number: Option<String>,
+
+    /// Bank account for a supplier Yuki has to create; Yuki requires it
+    /// with payment method transfer.
+    #[arg(long, value_name = "IBAN", conflicts_with = "contact_code")]
+    pub iban: Option<String>,
+
+    /// The supplier's invoice number (Reference).
+    #[arg(long, value_name = "REF")]
+    pub reference: String,
+
+    /// Invoice date, YYYY-MM-DD.
+    #[arg(long, value_parser = sales_invoice::parse_date)]
+    pub date: String,
+
+    /// Due date, YYYY-MM-DD. Default: the supplier's term in Yuki.
+    #[arg(long, value_parser = sales_invoice::parse_date)]
+    pub due_date: Option<String>,
+
+    /// Total including VAT, e.g. 121.00.
+    #[arg(long, value_name = "AMOUNT", value_parser = crate::money::Cents::parse_exact)]
+    pub total: crate::money::Cents,
+
+    /// VAT amount on the invoice, e.g. 21.00 (0 for none).
+    #[arg(long, alias = "vat", value_name = "AMOUNT", value_parser = crate::money::Cents::parse_exact)]
+    pub vat_amount: crate::money::Cents,
+
+    /// How the invoice is paid. Default: Yuki's (transfer).
+    #[arg(long, value_enum)]
+    pub payment_method: Option<purchase_invoice::PaymentMethod>,
+
+    /// Title of the invoice. Default: Yuki's "Invoice from <supplier>, <GL accounts>".
+    #[arg(long)]
+    pub subject: Option<String>,
+
+    /// Notes kept with the invoice.
+    #[arg(long)]
+    pub remarks: Option<String>,
+
+    /// GL account of the single line, e.g. 612000.
+    #[arg(long, alias = "gl", value_name = "CODE", conflicts_with = "line")]
+    pub gl_account: Option<String>,
+
+    /// Yuki's VAT type number of the single line (`yuki vat codes`).
+    #[arg(long, alias = "vat-code", value_name = "TYPE", conflicts_with = "line")]
+    pub vat_type: Option<i64>,
+
+    /// The VAT code's description, which with the type picks one code,
+    /// e.g. "VAT 21%".
+    #[arg(long, alias = "vat-desc", value_name = "TEXT", conflicts_with = "line")]
+    pub vat_description: Option<String>,
+
+    /// Description of the single line. Default: the subject.
+    #[arg(long, conflicts_with = "line")]
+    pub description: Option<String>,
+
+    /// One line, repeatable: "description;gl_account;amount_excl_vat;vat_type;vat_description"
+    /// (the description may be empty).
+    #[arg(long, value_name = "LINE", value_parser = purchase_invoice::parse_line)]
+    pub line: Vec<purchase_invoice::LineArg>,
+
+    /// Mark the invoice processed instead of leaving a proposal.
+    #[arg(long)]
+    pub process: bool,
+
+    /// Check (reading Yuki only), print the preview and the xmlDoc; send nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// The reference, repeated: required with --yes, so an unattended
+    /// run books only the invoice it meant to.
+    #[arg(long, value_name = "REF")]
+    pub confirm: Option<String>,
+
+    /// Book even though the Yuki archive holds a document with the same
+    /// file name, or the same reference from the same supplier.
+    #[arg(long)]
+    pub allow_archive_match: bool,
+}
+
+impl From<BookFlags> for purchase_invoice::BookArgs {
+    fn from(f: BookFlags) -> Self {
+        Self {
+            file: f.file.into(),
+            contact: f.contact,
+            contact_code: f.contact_code,
+            country: f.country,
+            vat_number: f.vat_number,
+            iban: f.iban,
+            reference: f.reference,
+            date: f.date,
+            due_date: f.due_date,
+            total: f.total,
+            vat: f.vat_amount,
+            payment_method: f.payment_method,
+            subject: f.subject,
+            remarks: f.remarks,
+            gl_account: f.gl_account,
+            vat_type: f.vat_type,
+            vat_description: f.vat_description,
+            description: f.description,
+            lines: f.line,
+            process: f.process,
+            dry_run: f.dry_run,
+            confirm: f.confirm,
+            allow_archive_match: f.allow_archive_match,
+        }
+    }
 }
 
 /// What an invoice is made of: `create` and `prepare` take the same.

@@ -291,7 +291,7 @@ pub struct Pdf {
 
 impl Pdf {
     /// Read `path`, which must be a PDF of at most [`PDF_MAX_BYTES`].
-    fn read(path: &Path) -> Result<Self, String> {
+    pub fn read(path: &Path) -> Result<Self, String> {
         let shown = path.display();
         let size = std::fs::metadata(path)
             .map_err(|e| format!("{shown}: {e}"))?

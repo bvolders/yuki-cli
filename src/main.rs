@@ -7,8 +7,8 @@ use yuki_cli::cli::Commands;
 use yuki_cli::cli::sales_invoice::InvoiceError;
 use yuki_cli::cli::{
     AccountCommands, AdminCommands, AuthCommands, CheckCommands, ConfigCommands, ContactCommands,
-    DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, SalesCommands,
-    SalesInvoiceCommands, UploadCommands, VatCommands,
+    DocumentCommands, InvoiceCommands, ProfileCommands, ProjectCommands, PurchaseCommands,
+    SalesCommands, SalesInvoiceCommands, UploadCommands, VatCommands,
 };
 use yuki_cli::cli::{Cli, RunEndpoint};
 use yuki_cli::config::Config;
@@ -501,6 +501,30 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
             }
         }
 
+        Commands::Purchase { command } => {
+            use yuki_cli::cli::purchase_invoice::{self, BookArgs};
+            let admin = cli.admin.as_deref();
+            match *command {
+                PurchaseCommands::Book(flags) => {
+                    let args = BookArgs::from(*flags);
+                    purchase_invoice::book(load, admin, args, cli.yes, cli.quiet, format).await?;
+                }
+                PurchaseCommands::Bookings {
+                    resolve,
+                    resolution,
+                    contact,
+                } => {
+                    purchase_invoice::bookings(
+                        &load()?,
+                        admin,
+                        resolve.as_deref().zip(resolution),
+                        contact.as_deref(),
+                        format,
+                    )?;
+                }
+            }
+        }
+
         Commands::Documents { command } => {
             let config = load()?;
             let admin = cli.admin.as_deref();
@@ -633,7 +657,7 @@ async fn run(cli: Cli, endpoint: RunEndpoint) -> Result<(), AppError> {
 
         Commands::Capabilities => {
             let value = serde_json::json!({
-                "areas": ["administrations", "vat", "contacts", "accounts", "projects", "invoices", "sales", "documents", "checks", "uploads"],
+                "areas": ["administrations", "vat", "contacts", "accounts", "projects", "invoices", "sales", "purchase", "documents", "checks", "uploads"],
                 "structured_output": true,
                 "daily_api_limit": 1000
             });

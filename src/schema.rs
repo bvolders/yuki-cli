@@ -343,6 +343,65 @@ pub fn generate() -> Value {
                 ]
             },
             {
+                "name": "purchase book",
+                "description": "Book a supplier's PDF invoice in Yuki with ProcessPurchaseInvoices: a proposal for the accountant unless --process. The lines (one via --gl-account/--vat-type/--vat-description, amount = total - VAT, or repeated --line) plus the VAT must make the total exactly; each VAT type/description pair must be active and each GL account must exist (read from Yuki). Refused with invalid_input (DUPLICATE) when the local purchase ledger holds the same PDF or the same supplier reference, when the upload dir sync state governing the PDF records it as in Yuki or pending, or when the archive holds a document with the same file name or the same reference from the same supplier (unless --allow-archive-match). Prints a preview to stderr and asks on a terminal; --yes needs --confirm <reference>. --dry-run reads Yuki and prints the xmlDoc (PDF elided) without sending. Exits 1 with confirmation_required, invoice_rejected, reference_mismatch, or outcome_unknown (the invoice stays pending: check Yuki, then purchase bookings --resolve). Authenticates with AuthenticateClient when client_id/client_secret (or YUKI_CLIENT_ID/YUKI_CLIENT_SECRET) are configured. A booked PDF is recorded in the governing .yuki-sync.json so upload dir skips it.",
+                "mutating": true,
+                "args": [
+                    {"name": "file", "type": "path", "required": true, "description": "The supplier's invoice PDF (max 3 MB)."},
+                    {"name": "--contact", "type": "string", "required": true, "description": "Supplier name (FullName)."},
+                    {"name": "--contact-code", "type": "string", "required": false, "description": "Supplier contact code: matched by it, and only code and name are sent."},
+                    {"name": "--country", "type": "string", "required": false, "description": "ISO 3166-1 alpha-2 country of a supplier Yuki has to create."},
+                    {"name": "--vat-number", "type": "string", "required": false, "description": "VAT number of a supplier Yuki has to create."},
+                    {"name": "--iban", "type": "string", "required": false, "description": "Bank account of a supplier Yuki has to create."},
+                    {"name": "--reference", "type": "string", "required": true, "description": "The supplier's invoice number."},
+                    {"name": "--date", "type": "string", "required": true, "description": "Invoice date, YYYY-MM-DD."},
+                    {"name": "--due-date", "type": "string", "required": false, "description": "Due date, YYYY-MM-DD."},
+                    {"name": "--total", "type": "number", "required": true, "description": "Total including VAT, up to 2 decimals."},
+                    {"name": "--vat-amount", "type": "number", "required": true, "description": "VAT amount, up to 2 decimals."},
+                    {"name": "--payment-method", "type": "string", "required": false, "enum": ["transfer", "direct-debit", "cash", "debit-card", "credit-card", "received-electronically", "received-cash", "to-settle", "paid-by-employee"], "description": "How the invoice is paid; default Yuki's (transfer)."},
+                    {"name": "--subject", "type": "string", "required": false, "description": "Title of the invoice."},
+                    {"name": "--remarks", "type": "string", "required": false, "description": "Notes kept with the invoice."},
+                    {"name": "--gl-account", "type": "string", "required": false, "description": "GL account of the single line."},
+                    {"name": "--vat-type", "type": "integer", "required": false, "description": "VAT type number of the single line."},
+                    {"name": "--vat-description", "type": "string", "required": false, "description": "VAT code description of the single line, e.g. VAT 21%."},
+                    {"name": "--description", "type": "string", "required": false, "description": "Description of the single line."},
+                    {"name": "--line", "type": "string[]", "required": false, "description": "Repeatable line: description;gl_account;amount_excl_vat;vat_type;vat_description."},
+                    {"name": "--process", "type": "boolean", "required": false, "description": "Mark it processed instead of a proposal."},
+                    {"name": "--dry-run", "type": "boolean", "required": false, "description": "Check (read-only) and print the preview and xmlDoc; send nothing."},
+                    {"name": "--confirm", "type": "string", "required": false, "description": "The reference, repeated: required with --yes."},
+                    {"name": "--allow-archive-match", "type": "boolean", "required": false, "description": "Book despite an archive document that looks like this invoice."}
+                ],
+                "output_fields": [
+                    {"name": "Succeeded", "type": "string"},
+                    {"name": "Processed", "type": "string"},
+                    {"name": "Reference", "type": "string"},
+                    {"name": "Subject", "type": "string"},
+                    {"name": "File", "type": "string"},
+                    {"name": "Message", "type": "string"}
+                ]
+            },
+            {
+                "name": "purchase bookings",
+                "description": "List the selected administration's purchase invoices from the local ledger (purchase-invoices.json next to the config): pending from just before Yuki is called, then booked or rejected. --resolve <reference> --as booked|rejected settles a pending one by hand after checking Yuki, and the PDF's pending upload dir sync record with it; makes no API call.",
+                "mutating": false,
+                "args": [
+                    {"name": "--resolve", "type": "string", "required": false, "description": "REFERENCE of the pending invoice to settle, with --as (a local write)."},
+                    {"name": "--as", "type": "string", "required": false, "enum": ["booked", "rejected"], "description": "What --resolve settles it as."},
+                    {"name": "--contact", "type": "string", "required": false, "description": "The supplier, when several have that reference pending."}
+                ],
+                "output_fields": [
+                    {"name": "Reference", "type": "string"},
+                    {"name": "Contact", "type": "string"},
+                    {"name": "Date", "type": "string"},
+                    {"name": "Total", "type": "string"},
+                    {"name": "File", "type": "string"},
+                    {"name": "Status", "type": "string"},
+                    {"name": "Recorded", "type": "string"},
+                    {"name": "Booked", "type": "string"},
+                    {"name": "Note", "type": "string"}
+                ]
+            },
+            {
                 "name": "invoices show",
                 "description": "Show one transaction by ID. Yuki cannot look a transaction up by ID, so this fetches every line on --account within --period (one API call) and keeps the matching one.",
                 "mutating": false,
@@ -836,7 +895,10 @@ fn enrich_v0_3(schema: &mut Value) {
             "effects".into(),
             json!(if !mutating {
                 "read_only"
-            } else if matches!(name.as_str(), "upload file" | "sales invoice create") {
+            } else if matches!(
+                name.as_str(),
+                "upload file" | "sales invoice create" | "purchase book"
+            ) {
                 "non_idempotent"
             } else {
                 "idempotent"
@@ -868,7 +930,11 @@ fn enrich_v0_3(schema: &mut Value) {
         }
         if matches!(
             name.as_str(),
-            "upload file" | "upload dir" | "profile remove" | "sales invoice create"
+            "upload file"
+                | "upload dir"
+                | "profile remove"
+                | "sales invoice create"
+                | "purchase book"
         ) {
             object.insert("confirmation_bypass_arg".into(), json!("--yes"));
         }
