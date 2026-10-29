@@ -14,6 +14,7 @@ pub mod sales_invoice;
 pub mod upload;
 pub mod upload_dir;
 pub mod vat;
+pub mod xml_doc;
 
 use std::ffi::OsString;
 

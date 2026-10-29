@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::contacts::yes_no;
 use crate::cli::invoice_ledger::{Claim, InvoiceLedger};
 use crate::cli::invoice_number::{dutch_date, structured_reference};
-use crate::client::escape_text;
+use crate::cli::xml_doc::{XmlWriter, bool_text};
 use crate::client::sales::{SalesClient, SalesInvoicesImport};
 use crate::config::{Config, Seller};
 use crate::error::{Delivery, YukiError};
@@ -32,7 +32,6 @@ use crate::period::{date_from_epoch_days, epoch_days, today};
 
 /// Namespace of the `SalesInvoices` document; Yuki rejects one without it.
 pub const NAMESPACE: &str = "urn:xmlns:http://www.theyukicompany.com:salesinvoices";
-const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 /// `ProductQuantity` carries up to four decimals.
 const QTY_DECIMALS: u32 = 4;
 /// `Notes` and `PaymentMethod` length limits from the XSD.
@@ -728,12 +727,7 @@ impl Invoice {
     }
 
     fn render(&self, embed_pdf: bool) -> String {
-        let mut x = XmlWriter::default();
-        let _ = writeln!(
-            x.out,
-            r#"<SalesInvoices xmlns="{NAMESPACE}" xmlns:xsi="{XSI}">"#
-        );
-        x.depth = 1;
+        let mut x = XmlWriter::root("SalesInvoices", NAMESPACE);
         x.open("SalesInvoice");
         // Without a number, no Reference: Yuki numbers the invoice.
         x.opt("Reference", &self.number);
@@ -760,18 +754,7 @@ impl Invoice {
                 "DocumentFileName",
                 &self.document_file_name().unwrap_or_default(),
             );
-            let encoded = BASE64.encode(&pdf.bytes);
-            if embed_pdf {
-                x.leaf("DocumentBase64", &encoded);
-            } else {
-                x.indent();
-                let _ = writeln!(
-                    x.out,
-                    "<DocumentBase64><!-- {} bytes base64 ({}-byte PDF) --></DocumentBase64>",
-                    encoded.len(),
-                    pdf.bytes.len()
-                );
-            }
+            x.base64(&BASE64.encode(&pdf.bytes), pdf.bytes.len(), embed_pdf);
         }
 
         let c = &self.contact;
@@ -814,48 +797,7 @@ impl Invoice {
         }
         x.close("InvoiceLines");
         x.close("SalesInvoice");
-        x.out.push_str("</SalesInvoices>");
-        x.out
-    }
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
-}
-
-/// An indented XML writer for the few element shapes the document needs.
-#[derive(Default)]
-struct XmlWriter {
-    out: String,
-    depth: usize,
-}
-
-impl XmlWriter {
-    fn indent(&mut self) {
-        self.out.push_str(&"  ".repeat(self.depth));
-    }
-
-    fn open(&mut self, name: &str) {
-        self.indent();
-        let _ = writeln!(self.out, "<{name}>");
-        self.depth += 1;
-    }
-
-    fn close(&mut self, name: &str) {
-        self.depth -= 1;
-        self.indent();
-        let _ = writeln!(self.out, "</{name}>");
-    }
-
-    fn leaf(&mut self, name: &str, value: &str) {
-        self.indent();
-        let _ = writeln!(self.out, "<{name}>{}</{name}>", escape_text(value));
-    }
-
-    fn opt(&mut self, name: &str, value: &Option<String>) {
-        if let Some(value) = value {
-            self.leaf(name, value);
-        }
+        x.finish("SalesInvoices")
     }
 }
 
