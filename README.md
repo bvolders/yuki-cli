@@ -534,10 +534,12 @@ same PDF, or the same reference from the same supplier, in the ledger
 supplier, reference, invoice date and total there, as Yuki's own duplicate
 check (`--allow-duplicate` books anyway); the PDF recorded as in Yuki or
 pending in the `.yuki-sync.json` of `upload dir` at or above its directory (a
-failed or skipped file is fine); or an archive document with the same file
-name, or the same reference from the same supplier (Yuki's free-text search;
-`--allow-archive-match` books anyway). References compare by letters and digits
-only (`F 2026/0042` is `F2026-0042`); supplier names in any case, ignoring
+failed or skipped file is fine); or an archive document, among the supplier's
+(Yuki's free text matches the contact, not file names) and all within a week
+of the invoice date, with the same file name (ignoring extension, case and an
+`Invoice-` prefix), the reference in its file name or subject, or the same
+amount within 3 days (`--allow-archive-match` books anyway). References
+compare by letters and digits only (`F 2026/0042` is `F2026-0042`); supplier names in any case, ignoring
 punctuation and legal forms (`Leverancier B.V.` is `Leverancier BV`). A booked
 PDF is recorded in that `.yuki-sync.json` as in Yuki, and `upload dir` never
 uploads a PDF the ledger holds, wherever it was booked from.

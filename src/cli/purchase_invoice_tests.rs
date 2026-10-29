@@ -501,27 +501,84 @@ fn doc(id: &str, file: &str, contact: &str, reference: &str) -> ArchiveDocument 
     }
 }
 
+fn archived(id: &str, file: &str, subject: &str, date: &str, amount: &str) -> ArchiveDocument {
+    ArchiveDocument {
+        subject: subject.into(),
+        document_date: format!("{date}T00:00:00"),
+        amount: amount.into(),
+        ..doc(id, file, "Vercel Inc", "")
+    }
+}
+
 #[test]
-fn archive_documents_match_by_file_name_or_reference_and_supplier() {
+fn archive_documents_match_by_file_name_reference_or_amount_and_date() {
     let dir = tempfile::tempdir().unwrap();
-    let invoice = build(&args(pdf_in(dir.path(), "Factuur.pdf"))).unwrap();
-    let docs = [
-        doc("1", "factuur.PDF", "", ""),
-        doc("2", "other.pdf", "Leverancier", "f2026-0042"),
-        doc("3", "other.pdf", "Someone else", "F2026-0042"),
-        doc("4", "x.pdf", "Leverancier BV", "F2026-0043"),
-        doc("1", "factuur.PDF", "", ""),
-    ];
-    let found = archive_matches(&invoice, &docs);
-    assert_eq!(found.len(), 2, "{found:?}");
-    assert!(
-        found[0].starts_with("same file name: document 1"),
-        "{found:?}"
+    let mut a = args(pdf_in(dir.path(), "2026-08-07_vercel_2E81616A-0007.pdf"));
+    a.reference = "2E81616A-0007".into();
+    a.date = "2026-08-07".into();
+    a.total = Cents(2420);
+    a.vat = Cents(420);
+    let invoice = build(&a).unwrap();
+    let found = |docs: &[ArchiveDocument]| archive_matches(&invoice, docs);
+    // The same file, whatever amount the archive recognised.
+    let same = archived(
+        "f7",
+        "2026-08-07_VERCEL_2E81616A-0007.PDF",
+        "",
+        "2026-08-07",
+        "17.65",
     );
-    assert!(
-        found[1].starts_with("same reference and supplier: document 2"),
-        "{found:?}"
+    assert!(found(&[same.clone(), same])[0].starts_with("same file name: document f7"));
+    // Renamed by Yuki or the supplier.
+    let renamed = archived(
+        "r1",
+        "Invoice-2026-08-07_vercel_2E81616A-0007.pdf",
+        "",
+        "2025-01-01",
+        "",
     );
+    assert_eq!(found(&[renamed]).len(), 1);
+    // The reference in another file name, or in the subject.
+    let by_ref = archived(
+        "x1",
+        "Vercel_2E81616A0007_receipt.pdf",
+        "",
+        "2025-01-01",
+        "",
+    );
+    assert!(found(&[by_ref])[0].starts_with("reference in its file name or subject"));
+    let by_subject = archived(
+        "x2",
+        "scan.pdf",
+        "Vercel invoice 2e81616a 0007",
+        "2025-01-01",
+        "",
+    );
+    assert_eq!(found(&[by_subject]).len(), 1);
+    // The same amount within three days, under any name.
+    let by_amount = archived("x3", "scan.pdf", "", "2026-08-10", "24.20");
+    assert!(found(&[by_amount])[0].starts_with("same amount within 3 days"));
+    // Not: four days off, another amount, another invoice of the supplier.
+    for other in [
+        archived("n1", "scan.pdf", "", "2026-08-11", "24.20"),
+        archived("n2", "scan.pdf", "", "2026-08-07", "24.21"),
+        archived(
+            "n3",
+            "2026-07-07_vercel_2E81616A-0006.pdf",
+            "Vercel 2E81616A-0006",
+            "2026-07-07",
+            "17.65",
+        ),
+    ] {
+        assert!(found(std::slice::from_ref(&other)).is_empty(), "{other:?}");
+    }
+}
+
+#[test]
+fn file_names_compare_without_extension_case_punctuation_or_invoice_prefix() {
+    assert_eq!(file_key("Invoice-2E81616A-0007.PDF"), "2e81616a0007");
+    assert_eq!(file_key("Factuur 2026_12.pdf"), "202612");
+    assert_eq!(file_key("invoice.pdf"), "invoice");
 }
 
 #[test]

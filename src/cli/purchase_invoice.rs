@@ -25,7 +25,7 @@ use crate::cli::purchase_ledger::{
 use crate::cli::sales_invoice::{InvoiceError, Pdf};
 use crate::cli::xml_doc::{XmlWriter, bool_text};
 use crate::client::accounting_info::AccountingInfoClient;
-use crate::client::archive::{ALL_DATES, ArchiveDocument};
+use crate::client::archive::{ALL_DATES, ArchiveClient, ArchiveDocument};
 use crate::client::contact::{Contact, ContactClient};
 use crate::client::purchase::{PurchaseClient, PurchaseInvoicesImport};
 use crate::client::vat::{VatClient, VatCode};
@@ -764,39 +764,102 @@ fn check_sync(state: &SyncState, spot: &SyncSpot, hash: &str) -> Result<(), Invo
     )))
 }
 
-/// Archive documents that look like this invoice: the same file name, or
-/// the same reference from the same supplier.
+/// Days either side of the invoice date an archive document with the same
+/// amount counts as the same invoice.
+const ARCHIVE_DAYS: i64 = 3;
+
+/// The window the archive is searched in when the supplier is new, as
+/// `documents exists` does: a week either side of the invoice date.
+const WINDOW_DAYS: i64 = 7;
+
+/// A file name as file names are compared: lower case, letters and digits
+/// only, without the extension or a prefix Yuki or a supplier adds
+/// (`Invoice-…`, `Factuur …`).
+fn file_key(name: &str) -> String {
+    let stem = Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let key = reference_key(&stem);
+    ["invoice", "factuur", "facture", "rechnung"]
+        .iter()
+        .find_map(|p| key.strip_prefix(p).filter(|rest| rest.len() >= 4))
+        .unwrap_or(&key)
+        .to_string()
+}
+
+/// Archive documents that look like this invoice, with why: the same file
+/// name (extension, case, punctuation and an `Invoice-` prefix aside; one
+/// containing the other), the reference in a document's file name or
+/// subject, or the same amount within [`ARCHIVE_DAYS`] of the invoice date.
+/// The archive's amount is what was recognised or booked, so only the last
+/// rule looks at it.
 fn archive_matches(invoice: &PurchaseInvoice, docs: &[ArchiveDocument]) -> Vec<String> {
-    let name = sync::name_key(&invoice.pdf.name);
+    let name = file_key(&invoice.pdf.name);
     let reference = reference_key(&invoice.reference);
-    let supplier = contact_key(&invoice.supplier.name);
+    let day = crate::period::epoch_days(&invoice.date);
     let mut seen = std::collections::BTreeSet::new();
     docs.iter()
         .filter(|d| seen.insert(d.id.clone()))
         .filter_map(|d| {
-            let contact = contact_key(&d.contact_name);
-            let why = if sync::name_key(&d.file_name) == name {
-                "same file name"
-            } else if !reference.is_empty()
-                && reference_key(&d.reference) == reference
-                && !contact.is_empty()
-                && (contact.contains(&supplier) || supplier.contains(&contact))
+            let file = file_key(&d.file_name);
+            let doc_day = crate::period::epoch_days(d.document_date.get(..10).unwrap_or(""));
+            let near =
+                matches!((day, doc_day), (Some(a), Some(b)) if (a - b).abs() <= ARCHIVE_DAYS);
+            let why = if name.len() >= 6
+                && file.len() >= 6
+                && (file.contains(&name) || name.contains(&file))
             {
-                "same reference and supplier"
+                "same file name"
+            } else if reference.len() >= 4
+                && (file.contains(&reference) || reference_key(&d.subject).contains(&reference))
+            {
+                "reference in its file name or subject"
+            } else if near && Cents::parse(&d.amount) == Some(invoice.total) {
+                "same amount within 3 days"
             } else {
                 return None;
             };
             Some(format!(
-                "{why}: document {} '{}' ({}, {}, {}, folder {})",
+                "{why}: document {} '{}' ({}, {}, {} EUR, folder {})",
                 d.id,
                 d.file_name,
                 d.contact_name,
-                d.reference,
                 d.document_date.get(..10).unwrap_or(&d.document_date),
+                d.amount,
                 d.folder
             ))
         })
         .collect()
+}
+
+/// The archive documents to compare with: the supplier's, found by its
+/// name as Yuki has it (the archive's free text matches the contact, not
+/// the file name or reference), and every document within [`WINDOW_DAYS`]
+/// of the invoice date, for a new supplier or one filed under another name.
+async fn archive_candidates(
+    archive: &ArchiveClient,
+    invoice: &PurchaseInvoice,
+) -> Result<Vec<ArchiveDocument>, YukiError> {
+    let shift = |days: i64| {
+        crate::period::epoch_days(&invoice.date)
+            .map(|d| crate::period::date_from_epoch_days(d + days))
+            .unwrap_or_else(|| invoice.date.clone())
+    };
+    let (from, to) = (shift(-WINDOW_DAYS), shift(WINDOW_DAYS));
+    let by_supplier = async {
+        match invoice.supplier.matched {
+            Match::Existing { .. } => {
+                let text = contact_key(&invoice.supplier.name);
+                archive
+                    .search_documents(&text, ALL_DATES.0, ALL_DATES.1)
+                    .await
+            }
+            _ => Ok(Vec::new()),
+        }
+    };
+    let (by_supplier, around) = tokio::join!(by_supplier, archive.search_documents("", &from, &to));
+    Ok(by_supplier?.into_iter().chain(around?).collect())
 }
 
 /// The VAT code Yuki lists for `vat_type` with `description` (any case),
@@ -988,21 +1051,15 @@ pub async fn verify(
     let contacts = ContactClient::new()
         .with_api_root(target.api_root)
         .with_session(&session);
-    let stem = Path::new(&invoice.pdf.name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let (option, value) = match &invoice.supplier.code {
         Some(code) => ("Code", code.clone()),
         // Without the legal form, so `Leverancier BV` finds `Leverancier B.V.`.
         None => ("Name", contact_key(&invoice.supplier.name)),
     };
-    let (codes, scheme, found, by_reference, by_name) = tokio::join!(
+    let (codes, scheme, found) = tokio::join!(
         vat.active_vat_codes(target.admin_id),
         info.get_gl_account_scheme(target.admin_id),
         contacts.search_contacts(target.domain_id, option, &value),
-        archive.search_documents(&invoice.reference, ALL_DATES.0, ALL_DATES.1),
-        archive.search_documents(&stem, ALL_DATES.0, ALL_DATES.1),
     );
     let (codes, scheme) = (codes?, scheme?);
     let mut problems = Vec::new();
@@ -1033,7 +1090,8 @@ pub async fn verify(
             problems.join("\n  - ")
         )));
     }
-    let docs: Vec<ArchiveDocument> = by_reference?.into_iter().chain(by_name?).collect();
+    // The supplier is known now: search the archive by it.
+    let docs = archive_candidates(&archive, invoice).await?;
     let matches = archive_matches(invoice, &docs);
     if !matches.is_empty() {
         let listed = matches.join("\n  - ");

@@ -455,6 +455,27 @@ fn an_archive_document_like_it_is_refused_unless_allowed() {
     );
     fails(&out, 1, "same file name: document doc-3");
     assert!(!actions(&log).iter().any(|a| a == "ProcessPurchaseInvoices"));
+    // Yuki's free text matches the contact, not the file name or reference:
+    // the archive is searched by the supplier, and around the invoice date.
+    let searches = log.lock().unwrap().clone();
+    let searches: Vec<(String, String)> = searches
+        .iter()
+        .filter(|r| r.action == "SearchDocuments")
+        .map(|r| {
+            (
+                r.param("searchText").to_string(),
+                r.param("startDate").to_string(),
+            )
+        })
+        .collect();
+    assert!(
+        searches.contains(&("leverancier".into(), "0001-01-01".into())),
+        "{searches:?}"
+    );
+    assert!(
+        searches.contains(&(String::new(), "2026-10-13".into())),
+        "{searches:?}"
+    );
     let mut allowed = CONFIRMED.to_vec();
     allowed.push("--allow-archive-match");
     ok(&book(&home, &pdf, &allowed));
