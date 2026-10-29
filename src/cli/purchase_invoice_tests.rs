@@ -362,11 +362,11 @@ fn confirm_names_the_reference() {
 
 fn imported(succeeded: bool, processed: bool, reference: &str) -> PurchaseInvoicesImport {
     PurchaseInvoicesImport {
-        total_succeeded: u32::from(succeeded),
-        total_failed: u32::from(!succeeded),
-        total_skipped: 0,
+        total_succeeded: Some(u32::from(succeeded)),
+        total_failed: Some(u32::from(!succeeded)),
+        total_skipped: Some(0),
         invoices: vec![ImportedInvoice {
-            succeeded,
+            succeeded: Some(succeeded),
             processed,
             reference: reference.into(),
             message: if succeeded { "" } else { "Contact not found" }.into(),

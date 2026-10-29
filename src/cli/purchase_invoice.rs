@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use crate::cli::contacts::yes_no;
+use crate::cli::contacts::{yes_no, yes_no_unknown};
 use crate::cli::invoice_ledger::Resolution;
 use crate::cli::purchase_ledger::{Claim, PurchaseLedger, Status as LedgerStatus};
 use crate::cli::sales_invoice::{InvoiceError, Pdf};
@@ -836,7 +836,7 @@ pub enum Verdict {
 /// Judge Yuki's `import` of `invoice`.
 pub fn verdict(import: &PurchaseInvoicesImport, invoice: &PurchaseInvoice) -> Verdict {
     if let Some(failure) = import.failure() {
-        let freed = !import.invoices.is_empty() && import.invoices.iter().all(|i| !i.succeeded);
+        let freed = import.nothing_created();
         return Verdict::Rejected {
             message: failure,
             freed,
@@ -881,7 +881,7 @@ fn print_import(import: &PurchaseInvoicesImport, invoice: &PurchaseInvoice, form
         .iter()
         .map(|i| {
             vec![
-                yes_no(i.succeeded),
+                yes_no_unknown(i.succeeded),
                 yes_no(i.processed),
                 i.reference.clone(),
                 i.subject.clone(),
@@ -1031,8 +1031,9 @@ async fn submit(
                     LedgerStatus::Pending,
                     Some(message.clone()),
                     None,
-                    Err(InvoiceError::Rejected(format!(
-                        "{}. It stays pending: {resolve}",
+                    // Not provably nothing created: as good as no answer.
+                    Err(InvoiceError::OutcomeUnknown(format!(
+                        "{}. Yuki's answer does not prove nothing was created, so it stays pending: {resolve}",
                         with_hint(message, plain)
                     ))),
                 ),

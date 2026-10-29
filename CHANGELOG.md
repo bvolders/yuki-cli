@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Breaking Changes
 
+- **yuki-client**: `SalesInvoicesImport`'s counts are `Option<u32>` and `ImportedInvoice::succeeded` is `Option<bool>`: `None` when Yuki's answer lacks the field or it does not parse, instead of 0/false. `SalesInvoicesImport::nothing_created()` says when the answer proves nothing was created; `sales invoice create` and `purchase book` free a number or an invoice only then, and otherwise leave it pending.
+
 - **yuki-client**: `OutstandingItem` gains public fields (`id`, `type_name`, `type_id`, `reference`, `document_id`); code that builds one with a struct literal needs `..Default::default()`.
 - **accounts**: `accounts balance` now reports the balance at the end of `--period` (or today, if the period is still running) instead of at its start, and adds an `As Of` column with that date. Scripts reading the old start-of-period figure, or indexing columns, must adjust.
 - **yuki-client**: HTTP 401/403 is now `YukiError::Unauthorized(status)` instead of `AuthFailed("HTTP …")`; `AuthFailed` remains for authentication faults.

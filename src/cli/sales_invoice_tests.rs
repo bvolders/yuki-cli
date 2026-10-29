@@ -939,11 +939,11 @@ iban = "BE35733070723437"
 
 fn import_of(reference: &str, processed: bool, email_sent: bool) -> SalesInvoicesImport {
     SalesInvoicesImport {
-        total_succeeded: 1,
-        total_failed: 0,
-        total_skipped: 0,
+        total_succeeded: Some(1),
+        total_failed: Some(0),
+        total_skipped: Some(0),
         invoices: vec![crate::client::sales::ImportedInvoice {
-            succeeded: true,
+            succeeded: Some(true),
             processed,
             email_sent,
             reference: reference.into(),

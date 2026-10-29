@@ -17,7 +17,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cli::contacts::yes_no;
+use crate::cli::contacts::{yes_no, yes_no_unknown};
 use crate::cli::invoice_ledger::{Claim, InvoiceLedger};
 use crate::cli::invoice_number::{dutch_date, structured_reference};
 use crate::cli::xml_doc::{XmlWriter, bool_text};
@@ -1613,7 +1613,7 @@ pub enum Verdict {
 /// Judge Yuki's `import` of `invoice`.
 pub fn verdict(import: &SalesInvoicesImport, invoice: &Invoice) -> Verdict {
     if let Some(failure) = import.failure() {
-        let freed = !import.invoices.is_empty() && import.invoices.iter().all(|i| !i.succeeded);
+        let freed = import.nothing_created();
         return Verdict::Rejected {
             message: failure,
             freed,
@@ -1764,7 +1764,7 @@ fn print_import(import: &SalesInvoicesImport, invoice: &Invoice, format: Option<
         .iter()
         .map(|i| {
             vec![
-                yes_no(i.succeeded),
+                yes_no_unknown(i.succeeded),
                 yes_no(i.processed),
                 yes_no(i.email_sent),
                 i.reference.clone(),

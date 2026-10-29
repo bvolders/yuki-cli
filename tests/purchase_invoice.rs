@@ -542,6 +542,31 @@ fn a_refusal_or_rejection_frees_the_invoice_and_hints_at_an_api_client() {
 }
 
 #[test]
+fn an_ambiguous_answer_never_frees_the_invoice() {
+    let (root, log, process) = mock("");
+    let (home, pdf) = setup(&root, "");
+    sync_state(pdf.parent().unwrap(), "");
+    // TotalSucceeded=1, but the invoice's Succeeded is empty.
+    let ambiguous = import(true, "F2026-0042")
+        .replace("<Succeeded>true</Succeeded>", "<Succeeded></Succeeded>");
+    *process.lock().unwrap() = (200, response("ProcessPurchaseInvoices", &ambiguous));
+    let out = book(&home, &pdf, CONFIRMED);
+    fails(&out, 1, "outcome_unknown");
+    assert_eq!(ledger(&home)[0]["status"], "pending");
+    assert_eq!(
+        sync_record(pdf.parent().unwrap()).unwrap()["status"],
+        "pending"
+    );
+    // So a re-run cannot book it a second time.
+    *process.lock().unwrap() = (
+        200,
+        response("ProcessPurchaseInvoices", &import(true, "F2026-0042")),
+    );
+    fails(&book(&home, &pdf, CONFIRMED), 1, "DUPLICATE");
+    assert_eq!(bodies(&log, "ProcessPurchaseInvoices").len(), 1);
+}
+
+#[test]
 fn another_reference_back_stays_pending() {
     let (root, _, process) = mock("");
     let (home, pdf) = setup(&root, "");

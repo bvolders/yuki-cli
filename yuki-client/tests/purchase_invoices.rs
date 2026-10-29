@@ -30,10 +30,10 @@ const SUCCESS: &str = r#"<PurchaseInvoicesImportResponse xmlns="urn:xmlns:http:/
 #[test]
 fn parses_a_success_sent_as_child_elements() {
     let import = PurchaseClient::parse_process_purchase_invoices(&envelope(SUCCESS)).unwrap();
-    assert_eq!(import.total_succeeded, 1);
+    assert_eq!(import.total_succeeded, Some(1));
     assert_eq!(import.invoices.len(), 1);
     let invoice = &import.invoices[0];
-    assert!(invoice.succeeded && !invoice.processed);
+    assert!(invoice.succeeded == Some(true) && !invoice.processed);
     assert_eq!(invoice.reference, "F2026-0042");
     assert_eq!(invoice.subject, "Hosting & support");
     assert_eq!(import.failure(), None);
@@ -50,9 +50,55 @@ fn parses_a_failure_sent_as_escaped_text() {
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     let import = PurchaseClient::parse_process_purchase_invoices(&envelope(&escaped)).unwrap();
-    assert_eq!(import.total_failed, 1);
+    assert_eq!(import.total_failed, Some(1));
+    assert!(import.nothing_created());
     let failure = import.failure().expect("a failed invoice is a failure");
     assert!(failure.contains("Unknown VAT code"), "{failure}");
+}
+
+/// A response with `Succeeded`, the counts and the invoices as given.
+fn answer(counts: (&str, &str, &str), invoices: &[&str]) -> String {
+    let invoices: String = invoices
+        .iter()
+        .map(|s| format!("<Invoice>{s}<Reference>F1</Reference></Invoice>"))
+        .collect();
+    envelope(&format!(
+        "<PurchaseInvoicesImportResponse><TotalSucceeded>{}</TotalSucceeded><TotalFailed>{}</TotalFailed><TotalSkipped>{}</TotalSkipped>{invoices}</PurchaseInvoicesImportResponse>",
+        counts.0, counts.1, counts.2
+    ))
+}
+
+#[test]
+fn only_an_explicit_consistent_failure_proves_nothing_was_created() {
+    let parse = |xml: String| PurchaseClient::parse_process_purchase_invoices(&xml).unwrap();
+    let failed = "<Succeeded>false</Succeeded>";
+    assert!(parse(answer(("0", "1", "0"), &[failed])).nothing_created());
+    for (counts, invoices) in [
+        // TotalSucceeded=1 with an empty or missing Succeeded: unknown.
+        (("1", "0", "0"), &["<Succeeded></Succeeded>"][..]),
+        (("1", "0", "0"), &[""][..]),
+        (("0", "1", "0"), &["<Succeeded>maybe</Succeeded>"][..]),
+        (("0", "1", "0"), &[""][..]),
+        // Skipped, a count mismatch, missing or unparsed counts.
+        (("0", "1", "1"), &[failed][..]),
+        (("0", "2", "0"), &[failed][..]),
+        (("0", "1", "0"), &[failed, failed][..]),
+        (("", "1", "0"), &[failed][..]),
+        (("0", "x", "0"), &[failed][..]),
+        (("0", "0", "0"), &[][..]),
+    ] {
+        let import = parse(answer(counts, invoices));
+        assert!(
+            !import.nothing_created(),
+            "{counts:?} {invoices:?}: {import:?}"
+        );
+    }
+    let empty = parse(answer(("1", "0", "0"), &["<Succeeded></Succeeded>"]));
+    assert_eq!(empty.invoices[0].succeeded, None);
+    assert!(
+        empty.failure().is_some(),
+        "not known to have succeeded either"
+    );
 }
 
 #[test]

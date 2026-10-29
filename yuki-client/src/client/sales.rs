@@ -18,16 +18,19 @@ pub struct SalesItem {
 /// The outcome of `ProcessSalesInvoices`: Yuki's `SalesInvoicesImportResponse`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SalesInvoicesImport {
-    pub total_succeeded: u32,
-    pub total_failed: u32,
-    pub total_skipped: u32,
+    /// `None` when the response lacks the count or it does not parse.
+    pub total_succeeded: Option<u32>,
+    pub total_failed: Option<u32>,
+    pub total_skipped: Option<u32>,
     pub invoices: Vec<ImportedInvoice>,
 }
 
 /// One invoice of a [`SalesInvoicesImport`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportedInvoice {
-    pub succeeded: bool,
+    /// `None` when `Succeeded` is missing or neither true nor false: then
+    /// nothing is known about the invoice.
+    pub succeeded: Option<bool>,
     /// Booked (`Process=true` took effect), not merely saved as a draft.
     pub processed: bool,
     pub email_sent: bool,
@@ -43,17 +46,20 @@ impl SalesInvoicesImport {
     /// A failed or skipped invoice, an invoice not marked succeeded, or a
     /// response that lists no invoice at all each count as not succeeding.
     pub fn failure(&self) -> Option<String> {
-        let all_succeeded = self.invoices.iter().all(|i| i.succeeded);
-        if self.total_failed == 0
-            && self.total_skipped == 0
+        let all_succeeded = self.invoices.iter().all(|i| i.succeeded == Some(true));
+        if self.total_failed == Some(0)
+            && self.total_skipped == Some(0)
             && all_succeeded
             && !self.invoices.is_empty()
         {
             return None;
         }
+        let count = |n: Option<u32>| n.map_or("?".to_string(), |n| n.to_string());
         let mut summary = format!(
             "Yuki did not accept every invoice: {} succeeded, {} failed, {} skipped",
-            self.total_succeeded, self.total_failed, self.total_skipped
+            count(self.total_succeeded),
+            count(self.total_failed),
+            count(self.total_skipped)
         );
         if self.invoices.is_empty() {
             summary.push_str("; no invoice was reported");
@@ -61,7 +67,7 @@ impl SalesInvoicesImport {
         let messages: Vec<&str> = self
             .invoices
             .iter()
-            .filter(|i| !i.succeeded && !i.message.is_empty())
+            .filter(|i| i.succeeded != Some(true) && !i.message.is_empty())
             .map(|i| i.message.as_str())
             .collect();
         if !messages.is_empty() {
@@ -69,6 +75,18 @@ impl SalesInvoicesImport {
             summary.push_str(&messages.join("; "));
         }
         Some(summary)
+    }
+
+    /// Whether Yuki provably created nothing: no invoice succeeded, at least
+    /// one failed, none was skipped, and every invoice listed says, in so
+    /// many words, `Succeeded` false, one per failure. Anything missing,
+    /// unparsed or inconsistent is not proof.
+    pub fn nothing_created(&self) -> bool {
+        self.total_succeeded == Some(0)
+            && self.total_skipped == Some(0)
+            && self.total_failed.is_some_and(|n| n >= 1)
+            && self.total_failed == u32::try_from(self.invoices.len()).ok()
+            && self.invoices.iter().all(|i| i.succeeded == Some(false))
     }
 }
 
@@ -199,7 +217,12 @@ impl SalesClient {
     /// The import response `root` in `xml`, or `None` when it has none.
     fn parse_import(xml: &str, root: &str) -> Result<Option<SalesInvoicesImport>, YukiError> {
         let flag = |text: &str| text.eq_ignore_ascii_case("true") || text == "1";
-        let count = |text: &str| text.parse::<u32>().unwrap_or(0);
+        let strict = |text: &str| match text {
+            t if t.eq_ignore_ascii_case("true") || t == "1" => Some(true),
+            t if t.eq_ignore_ascii_case("false") || t == "0" => Some(false),
+            _ => None,
+        };
+        let count = |text: &str| text.parse::<u32>().ok();
         let mut reader = Reader::from_str(xml);
         let mut import: Option<SalesInvoicesImport> = None;
         let mut invoice: Option<ImportedInvoice> = None;
@@ -232,7 +255,7 @@ impl SalesClient {
                             field = None;
                             let text = content.take();
                             match (invoice.as_mut(), local.as_str()) {
-                                (Some(i), "Succeeded") => i.succeeded = flag(&text),
+                                (Some(i), "Succeeded") => i.succeeded = strict(&text),
                                 (Some(i), "Processed") => i.processed = flag(&text),
                                 (Some(i), "EmailSent") => i.email_sent = flag(&text),
                                 (Some(i), "Reference") => i.reference = text,
