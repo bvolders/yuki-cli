@@ -19,7 +19,15 @@ const VAT_CODES: &str = r#"<VATCodes xmlns="">
 <VATCode><type>11</type><description>VAT 12%</description></VATCode>
 <VATCode><type>11</type><description>VAT 21%</description></VATCode>
 <VATCode><type>2</type><description>VAT 6%</description></VATCode>
+<VATCode><type>11</type><description>Input tax</description></VATCode>
 </VATCodes>"#;
+
+/// Yuki's contacts, whatever is searched: the mock leaves the filtering to
+/// the CLI.
+const CONTACTS: &str = r#"<Contacts xmlns="">
+<Contact ID="c-1"><Code>SUP001</Code><Name>Leverancier BV</Name><Type>Company</Type></Contact>
+<Contact ID="c-2"><Code></Code><Name>Andere NV</Name><Type>Company</Type></Contact>
+</Contacts>"#;
 
 const GL_SCHEME: &str = r#"<GLAccounts xmlns="">
 <GLAccount><code>612000</code><description>Hosting</description><type>1</type></GLAccount>
@@ -59,6 +67,7 @@ fn mock(archive: &'static str) -> (String, RequestLog, Process) {
         "Authenticate" => (200, response("Authenticate", "session-1")),
         "AuthenticateClient" => (200, response("AuthenticateClient", "session-2")),
         "SetCurrentDomain" => (200, response("SetCurrentDomain", "")),
+        "SearchContacts" => (200, response("SearchContacts", CONTACTS)),
         "ActiveVATCodesList" => (200, response("ActiveVATCodesList", VAT_CODES)),
         "GetGLAccountScheme" => (200, response("GetGLAccountScheme", GL_SCHEME)),
         "SearchDocuments" => (
@@ -112,6 +121,8 @@ fn book_with_env(home: &TempDir, pdf: &Path, extra: &[&str], env: &[(&str, &str)
         "11",
         "--vat-description",
         "vat 21%",
+        "--payment-method",
+        "credit-card",
         "--output",
         "json",
     ];
@@ -217,7 +228,10 @@ fn the_xml_validates_against_the_xsd() {
             "--due-date",
             "2026-11-19",
             "--payment-method",
-            "card",
+            "transfer",
+            // A supplier Yuki creates, so every contact element is sent.
+            "--contact",
+            "Nieuwe Leverancier",
             "--subject",
             "Hosting & support",
             "--remarks",
@@ -417,6 +431,8 @@ fn lines_that_do_not_make_the_total_are_refused_before_any_call() {
             "Hosting;612000;60.00;1;VAT 21%",
             "--line",
             "Licence;613000;39.00;1;VAT 21%",
+            "--payment-method",
+            "cash",
             "--dry-run",
         ],
     );
@@ -769,4 +785,162 @@ fn a_respelled_or_three_of_four_duplicate_is_refused() {
         response("ProcessPurchaseInvoices", &import(true, "F2026-0099")),
     );
     ok(&book(&home, &rescan, &allowed));
+}
+
+/// `purchase book` with exactly `args` after the file.
+fn book_raw(home: &TempDir, pdf: &Path, args: &[&str]) -> Output {
+    let mut all = vec!["purchase", "book", pdf.to_str().unwrap()];
+    all.extend_from_slice(args);
+    yuki(home, &all)
+}
+
+const MINIMAL: &[&str] = &[
+    "--reference",
+    "F2026-0042",
+    "--date",
+    "2026-10-20",
+    "--total",
+    "121.00",
+    "--vat-amount",
+    "21.00",
+    "--gl-account",
+    "612000",
+    "--vat-type",
+    "1",
+    "--vat-description",
+    "VAT 21%",
+];
+
+#[test]
+fn a_contact_code_alone_identifies_the_supplier() {
+    let (root, log, _) = mock("");
+    let (home, pdf) = setup(&root, "");
+    let mut unknown = MINIMAL.to_vec();
+    unknown.extend([
+        "--contact-code",
+        "NOPE",
+        "--payment-method",
+        "cash",
+        "--dry-run",
+    ]);
+    fails(
+        &book_raw(&home, &pdf, &unknown),
+        1,
+        "no contact has code NOPE",
+    );
+
+    let mut args = MINIMAL.to_vec();
+    args.extend([
+        "--contact-code",
+        "SUP001",
+        "--payment-method",
+        "transfer",
+        "--iban",
+        "BE68 5390 0754 7034",
+        "--yes",
+        "--confirm",
+        "F2026-0042",
+    ]);
+    ok(&book_raw(&home, &pdf, &args));
+    let body = &bodies(&log, "ProcessPurchaseInvoices")[0];
+    assert!(body.contains("<ContactCode>SUP001</ContactCode>"), "{body}");
+    assert!(body.contains("<BankAccount>BE68539007547034</BankAccount>"));
+    assert!(
+        !body.contains("<FullName>"),
+        "Yuki would overwrite the name: {body}"
+    );
+    // The ledger knows the supplier by Yuki's name.
+    assert_eq!(ledger(&home)[0]["contact"], "Leverancier BV");
+}
+
+#[test]
+fn a_new_supplier_is_said_so_and_needs_a_country() {
+    let (root, _, _) = mock("");
+    let (home, pdf) = setup(&root, "");
+    let out = book(
+        &home,
+        &pdf,
+        &["--contact", "Nieuwe Leverancier", "--dry-run"],
+    );
+    fails(&out, 1, "no contact named 'Nieuwe Leverancier' in Yuki");
+    fails(&out, 1, "--country");
+    let out = book(
+        &home,
+        &pdf,
+        &[
+            "--contact",
+            "Nieuwe Leverancier",
+            "--country",
+            "BE",
+            "--dry-run",
+        ],
+    );
+    ok(&out);
+    assert!(stderr(&out).contains("!! NEW supplier will be created in Yuki"));
+    let xml = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(xml.contains("<ContactType>Company</ContactType>"), "{xml}");
+    // An existing supplier, spelled otherwise, is matched and not recreated.
+    let out = book(&home, &pdf, &["--contact", "leverancier b.v.", "--dry-run"]);
+    ok(&out);
+    let xml = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(xml.contains("<FullName>Leverancier BV</FullName>"), "{xml}");
+    assert!(!xml.contains("ContactType"), "{xml}");
+}
+
+#[test]
+fn the_payment_method_is_required() {
+    let (root, log, _) = mock("");
+    let (home, pdf) = setup(&root, "");
+    let mut args = MINIMAL.to_vec();
+    args.extend(["--contact", "Leverancier BV", "--dry-run"]);
+    fails(&book_raw(&home, &pdf, &args), 2, "--payment-method");
+    args.extend(["--payment-method", "transfer"]);
+    fails(
+        &book_raw(&home, &pdf, &args),
+        1,
+        "--payment-method transfer needs --iban",
+    );
+    assert!(actions(&log).is_empty());
+}
+
+#[test]
+fn a_vat_amount_the_rates_do_not_give_is_refused() {
+    let (root, log, _) = mock("");
+    let (home, pdf) = setup(&root, "");
+    // 101.00 + 20.00: 21% of 101.00 is 21.21.
+    let out = book(
+        &home,
+        &pdf,
+        &[
+            "--vat-amount",
+            "20.00",
+            "--vat-type",
+            "1",
+            "--vat-description",
+            "VAT 21%",
+            "--dry-run",
+        ],
+    );
+    fails(
+        &out,
+        1,
+        "--vat-amount 20.00 does not match the lines: at their VAT rates it is 21.21",
+    );
+    // A code without a plain rate is not checked, and the preview says so.
+    let out = book(
+        &home,
+        &pdf,
+        &[
+            "--vat-amount",
+            "20.00",
+            "--vat-type",
+            "11",
+            "--vat-description",
+            "Input tax",
+            "--dry-run",
+        ],
+    );
+    ok(&out);
+    assert!(stderr(&out).contains("VAT amount not checked"));
+    assert!(!actions(&log).iter().any(|a| a == "ProcessPurchaseInvoices"));
 }

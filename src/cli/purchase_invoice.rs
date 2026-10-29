@@ -26,6 +26,7 @@ use crate::cli::sales_invoice::{InvoiceError, Pdf};
 use crate::cli::xml_doc::{XmlWriter, bool_text};
 use crate::client::accounting_info::AccountingInfoClient;
 use crate::client::archive::{ALL_DATES, ArchiveDocument};
+use crate::client::contact::{Contact, ContactClient};
 use crate::client::purchase::{PurchaseClient, PurchaseInvoicesImport};
 use crate::client::vat::{VatClient, VatCode};
 use crate::config::{ApiClient, Config, Target};
@@ -41,8 +42,6 @@ pub const NAMESPACE: &str = "urn:xmlns:http://www.theyukicompany.com:purchaseinv
 const AMOUNT_MAX: i64 = 10_i64.pow(12);
 /// `DocumentFileName` has at least five characters.
 const FILE_NAME_MIN: usize = 5;
-/// `BankAccount` has at most 40.
-const BANK_ACCOUNT_MAX: usize = 40;
 
 /// How long `--resolve` waits for a running `upload dir` to release the sync state.
 const SYNC_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -75,6 +74,19 @@ pub enum PaymentMethod {
 }
 
 impl PaymentMethod {
+    /// The names `--payment-method` takes.
+    pub const NAMES: &[&str] = &[
+        "transfer",
+        "direct-debit",
+        "cash",
+        "debit-card",
+        "credit-card",
+        "received-electronically",
+        "received-cash",
+        "to-settle",
+        "paid-by-employee",
+    ];
+
     /// The value as the XSD spells it.
     pub fn xsd(self) -> &'static str {
         match self {
@@ -165,24 +177,57 @@ pub struct BookArgs {
     /// Book even when the ledger holds an invoice with three of the same
     /// supplier, reference, date and total.
     pub allow_duplicate: bool,
+    /// A supplier Yuki creates is a person, not a company.
+    pub person: bool,
 }
 
 /// The supplier: matched by `code`, else by `name`, else created from the
 /// details given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Supplier {
+    /// As given, or as Yuki has it once [`Match::Existing`].
     pub name: String,
     pub code: Option<String>,
     pub country: Option<String>,
     pub vat_number: Option<String>,
     pub iban: Option<String>,
+    /// `ContactType` of a supplier Yuki creates: `Person` rather than `Company`.
+    pub person: bool,
+    pub matched: Match,
+}
+
+/// What Yuki's contacts say about the supplier, read by [`verify`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Match {
+    /// Not looked up (yet).
+    Unchecked,
+    /// An existing contact, found by its code or by its name.
+    Existing { by_code: bool },
+    /// No such contact: Yuki creates it from what is sent.
+    New,
 }
 
 impl Supplier {
     pub fn label(&self) -> String {
         match &self.code {
+            Some(code) if self.name.is_empty() => format!("code {code}"),
             Some(code) => format!("{} (code {code})", self.name),
             None => self.name.clone(),
+        }
+    }
+
+    /// Whether the contact is matched by its code: then the code alone
+    /// identifies it, and Yuki overwrites it with whatever else is sent.
+    fn by_code(&self) -> bool {
+        self.code.is_some()
+    }
+
+    /// Whether Yuki is to create the contact.
+    fn is_new(&self) -> bool {
+        match self.matched {
+            Match::New => true,
+            Match::Existing { .. } => false,
+            Match::Unchecked => self.code.is_none(),
         }
     }
 }
@@ -218,6 +263,8 @@ pub struct PurchaseInvoice {
     pub supplier: Supplier,
     pub lines: Vec<Line>,
     pub process: bool,
+    /// What the checks against Yuki found worth saying, for the preview.
+    pub notes: Vec<String>,
 }
 
 /// Trimmed text, `None` when empty; characters XML 1.0 cannot carry are a problem.
@@ -253,14 +300,23 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
             pdf.name
         ));
     }
+    if !pdf.name.to_lowercase().ends_with(".pdf") {
+        p.push(format!(
+            "'{}' does not end in .pdf: Yuki files the document by its name",
+            pdf.name
+        ));
+    }
     let hash = sync::sha256_hex(&pdf.bytes);
 
     let reference = text("--reference", Some(&args.reference), &mut p).unwrap_or_else(|| {
         p.push("--reference (the supplier's invoice number) is empty".into());
         String::new()
     });
+    let code = text("--contact-code", args.contact_code.as_deref(), &mut p);
     let name = text("--contact", Some(&args.contact), &mut p).unwrap_or_else(|| {
-        p.push("--contact (the supplier's name) is empty".into());
+        if code.is_none() {
+            p.push("--contact (the supplier's name) is empty: give it, or --contact-code".into());
+        }
         String::new()
     });
     let country = text("--country", args.country.as_deref(), &mut p).map(|c| c.to_uppercase());
@@ -271,18 +327,31 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
             "--country '{c}' is not an ISO 3166-1 alpha-2 code such as BE"
         ));
     }
-    let iban = text("--iban", args.iban.as_deref(), &mut p).map(|i| i.replace(' ', ""));
-    if iban.as_ref().is_some_and(|i| i.len() > BANK_ACCOUNT_MAX) {
-        p.push(format!(
-            "--iban is longer than {BANK_ACCOUNT_MAX} characters"
-        ));
+    let iban =
+        text("--iban", args.iban.as_deref(), &mut p).map(|i| i.replace(' ', "").to_uppercase());
+    if let Some(i) = &iban
+        && let Err(why) = check_iban(i)
+    {
+        p.push(format!("--iban {i}: {why}"));
+    }
+    match args.payment_method {
+        None => p.push(format!(
+            "--payment-method is required: one of {}",
+            PaymentMethod::NAMES.join(", ")
+        )),
+        Some(PaymentMethod::Transfer) if iban.is_none() => p.push(
+            "--payment-method transfer needs --iban: Yuki requires the supplier's bank account to pay by transfer".into(),
+        ),
+        Some(_) => {}
     }
     let supplier = Supplier {
         name,
-        code: text("--contact-code", args.contact_code.as_deref(), &mut p),
+        code,
         country,
         vat_number: text("--vat-number", args.vat_number.as_deref(), &mut p),
         iban,
+        person: args.person,
+        matched: Match::Unchecked,
     };
     if let Some(due) = &args.due_date
         && *due < args.date
@@ -300,6 +369,12 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
     }
     if args.vat.0 < 0 {
         p.push(format!("--vat-amount {} cannot be negative", args.vat));
+    }
+    if args.vat.0 > args.total.0 {
+        p.push(format!(
+            "--vat-amount {} exceeds --total {}: the total includes the VAT",
+            args.vat, args.total
+        ));
     }
     amount("--total", args.total, &mut p);
     amount("--vat-amount", args.vat, &mut p);
@@ -351,7 +426,7 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
         }
     }
     let net: Cents = lines.iter().map(|l| l.amount).sum();
-    if !lines.is_empty() && net + args.vat != args.total {
+    if !lines.is_empty() && args.vat.0 <= args.total.0 && net + args.vat != args.total {
         p.push(format!(
             "the lines ({net} excl. VAT) plus the VAT ({}) make {}, not the total {}: off by {}",
             args.vat,
@@ -384,7 +459,54 @@ pub fn build(args: &BookArgs) -> Result<PurchaseInvoice, InvoiceError> {
         supplier,
         lines,
         process: args.process,
+        notes: Vec::new(),
     })
+}
+
+/// Whether `iban` (upper case, no spaces) is an IBAN: country letters,
+/// check digits, at most 34 characters, and the ISO 13616 mod-97 check.
+pub fn check_iban(iban: &str) -> Result<(), String> {
+    let b = iban.as_bytes();
+    let shaped = (15..=34).contains(&b.len())
+        && b[..2].iter().all(u8::is_ascii_uppercase)
+        && b[2..4].iter().all(u8::is_ascii_digit)
+        && b.iter().all(u8::is_ascii_alphanumeric);
+    if !shaped {
+        return Err(
+            "not an IBAN (two letters, two check digits, up to 30 letters or digits)".into(),
+        );
+    }
+    let rearranged = b[4..].iter().chain(&b[..4]);
+    let remainder = rearranged.fold(0_u32, |acc, &c| {
+        let value = if c.is_ascii_digit() {
+            u32::from(c - b'0')
+        } else {
+            u32::from(c - b'A') + 10
+        };
+        if value >= 10 {
+            (acc * 100 + value) % 97
+        } else {
+            (acc * 10 + value) % 97
+        }
+    });
+    if remainder == 1 {
+        Ok(())
+    } else {
+        Err("the check digits are wrong (mod-97): a typo?".into())
+    }
+}
+
+/// The percentage, in hundredths, of a VAT code whose description is a
+/// plain rate (`VAT 21%`, `BTW 6%`, `TVA 0%`); `None` for anything else,
+/// such as reverse charge, imports or `Input tax`, where the VAT on the
+/// invoice does not follow from the rate.
+pub fn plain_rate(description: &str) -> Option<i64> {
+    let lower = description.trim().to_lowercase();
+    let rest = ["vat ", "btw ", "tva ", "mwst "]
+        .iter()
+        .find_map(|p| lower.strip_prefix(p))?;
+    let number = rest.trim().strip_suffix('%')?.trim().replace(',', ".");
+    crate::money::parse_percent(&number).ok()
 }
 
 impl PurchaseInvoice {
@@ -425,17 +547,22 @@ impl PurchaseInvoice {
             embed_pdf,
         );
 
+        // Yuki overwrites a contact it matches with every element sent, so
+        // an existing one gets its code (or exactly its name) and the bank
+        // account, which Yuki adds rather than replaces; only a new one
+        // gets the rest.
         let s = &self.supplier;
         x.open("Contact");
         x.opt("ContactCode", &s.code);
-        x.leaf("FullName", &s.name);
-        // Matched by code, Yuki overwrites the contact with what is sent:
-        // then only the code and the name go.
-        if s.code.is_none() {
+        if !s.by_code() {
+            x.leaf("FullName", &s.name);
+        }
+        if s.is_new() {
             x.opt("CountryCode", &s.country);
             x.opt("VATNumber", &s.vat_number);
-            x.opt("BankAccount", &s.iban);
+            x.leaf("ContactType", if s.person { "Person" } else { "Company" });
         }
+        x.opt("BankAccount", &s.iban);
         x.close("Contact");
 
         x.open("InvoiceLines");
@@ -501,24 +628,38 @@ impl PurchaseInvoice {
         };
         row("Administration", administration);
         row("Mode", self.mode());
-        row("Supplier", &self.supplier.label());
         let s = &self.supplier;
-        if s.code.is_some() {
+        let bank = s
+            .iban
+            .as_deref()
+            .map(|i| format!(" and bank account {i} (added to the contact)"))
+            .unwrap_or_default();
+        if s.is_new() {
             row(
-                "",
-                "matched by code: only the code and the name are sent, so Yuki keeps the contact's details",
+                "Supplier",
+                &format!("!! NEW supplier will be created in Yuki: {}", s.name),
             );
-        } else {
+            let kind = if s.person { "person" } else { "company" };
             let details: Vec<&str> = [&s.country, &s.vat_number, &s.iban]
                 .into_iter()
                 .filter_map(|v| v.as_deref())
                 .collect();
-            if !details.is_empty() {
-                row("", &details.join(", "));
-            }
+            row("", &format!("{kind}, {}", details.join(", ")));
+        } else if s.by_code() {
+            row("Supplier", &s.label());
             row(
                 "",
-                "no contact code: Yuki matches the supplier by name, or creates it from the details sent",
+                &format!(
+                    "existing contact, matched by code: only the code{bank} is sent, so Yuki keeps its details"
+                ),
+            );
+        } else {
+            row("Supplier", &s.label());
+            row(
+                "",
+                &format!(
+                    "existing contact, matched by its name as Yuki has it: only the name{bank} is sent"
+                ),
             );
         }
         row("Reference", &self.reference);
@@ -564,6 +705,9 @@ impl PurchaseInvoice {
         let _ = writeln!(out, "  {:<15}{:>12} EUR", "Net", self.net().to_string());
         let _ = writeln!(out, "  {:<15}{:>12} EUR", "VAT", self.vat.to_string());
         let _ = write!(out, "  {:<15}{:>12} EUR", "Total", self.total.to_string());
+        for note in &self.notes {
+            let _ = write!(out, "\n  note: {note}");
+        }
         out
     }
 }
@@ -702,6 +846,125 @@ fn vat_code<'a>(
     Err(why)
 }
 
+/// Find the supplier among Yuki's `contacts` (the search for its code, or
+/// its name): by code it must exist; by name it is the one contact with
+/// the same [`contact_key`] (or, among several, the one spelled exactly the
+/// same), and otherwise new, which needs a country.
+fn match_supplier(
+    s: &mut Supplier,
+    contacts: &[Contact],
+    problems: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) {
+    if let Some(code) = &s.code {
+        let found: Vec<&Contact> = contacts
+            .iter()
+            .filter(|c| c.code.trim().eq_ignore_ascii_case(code.trim()))
+            .collect();
+        match found.as_slice() {
+            [one] => {
+                if !s.name.is_empty() && contact_key(&s.name) != contact_key(&one.name) {
+                    notes.push(format!(
+                        "--contact '{}' ignored: contact {code} is '{}' in Yuki",
+                        s.name, one.name
+                    ));
+                }
+                s.name = one.name.trim().to_string();
+                s.matched = Match::Existing { by_code: true };
+            }
+            [] => problems.push(format!(
+                "no contact has code {code} in Yuki (see `yuki contacts search <name>`)"
+            )),
+            _ => problems.push(format!("several contacts have code {code} in Yuki")),
+        }
+        return;
+    }
+    let key = contact_key(&s.name);
+    let same: Vec<&Contact> = contacts
+        .iter()
+        .filter(|c| contact_key(&c.name) == key)
+        .collect();
+    let exact: Vec<&&Contact> = same
+        .iter()
+        .filter(|c| c.name.trim().eq_ignore_ascii_case(s.name.trim()))
+        .collect();
+    let chosen = match (same.as_slice(), exact.as_slice()) {
+        ([one], _) => Some(*one),
+        (_, [one]) => Some(**one),
+        ([], _) => None,
+        (many, _) => {
+            let listed: Vec<String> = many
+                .iter()
+                .map(|c| match c.code.trim() {
+                    "" => format!("'{}' (no code)", c.name),
+                    code => format!("'{}' (code {code})", c.name),
+                })
+                .collect();
+            problems.push(format!(
+                "several contacts in Yuki match '{}': {}; pick one with --contact-code, or give its exact name",
+                s.name,
+                listed.join(", ")
+            ));
+            return;
+        }
+    };
+    match chosen {
+        Some(contact) => {
+            if contact.name.trim() != s.name {
+                notes.push(format!(
+                    "supplier '{}' is '{}' in Yuki: that name is sent, so Yuki matches it",
+                    s.name, contact.name
+                ));
+            }
+            s.name = contact.name.trim().to_string();
+            s.matched = Match::Existing { by_code: false };
+        }
+        None => {
+            s.matched = Match::New;
+            if s.country.is_none() {
+                problems.push(format!(
+                    "no contact named '{}' in Yuki, so Yuki would create one: give --country (and --vat-number), or --contact-code for an existing one",
+                    s.name
+                ));
+            }
+        }
+    }
+}
+
+/// Check `--vat-amount` against the lines: each line's net at its VAT
+/// code's rate, rounded per line, within a cent per line. A code that is
+/// not a plain rate (reverse charge, imports, `Input tax`) skips the check,
+/// with a note.
+fn check_vat_amount(invoice: &mut PurchaseInvoice, problems: &mut Vec<String>) {
+    let rates: Vec<Option<i64>> = invoice
+        .lines
+        .iter()
+        .map(|l| plain_rate(&l.vat_description))
+        .collect();
+    if let Some(at) = rates.iter().position(Option::is_none) {
+        invoice.notes.push(format!(
+            "VAT amount not checked: line {}'s VAT code '{}' is not a plain rate",
+            at + 1,
+            invoice.lines[at].vat_description
+        ));
+        return;
+    }
+    let expected: Cents = invoice
+        .lines
+        .iter()
+        .zip(&rates)
+        .map(|(l, r)| l.amount.percent(r.unwrap_or_default()))
+        .sum();
+    let tolerance = invoice.lines.len() as i64;
+    if (invoice.vat.0 - expected.0).abs() > tolerance {
+        problems.push(format!(
+            "--vat-amount {} does not match the lines: at their VAT rates it is {expected} (give or take {tolerance} cent{})",
+            invoice.vat,
+            if tolerance == 1 { "" } else { "s" }
+        ));
+    }
+}
+
 /// Check the invoice against Yuki, reading only: the VAT code pairs (and
 /// take Yuki's spelling of each description), the GL accounts, and the
 /// archive. Opens one session on the accounting service and shares it.
@@ -722,18 +985,34 @@ pub async fn verify(
     let info = AccountingInfoClient::new()
         .with_api_root(target.api_root)
         .with_session(&session);
+    let contacts = ContactClient::new()
+        .with_api_root(target.api_root)
+        .with_session(&session);
     let stem = Path::new(&invoice.pdf.name)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (codes, scheme, by_reference, by_name) = tokio::join!(
+    let (option, value) = match &invoice.supplier.code {
+        Some(code) => ("Code", code.clone()),
+        // Without the legal form, so `Leverancier BV` finds `Leverancier B.V.`.
+        None => ("Name", contact_key(&invoice.supplier.name)),
+    };
+    let (codes, scheme, found, by_reference, by_name) = tokio::join!(
         vat.active_vat_codes(target.admin_id),
         info.get_gl_account_scheme(target.admin_id),
+        contacts.search_contacts(target.domain_id, option, &value),
         archive.search_documents(&invoice.reference, ALL_DATES.0, ALL_DATES.1),
         archive.search_documents(&stem, ALL_DATES.0, ALL_DATES.1),
     );
     let (codes, scheme) = (codes?, scheme?);
     let mut problems = Vec::new();
+    match_supplier(
+        &mut invoice.supplier,
+        &found?,
+        &mut problems,
+        &mut invoice.notes,
+    );
+    check_vat_amount(invoice, &mut problems);
     for (i, line) in invoice.lines.iter_mut().enumerate() {
         match vat_code(&codes, line.vat_type, &line.vat_description) {
             Ok(code) => line.vat_description = code.description.trim().to_string(),

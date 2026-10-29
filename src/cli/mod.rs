@@ -669,26 +669,33 @@ pub struct BookFlags {
     #[arg(value_name = "FILE")]
     pub file: String,
 
-    /// Supplier name (FullName): matched by name unless --contact-code is given.
-    #[arg(long, value_name = "NAME")]
-    pub contact: String,
+    /// Supplier name. Looked up in Yuki's contacts (case, punctuation and
+    /// legal form aside): an existing one is matched by its name as Yuki
+    /// has it, otherwise Yuki creates the supplier (needs --country).
+    #[arg(long, value_name = "NAME", required_unless_present = "contact_code")]
+    pub contact: Option<String>,
 
-    /// Supplier's contact code in Yuki: matched by it, and then only the
-    /// code and the name are sent, so Yuki keeps the contact's details.
+    /// Supplier's contact code in Yuki, which must exist: only the code (and
+    /// --iban) is sent, because Yuki overwrites a contact matched by code
+    /// with everything sent.
     #[arg(long, value_name = "CODE")]
     pub contact_code: Option<String>,
 
-    /// Country (ISO 3166-1 alpha-2) for a supplier Yuki has to create.
+    /// Country (ISO 3166-1 alpha-2) of a supplier Yuki has to create.
     #[arg(long, value_name = "CC", conflicts_with = "contact_code")]
     pub country: Option<String>,
 
-    /// VAT number for a supplier Yuki has to create.
+    /// VAT number of a supplier Yuki has to create.
     #[arg(long, value_name = "VAT", conflicts_with = "contact_code")]
     pub vat_number: Option<String>,
 
-    /// Bank account for a supplier Yuki has to create; Yuki requires it
-    /// with payment method transfer.
-    #[arg(long, value_name = "IBAN", conflicts_with = "contact_code")]
+    /// A supplier Yuki has to create is a person (default: a company).
+    #[arg(long, conflicts_with = "contact_code")]
+    pub person: bool,
+
+    /// The supplier's IBAN, added to the contact; required with
+    /// --payment-method transfer.
+    #[arg(long, value_name = "IBAN")]
     pub iban: Option<String>,
 
     /// The supplier's invoice number (Reference).
@@ -711,9 +718,9 @@ pub struct BookFlags {
     #[arg(long, alias = "vat", value_name = "AMOUNT", value_parser = crate::money::Cents::parse_exact)]
     pub vat_amount: crate::money::Cents,
 
-    /// How the invoice is paid. Default: Yuki's (transfer).
+    /// How the invoice is paid; transfer needs --iban.
     #[arg(long, value_enum)]
-    pub payment_method: Option<purchase_invoice::PaymentMethod>,
+    pub payment_method: purchase_invoice::PaymentMethod,
 
     /// Title of the invoice. Default: Yuki's "Invoice from <supplier>, <GL accounts>".
     #[arg(long)]
@@ -774,7 +781,7 @@ impl From<BookFlags> for purchase_invoice::BookArgs {
     fn from(f: BookFlags) -> Self {
         Self {
             file: f.file.into(),
-            contact: f.contact,
+            contact: f.contact.unwrap_or_default(),
             contact_code: f.contact_code,
             country: f.country,
             vat_number: f.vat_number,
@@ -784,7 +791,7 @@ impl From<BookFlags> for purchase_invoice::BookArgs {
             due_date: f.due_date,
             total: f.total,
             vat: f.vat_amount,
-            payment_method: f.payment_method,
+            payment_method: Some(f.payment_method),
             subject: f.subject,
             remarks: f.remarks,
             gl_account: f.gl_account,
@@ -797,6 +804,7 @@ impl From<BookFlags> for purchase_invoice::BookArgs {
             confirm: f.confirm,
             allow_archive_match: f.allow_archive_match,
             allow_duplicate: f.allow_duplicate,
+            person: f.person,
         }
     }
 }

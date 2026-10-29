@@ -495,10 +495,11 @@ booked figure is Yuki's own.
 
 ```sh
 yuki purchase book F2026-0042.pdf --contact "Leverancier BV" --reference F2026-0042 \
-  --date 2026-10-20 --total 121.00 --vat-amount 21.00 \
+  --date 2026-10-20 --total 121.00 --vat-amount 21.00 --payment-method credit-card \
   --gl-account 612000 --vat-type 1 --vat-description "VAT 21%" --dry-run  # Check and show the xmlDoc
-yuki purchase book F2026-0042.pdf --contact "Leverancier BV" --reference F2026-0042 \
+yuki purchase book F2026-0042.pdf --contact-code SUP001 --reference F2026-0042 \
   --date 2026-10-20 --total 121.00 --vat-amount 21.00 \
+  --payment-method transfer --iban BE68539007547034 \
   --line "Hosting;612000;60.00;1;VAT 21%" --line "Licence;613000;40.00;1;VAT 21%" \
   --yes --confirm F2026-0042                           # Two lines, unattended
 yuki purchase bookings                                 # What purchase book sent (local ledger)
@@ -507,10 +508,14 @@ yuki purchase bookings --resolve F2026-0042 --as booked  # Settle one left pendi
 
 `purchase book` sends the PDF and its booking to Yuki (`ProcessPurchaseInvoices`)
 as a **proposal** the accountant checks and processes; `--process` marks it
-processed. The supplier is matched by `--contact-code` (then only the code and
-the name are sent, because Yuki overwrites a contact matched by code with what
-it gets), else by name; `--country`, `--vat-number` and `--iban` are for a
-supplier Yuki has to create. One line takes `--gl-account`, `--vat-type`,
+processed. Yuki overwrites a contact it matches with every element sent, so
+the supplier is looked up first (read-only): `--contact-code` must exist, and
+only the code goes; `--contact` is matched by name (case, punctuation and legal
+form aside) and only Yuki's spelling of the name goes. A name Yuki does not
+have is a **new** supplier, which the preview says in capitals: it needs
+`--country` (and takes `--vat-number`; a company unless `--person`).
+`--payment-method` is required; `transfer` needs `--iban`, which is checked
+(mod 97) and added to the contact. The file must be a `.pdf`. One line takes `--gl-account`, `--vat-type`,
 `--vat-description` and `--description`, and its amount is `--total` minus
 `--vat-amount`; more lines are `--line
 "description;gl_account;amount_excl_vat;vat_type;vat_description"`. The lines
@@ -518,6 +523,9 @@ plus the VAT must make the total to the cent. Belgian VAT types are ambiguous
 (11 is several codes), so the type and description are sent as a pair, which
 must be an active VAT code (`yuki vat codes`), and each GL account must exist
 (`yuki accounts scheme`): Yuki would book an unknown one to a default account.
+When every line's VAT code is a plain rate (`VAT 21%`), `--vat-amount` must be
+the lines' VAT at those rates, within a cent per line; with any other code
+(reverse charge, imports, `Input tax`) the preview says it was not checked.
 
 A purchase invoice cannot be deleted through the API, so the command refuses
 (kind `invalid_input`, `DUPLICATE`) when the PDF may be in Yuki already: the
@@ -530,7 +538,7 @@ failed or skipped file is fine); or an archive document with the same file
 name, or the same reference from the same supplier (Yuki's free-text search;
 `--allow-archive-match` books anyway). References compare by letters and digits
 only (`F 2026/0042` is `F2026-0042`); supplier names in any case, ignoring
-punctuation and legal forms (`Leverancier B.V.` is `leverancier bv`). A booked
+punctuation and legal forms (`Leverancier B.V.` is `Leverancier BV`). A booked
 PDF is recorded in that `.yuki-sync.json` as in Yuki, and `upload dir` never
 uploads a PDF the ledger holds, wherever it was booked from.
 

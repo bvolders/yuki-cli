@@ -18,6 +18,7 @@ fn args(file: PathBuf) -> BookArgs {
         gl_account: Some("612000".into()),
         vat_type: Some(1),
         vat_description: Some("VAT 21%".into()),
+        payment_method: Some(PaymentMethod::CreditCard),
         ..BookArgs::default()
     }
 }
@@ -116,44 +117,257 @@ fn the_single_line_shortcut_books_total_minus_vat_in_xsd_order() {
     );
 }
 
+fn contact_xml(invoice: &PurchaseInvoice) -> String {
+    let xml = invoice.to_xml();
+    xml[xml.find("<Contact>").unwrap()..xml.find("</Contact>").unwrap()].to_string()
+}
+
+fn yuki_contact(code: &str, name: &str) -> Contact {
+    Contact {
+        id: format!("id-{name}"),
+        code: code.into(),
+        name: name.into(),
+        ..Contact::default()
+    }
+}
+
 #[test]
-fn a_contact_matched_by_code_sends_only_code_and_name() {
+fn a_contact_matched_by_code_gets_only_its_code_and_bank_account() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
-    a.country = Some("be".into());
-    a.vat_number = Some("BE0123456789".into());
-    a.iban = Some("BE68 5390 0754 7034".into());
-    let new = build(&a).unwrap().to_xml();
-    in_order(
-        &new,
-        &[
-            "Contact",
-            "FullName",
-            "CountryCode",
-            "VATNumber",
-            "BankAccount",
-        ],
-    );
-    assert!(
-        new.contains("<CountryCode>BE</CountryCode>")
-            && new.contains("<BankAccount>BE68539007547034</BankAccount>"),
-        "{new}"
-    );
-
+    a.contact = String::new();
     a.contact_code = Some("SUP001".into());
-    let coded = build(&a).unwrap().to_xml();
-    let contact = &coded[coded.find("<Contact>").unwrap()..coded.find("</Contact>").unwrap()];
+    a.iban = Some("be68 5390 0754 7034".into());
+    let mut invoice = build(&a).unwrap();
+    let (mut problems, mut notes) = (Vec::new(), Vec::new());
+    let yuki = [
+        yuki_contact("SUP001", "Leverancier B.V."),
+        yuki_contact("SUP002", "X"),
+    ];
+    match_supplier(&mut invoice.supplier, &yuki, &mut problems, &mut notes);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(invoice.supplier.name, "Leverancier B.V.");
+    let contact = contact_xml(&invoice);
     assert!(
         contact.contains("<ContactCode>SUP001</ContactCode>"),
         "{contact}"
     );
     assert!(
-        contact.contains("<FullName>Leverancier BV</FullName>"),
+        contact.contains("<BankAccount>BE68539007547034</BankAccount>"),
         "{contact}"
     );
-    for absent in ["CountryCode", "VATNumber", "BankAccount"] {
+    // Yuki would overwrite the contact with anything else.
+    for absent in ["FullName", "CountryCode", "VATNumber", "ContactType"] {
         assert!(!contact.contains(absent), "{absent} in {contact}");
     }
+    assert!(
+        invoice
+            .preview("x")
+            .contains("matched by code: only the code and bank account")
+    );
+
+    // A --contact that is not Yuki's name for the code is ignored, said so.
+    a.contact = "Someone Else".into();
+    let mut invoice = build(&a).unwrap();
+    match_supplier(&mut invoice.supplier, &yuki, &mut problems, &mut notes);
+    assert!(
+        notes[0].contains("--contact 'Someone Else' ignored"),
+        "{notes:?}"
+    );
+    // An unknown code is refused.
+    a.contact_code = Some("NOPE".into());
+    let mut invoice = build(&a).unwrap();
+    match_supplier(&mut invoice.supplier, &yuki, &mut problems, &mut notes);
+    assert!(
+        problems[0].contains("no contact has code NOPE"),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn a_contact_matched_by_name_gets_yukis_spelling_and_no_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
+    a.contact = "leverancier bv".into();
+    a.country = Some("BE".into());
+    a.vat_number = Some("BE0123456789".into());
+    let mut invoice = build(&a).unwrap();
+    let (mut problems, mut notes) = (Vec::new(), Vec::new());
+    let yuki = [
+        yuki_contact("", "Leverancier B.V."),
+        yuki_contact("", "Leveranciers"),
+    ];
+    match_supplier(&mut invoice.supplier, &yuki, &mut problems, &mut notes);
+    assert!(problems.is_empty(), "{problems:?}");
+    let contact = contact_xml(&invoice);
+    assert!(
+        contact.contains("<FullName>Leverancier B.V.</FullName>"),
+        "{contact}"
+    );
+    for absent in ["ContactCode", "CountryCode", "VATNumber", "ContactType"] {
+        assert!(!contact.contains(absent), "{absent} in {contact}");
+    }
+    // Two contacts alike, none spelled exactly so: ambiguous.
+    let twins = [
+        yuki_contact("", "Leverancier B.V."),
+        yuki_contact("A1", "LEVERANCIER NV"),
+    ];
+    let mut invoice = build(&a).unwrap();
+    match_supplier(&mut invoice.supplier, &twins, &mut problems, &mut notes);
+    assert!(
+        problems[0].contains("several contacts in Yuki match") && problems[0].contains("code A1"),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn a_new_supplier_needs_a_country_and_is_a_company_unless_a_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
+    a.contact = "Nieuwe Leverancier".into();
+    let mut invoice = build(&a).unwrap();
+    let (mut problems, mut notes) = (Vec::new(), Vec::new());
+    match_supplier(&mut invoice.supplier, &[], &mut problems, &mut notes);
+    assert!(problems[0].contains("give --country"), "{problems:?}");
+
+    a.country = Some("be".into());
+    a.vat_number = Some("BE0123456789".into());
+    let mut invoice = build(&a).unwrap();
+    problems.clear();
+    match_supplier(&mut invoice.supplier, &[], &mut problems, &mut notes);
+    assert!(problems.is_empty());
+    let contact = contact_xml(&invoice);
+    in_order(
+        &contact,
+        &["FullName", "CountryCode", "VATNumber", "ContactType"],
+    );
+    assert!(
+        contact.contains("<ContactType>Company</ContactType>"),
+        "{contact}"
+    );
+    assert!(
+        invoice
+            .preview("x")
+            .contains("!! NEW supplier will be created in Yuki: Nieuwe Leverancier")
+    );
+    a.person = true;
+    let mut invoice = build(&a).unwrap();
+    match_supplier(&mut invoice.supplier, &[], &mut problems, &mut notes);
+    assert!(contact_xml(&invoice).contains("<ContactType>Person</ContactType>"));
+}
+
+#[test]
+fn payment_method_is_required_and_transfer_needs_a_valid_iban() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
+    a.payment_method = None;
+    assert!(invalid(&a).contains("--payment-method is required"));
+    a.payment_method = Some(PaymentMethod::Transfer);
+    assert!(invalid(&a).contains("--payment-method transfer needs --iban"));
+    a.iban = Some("BE68 5390 0754 7035".into());
+    assert!(invalid(&a).contains("check digits are wrong"));
+    a.iban = Some("be68 5390 0754 7034".into());
+    let invoice = build(&a).unwrap();
+    assert_eq!(invoice.supplier.iban.as_deref(), Some("BE68539007547034"));
+}
+
+#[test]
+fn ibans_are_checked_by_mod_97() {
+    for good in [
+        "BE68539007547034",
+        "NL91ABNA0417164300",
+        "DE89370400440532013000",
+        "GB82WEST12345698765432",
+    ] {
+        assert_eq!(check_iban(good), Ok(()), "{good}");
+    }
+    for bad in [
+        "BE68539007547035",
+        "NL91ABNA0417164301",
+        "BE6853900754",
+        "1234567890123456",
+        "BE68-5390-0754-7034",
+    ] {
+        assert!(check_iban(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn the_file_must_be_a_pdf_and_the_vat_within_the_total() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(invalid(&args(pdf_in(dir.path(), "factuur.txt"))).contains("does not end in .pdf"));
+    build(&args(pdf_in(dir.path(), "FACTUUR.PDF"))).unwrap();
+    let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
+    a.vat = Cents(13000);
+    let err = invalid(&a);
+    assert!(
+        err.contains("--vat-amount 130.00 exceeds --total 121.00"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("off by"),
+        "one problem, not a negative line: {err}"
+    );
+}
+
+#[test]
+fn a_plain_vat_rate_is_read_from_the_description() {
+    assert_eq!(plain_rate("VAT 21%"), Some(2100));
+    assert_eq!(plain_rate("btw 6 %"), Some(600));
+    assert_eq!(plain_rate("TVA 5,5%"), Some(550));
+    assert_eq!(plain_rate("VAT 0%"), Some(0));
+    for other in [
+        "VAT reverse-charge (21%)",
+        "Import inside the EU (services) (21%)",
+        "Input tax",
+        "Non-deductible",
+        "VAT reverse-charge",
+    ] {
+        assert_eq!(plain_rate(other), None, "{other}");
+    }
+}
+
+#[test]
+fn the_vat_amount_must_follow_from_the_rates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = args(pdf_in(dir.path(), "factuur.pdf"));
+    a.gl_account = None;
+    a.vat_type = None;
+    a.vat_description = None;
+    a.total = Cents(11861);
+    a.vat = Cents(1861);
+    a.lines = vec![
+        parse_line("a;612000;33.33;1;VAT 21%").unwrap(),
+        parse_line("b;612000;33.33;1;VAT 21%").unwrap(),
+        parse_line("c;612000;33.34;2;VAT 6%").unwrap(),
+    ];
+    // 7.00 + 7.00 + 2.00 = 16.00 expected; 18.61 is off.
+    let mut invoice = build(&a).unwrap();
+    let mut problems = Vec::new();
+    check_vat_amount(&mut invoice, &mut problems);
+    assert!(
+        problems[0].contains("at their VAT rates it is 16.00 (give or take 3 cents)"),
+        "{problems:?}"
+    );
+    // Within a cent per line passes.
+    a.total = Cents(11603);
+    a.vat = Cents(1603);
+    let mut invoice = build(&a).unwrap();
+    problems.clear();
+    check_vat_amount(&mut invoice, &mut problems);
+    assert!(problems.is_empty(), "{problems:?}");
+    // A code without a plain rate skips the check, said so.
+    a.lines[2].vat_description = "Input tax".into();
+    a.total = Cents(20000);
+    a.vat = Cents(10000);
+    let mut invoice = build(&a).unwrap();
+    check_vat_amount(&mut invoice, &mut problems);
+    assert!(problems.is_empty());
+    assert!(
+        invoice.notes[0].contains("VAT amount not checked: line 3's VAT code 'Input tax'"),
+        "{:?}",
+        invoice.notes
+    );
 }
 
 #[test]
