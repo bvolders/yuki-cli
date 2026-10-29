@@ -19,6 +19,8 @@ fn config_with(
         base_url: None,
         endpoint_override: None,
         seller: None,
+        client_id: None,
+        client_secret: None,
     }
 }
 
@@ -895,4 +897,64 @@ fn a_seller_round_trips_without_writing_its_unset_fields() {
     );
     let loaded = Config::load_from(&path).unwrap();
     assert_eq!(loaded.seller, config.seller);
+}
+
+#[test]
+fn the_api_client_comes_from_env_then_administration_then_top_level() {
+    let mut own = AdminEntry::new("uuid-1", "admin-1");
+    own.client_id = Some("admin-id".into());
+    own.client_secret = Some("admin-secret".into());
+    let mut config = config_with(
+        "test-key",
+        "a",
+        [("a", own), ("b", AdminEntry::new("uuid-2", "admin-2"))],
+    );
+    let no_env = |_: &str| None;
+    assert_eq!(config.api_client(Some("b"), no_env).unwrap(), None);
+    config.client_id = Some("top-id".into());
+    config.client_secret = Some("top-secret".into());
+
+    let a = config.api_client(None, no_env).unwrap().unwrap();
+    assert_eq!(
+        (a.id.as_str(), a.secret.as_str()),
+        ("admin-id", "admin-secret")
+    );
+    assert_eq!(a.source, "[administrations.a]");
+    let b = config.api_client(Some("b"), no_env).unwrap().unwrap();
+    assert_eq!(b.id, "top-id");
+
+    let env = |name: &str| match name {
+        "YUKI_CLIENT_ID" => Some("env-id".to_string()),
+        "YUKI_CLIENT_SECRET" => Some("env-secret".to_string()),
+        _ => None,
+    };
+    let from_env = config.api_client(None, env).unwrap().unwrap();
+    assert_eq!(from_env.id, "env-id");
+    // Debug never shows the secret.
+    let shown = format!("{from_env:?}");
+    assert!(
+        !shown.contains("env-secret") && shown.contains("<hidden>"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn half_an_api_client_is_a_config_error() {
+    let mut config = config_with(
+        "test-key",
+        "a",
+        [("a", AdminEntry::new("uuid-1", "admin-1"))],
+    );
+    config.client_id = Some("top-id".into());
+    let err = config.api_client(None, |_| None).unwrap_err().to_string();
+    assert!(err.contains("client_id but no client_secret"), "{err}");
+    let only_secret = |name: &str| (name == "YUKI_CLIENT_SECRET").then(|| "s".to_string());
+    let err = config
+        .api_client(None, only_secret)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("YUKI_CLIENT_SECRET but no YUKI_CLIENT_ID"),
+        "{err}"
+    );
 }

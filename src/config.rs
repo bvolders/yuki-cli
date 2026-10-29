@@ -69,6 +69,15 @@ pub struct AdminEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 
+    /// Client ID of a registered Yuki API client, for this administration;
+    /// see [`Config::api_client`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+
+    /// The secret that goes with `client_id`. Never printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+
     /// Per-administration settings this build does not know about, kept
     /// verbatim so an older or newer `yuki` never drops them on save.
     #[serde(flatten)]
@@ -89,6 +98,8 @@ impl AdminEntry {
             unmatched_ignore_descriptions: None,
             no_document_accounts: None,
             base_url: None,
+            client_id: None,
+            client_secret: None,
             extra: toml::Table::new(),
         }
     }
@@ -178,6 +189,34 @@ pub struct Config {
     /// prints it. Needed by `sales invoice prepare --out`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seller: Option<Seller>,
+    /// Client ID of a registered Yuki API client, for administrations that
+    /// name none; see [`Config::api_client`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// The secret that goes with `client_id`. Never printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+}
+
+/// A registered Yuki API client: the ID and secret Yuki issues to an
+/// integration, for `AuthenticateClient`. Its `Debug` hides the secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiClient {
+    pub id: String,
+    pub secret: String,
+    /// Where it came from, for messages: `YUKI_CLIENT_ID/YUKI_CLIENT_SECRET`,
+    /// `[administrations.x]` or `the top level of the config`.
+    pub source: String,
+}
+
+impl std::fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiClient")
+            .field("id", &self.id)
+            .field("secret", &"<hidden>")
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 /// The firm issuing sales invoices (`[seller]` in the config).
@@ -408,6 +447,63 @@ impl Config {
             api_key,
             api_root: self.api_root(Some(entry)),
         })
+    }
+
+    /// The registered API client to authenticate administration `admin` (the
+    /// default when `None`) with, if any: from `YUKI_CLIENT_ID` and
+    /// `YUKI_CLIENT_SECRET` (read through `env`), else the administration's
+    /// `client_id`/`client_secret`, else the top-level ones. The first
+    /// layer that names either must name both.
+    pub fn api_client(
+        &self,
+        admin: Option<&str>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<ApiClient>, YukiError> {
+        let name = admin.unwrap_or(&self.default_admin);
+        let entry = self.administrations.get(name);
+        let nonempty = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+        let layers = [
+            (
+                nonempty(env("YUKI_CLIENT_ID")),
+                nonempty(env("YUKI_CLIENT_SECRET")),
+                "YUKI_CLIENT_ID/YUKI_CLIENT_SECRET".to_string(),
+                "YUKI_CLIENT_ID",
+                "YUKI_CLIENT_SECRET",
+            ),
+            (
+                nonempty(entry.and_then(|e| e.client_id.clone())),
+                nonempty(entry.and_then(|e| e.client_secret.clone())),
+                format!("[administrations.{name}]"),
+                "client_id",
+                "client_secret",
+            ),
+            (
+                nonempty(self.client_id.clone()),
+                nonempty(self.client_secret.clone()),
+                "the top level of the config".to_string(),
+                "client_id",
+                "client_secret",
+            ),
+        ];
+        for (id, secret, source, id_name, secret_name) in layers {
+            match (id, secret) {
+                (None, None) => continue,
+                (Some(id), Some(secret)) => {
+                    return Ok(Some(ApiClient { id, secret, source }));
+                }
+                (Some(_), None) => {
+                    return Err(YukiError::Config(format!(
+                        "{source} has {id_name} but no {secret_name}: give both or neither"
+                    )));
+                }
+                (None, Some(_)) => {
+                    return Err(YukiError::Config(format!(
+                        "{source} has {secret_name} but no {id_name}: give both or neither"
+                    )));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Every distinct access key in the configuration, each paired with the
