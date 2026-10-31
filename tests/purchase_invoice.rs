@@ -126,8 +126,16 @@ fn setup(root: &str, extra_toml: &str) -> (TempDir, PathBuf) {
     (home, pdf)
 }
 
+/// The API client a booking needs: Yuki refuses `ProcessPurchaseInvoices`
+/// on a session opened with the access key alone.
+const CLIENT_ENV: &[(&str, &str)] = &[
+    ("YUKI_CLIENT_ID", "test-id"),
+    ("YUKI_CLIENT_SECRET", "test-secret"),
+];
+
+/// `purchase book` with an API client from the environment.
 fn book(home: &TempDir, pdf: &Path, extra: &[&str]) -> Output {
-    book_with_env(home, pdf, extra, &[])
+    book_with_env(home, pdf, extra, CLIENT_ENV)
 }
 
 fn book_with_env(home: &TempDir, pdf: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
@@ -203,7 +211,8 @@ fn sync_record(dir: &Path) -> Option<Value> {
 fn a_dry_run_checks_against_yuki_and_prints_the_xml_without_sending() {
     let (root, log, _) = mock("");
     let (home, pdf) = setup(&root, "");
-    let out = book(&home, &pdf, &["--dry-run"]);
+    // Reading needs no API client: the access key alone will do.
+    let out = book_with_env(&home, &pdf, &["--dry-run"], &[]);
     ok(&out);
     let xml = String::from_utf8_lossy(&out.stdout).into_owned();
     for fragment in [
@@ -335,13 +344,19 @@ fn a_confirmed_booking_is_written_ahead_settled_and_recorded_for_upload_dir() {
         .iter()
         .position(|a| a == "ProcessPurchaseInvoices")
         .unwrap();
-    // One session for the run, opened with the key alone, before anything else.
-    assert_eq!(calls[0], "Authenticate");
-    assert_eq!(calls.iter().filter(|a| *a == "Authenticate").count(), 1);
+    // One session for the run, opened as the API client, before anything else.
+    assert_eq!(calls[0], "AuthenticateClient");
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|a| a.starts_with("Authenticate"))
+            .count(),
+        1
+    );
     assert!(process_at > 0);
     let body = &bodies(&log, "ProcessPurchaseInvoices")[0];
     for fragment in [
-        "<yuki:sessionId>session-1</yuki:sessionId>",
+        "<yuki:sessionId>session-2</yuki:sessionId>",
         "<yuki:administrationId>admin-1</yuki:administrationId>",
         "<yuki:disableAutoCorrect>false</yuki:disableAutoCorrect>",
         "<yuki:xmlDoc><PurchaseInvoices xmlns=\"urn:xmlns:http://www.theyukicompany.com:purchaseinvoices\"",
@@ -590,13 +605,13 @@ fn resolving_as_booked_records_the_pdf_for_upload_dir() {
 }
 
 #[test]
-fn a_refusal_or_rejection_frees_the_invoice_and_hints_at_an_api_client() {
+fn a_refusal_or_rejection_frees_the_invoice() {
     let (root, _, process) = mock("");
     let (home, pdf) = setup(&root, "");
     sync_state(pdf.parent().unwrap(), "");
     *process.lock().unwrap() = (403, String::new());
     let out = book(&home, &pdf, CONFIRMED);
-    fails(&out, 2, "support.accounting@nmbrs.com");
+    fails(&out, 2, "HTTP 403");
     assert_eq!(ledger(&home)[0]["status"], "rejected");
     assert!(
         sync_record(pdf.parent().unwrap()).is_none(),
@@ -663,7 +678,7 @@ fn a_configured_api_client_authenticates_with_authenticate_client() {
         &root,
         "client_id = \"cid-1\"\nclient_secret = \"s3cret-value\"\n",
     );
-    let out = book(&home, &pdf, CONFIRMED);
+    let out = book_with_env(&home, &pdf, CONFIRMED, &[]);
     ok(&out);
     let auth = &bodies(&log, "AuthenticateClient")[0];
     for fragment in [
@@ -845,7 +860,7 @@ fn a_respelled_or_three_of_four_duplicate_is_refused() {
 fn book_raw(home: &TempDir, pdf: &Path, args: &[&str]) -> Output {
     let mut all = vec!["purchase", "book", pdf.to_str().unwrap()];
     all.extend_from_slice(args);
-    yuki(home, &all)
+    common::yuki_with_env(home, &all, CLIENT_ENV)
 }
 
 const MINIMAL: &[&str] = &[
@@ -1042,4 +1057,55 @@ fn names_with_ampersands_dots_and_apostrophes_find_their_contact() {
             "{given}"
         );
     }
+}
+
+#[test]
+fn without_an_api_client_a_booking_is_refused_up_front() {
+    let (root, log, _) = mock("");
+    let (home, pdf) = setup(&root, "");
+    sync_state(pdf.parent().unwrap(), "");
+    let out = book_with_env(&home, &pdf, CONFIRMED, &[]);
+    fails(
+        &out,
+        1,
+        "Yuki requires an API Client ID/Secret for purchase invoices: request them from support.accounting@nmbrs.com",
+    );
+    // Before any call, the prompt or the write-ahead.
+    assert!(actions(&log).is_empty());
+    assert!(ledger(&home).is_empty());
+    assert!(sync_record(pdf.parent().unwrap()).is_none());
+}
+
+#[test]
+fn yukis_no_client_id_fault_frees_the_invoice() {
+    let (root, _, process) = mock("");
+    let (home, pdf) = setup(&root, "");
+    sync_state(pdf.parent().unwrap(), "");
+    let fault = include_str!("fixtures/no-client-id-fault.xml");
+    *process.lock().unwrap() = (500, fault.to_string());
+    let out = book(&home, &pdf, CONFIRMED);
+    fails(
+        &out,
+        1,
+        "Yuki requires an API Client ID/Secret for purchase invoices",
+    );
+    fails(&out, 1, "Nothing was booked.");
+    // A deterministic refusal: nothing was created, so nothing stays pending.
+    let entry = &ledger(&home)[0];
+    assert_eq!(entry["status"], "rejected");
+    assert!(
+        entry["note"]
+            .as_str()
+            .unwrap()
+            .contains("No Client ID supplied")
+    );
+    assert!(sync_record(pdf.parent().unwrap()).is_none());
+    // Any other SOAP fault stays an unknown outcome.
+    let other = fault.replace(
+        "No Client ID supplied",
+        "Server was unable to process request.",
+    );
+    *process.lock().unwrap() = (500, other);
+    let out = book(&home, &pdf, CONFIRMED);
+    fails(&out, 1, "outcome_unknown");
 }

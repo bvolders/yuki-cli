@@ -46,7 +46,8 @@ fn request_message(e: &reqwest::Error) -> String {
 pub enum Delivery {
     /// The request never left: no connection, or it could not be built.
     NotSent,
-    /// Yuki refused it unprocessed (HTTP 401, 403 or 429).
+    /// Yuki refused it unprocessed (HTTP 401, 403 or 429, or a fault that
+    /// refuses every such request, such as [`YukiError::is_missing_client_id`]).
     Refused,
     /// It may have been processed.
     Unknown,
@@ -58,8 +59,19 @@ impl YukiError {
         match self {
             Self::Request(e) if e.is_connect() || e.is_builder() => Delivery::NotSent,
             Self::Unauthorized(_) | Self::RateLimited => Delivery::Refused,
+            e if e.is_missing_client_id() => Delivery::Refused,
             _ => Delivery::Unknown,
         }
+    }
+
+    /// Whether this is Yuki's refusal of a session opened without an API
+    /// client: `soap:Client` "No Client ID supplied", which
+    /// `ProcessPurchaseInvoices` answers to plain `Authenticate` before it
+    /// processes anything.
+    pub fn is_missing_client_id(&self) -> bool {
+        matches!(self, Self::SoapFault { code, message }
+            if code.to_lowercase().ends_with("client")
+                && message.trim().eq_ignore_ascii_case("No Client ID supplied"))
     }
 
     pub fn exit_code(&self) -> u8 {

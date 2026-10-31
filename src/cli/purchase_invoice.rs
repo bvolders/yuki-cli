@@ -49,6 +49,10 @@ const FILE_NAME_MIN: usize = 5;
 /// How long `--resolve` waits for a running `upload dir` to release the sync state.
 const SYNC_PATIENCE: Duration = Duration::from_secs(5);
 
+/// Why a booking needs an API client: `ProcessPurchaseInvoices` refuses a
+/// session opened with the access key alone ("No Client ID supplied").
+pub const NO_CLIENT: &str = "Yuki requires an API Client ID/Secret for purchase invoices: request them from support.accounting@nmbrs.com and set client_id/client_secret (or YUKI_CLIENT_ID/YUKI_CLIENT_SECRET). Nothing was booked.";
+
 /// Where to ask for an API client when Yuki refuses the access key alone.
 pub const CLIENT_HINT: &str = "If Yuki refuses purchase invoices for this access key, ask Yuki support (support.accounting@nmbrs.com) for an API Client ID and Client Secret, and set client_id and client_secret in the config (or YUKI_CLIENT_ID and YUKI_CLIENT_SECRET)";
 
@@ -1461,6 +1465,11 @@ fn settle_outcome(
             let what_now =
                 format!("the purchase invoice may already be in Yuki. It stays pending: {resolve}");
             match classify(e, &what_now) {
+                InvoiceError::Yuki(e) if e.is_missing_client_id() => outcome(
+                    LedgerStatus::Rejected,
+                    format!("refused by Yuki: {e}"),
+                    Err(InvoiceError::Yuki(YukiError::Config(NO_CLIENT.into()))),
+                ),
                 InvoiceError::Yuki(e) => outcome(
                     LedgerStatus::Rejected,
                     format!("nothing reached Yuki: {e}"),
@@ -1643,6 +1652,11 @@ pub async fn book(
     let api_client = config
         .api_client(admin, |v| std::env::var(v).ok())
         .map_err(InvoiceError::input)?;
+    // Yuki refuses every booking of a session without an API client, so a
+    // booking needs one; a dry run only reads, which the key alone may.
+    if api_client.is_none() && !args.dry_run {
+        return Err(InvoiceError::Yuki(YukiError::Config(NO_CLIENT.into())));
+    }
 
     // Everything local that may already have put the PDF in Yuki.
     PurchaseLedger::peek(target.admin_id)?.check_free(&invoice.claim(), args.allow_duplicate)?;

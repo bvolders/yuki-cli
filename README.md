@@ -554,11 +554,14 @@ reference (`reference_mismatch`), leaves it pending: check Yuki, then
 `purchase bookings --resolve <reference> --as booked|rejected` (with `--contact`
 when two suppliers share the reference), which settles the sync record too.
 
-Yuki may only accept purchase invoices from a registered API client. Set
-`client_id` and `client_secret` (top level, or per administration), or
+Yuki books purchase invoices only for a registered API client: with the
+access key alone, `ProcessPurchaseInvoices` answers "No Client ID supplied".
+Set `client_id` and `client_secret` (top level, or per administration), or
 `YUKI_CLIENT_ID` and `YUKI_CLIENT_SECRET`, and `purchase book` authenticates
 with `AuthenticateClient`; Yuki support (support.accounting@nmbrs.com) issues
-them. Other commands keep the access key alone.
+them. Without them a booking is refused before anything is sent, while
+`--dry-run` still checks with the access key. Other commands keep the access
+key alone.
 
 ### Global flags
 

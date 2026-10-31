@@ -68,6 +68,7 @@ These are hard-won lessons from the actual API behavior:
 - VAT operations use exact casing: `VATReturnList`, `ActiveVATCodesList`
 - Real XML field names often differ from what you'd guess (lowercase, different names)
 - `paymentMethod` must be int (`0` = unspecified), not empty string
+- Purchase.asmx requires `AuthenticateClient`: `ProcessPurchaseInvoices` on a plain `Authenticate` session is a `soap:Client` fault "No Client ID supplied", a deterministic refusal (`YukiError::is_missing_client_id`, `Delivery::Refused`); reading with the key alone works
 - `ProcessPurchaseInvoices` takes `sessionId`/`administrationId` (lowercase d) and `disableAutoCorrect`; it returns no invoice ID, and a contact matched by `ContactCode` is overwritten with the address fields sent. An unknown `GLAccountCode` is silently booked to a default account; Belgian `LineVATType` numbers are ambiguous without `LineVATDescription`
 - `SearchDocuments`: `folderID=-1, tabID=-1` means "all folders"
 - Amount uses dot decimal separator (`695.74`), not comma

@@ -36,3 +36,23 @@ fn xml_error_returns_exit_code_1() {
     let err = yuki_client::error::YukiError::Xml("parse failed".into());
     assert_eq!(err.exit_code(), 1);
 }
+
+#[test]
+fn a_missing_client_id_fault_is_a_refusal_and_other_faults_are_not() {
+    use yuki_client::error::{Delivery, YukiError};
+    let fault = |code: &str, message: &str| YukiError::SoapFault {
+        code: code.into(),
+        message: message.into(),
+    };
+    let refused = fault("soap:Client", "No Client ID supplied");
+    assert!(refused.is_missing_client_id());
+    assert_eq!(refused.delivery(), Delivery::Refused);
+    assert!(fault("soap:client", "no client id supplied ").is_missing_client_id());
+    for other in [
+        fault("soap:Server", "No Client ID supplied"),
+        fault("soap:Client", "Server was unable to process request."),
+    ] {
+        assert!(!other.is_missing_client_id(), "{other}");
+        assert_eq!(other.delivery(), Delivery::Unknown, "{other}");
+    }
+}
