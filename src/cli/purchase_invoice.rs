@@ -21,7 +21,7 @@ use clap::ValueEnum as _;
 use crate::cli::contacts::{yes_no, yes_no_unknown};
 use crate::cli::invoice_common::{InvoiceError, Pdf, classify, parse_date, rejection, xml_text};
 use crate::cli::invoice_ledger::Resolution;
-use crate::cli::keys::{contact_key, reference_key};
+use crate::cli::keys::{contact_key, reference_key, search_word};
 use crate::cli::purchase_ledger::{Claim, PurchaseLedger, Status as LedgerStatus};
 use crate::cli::xml_doc::{XmlWriter, bool_text};
 use crate::cli::{PurchaseCommands, ask_yes_no, can_prompt};
@@ -1031,7 +1031,7 @@ async fn archive_candidates(
     let (from, to) = (shift(-WINDOW_DAYS), shift(WINDOW_DAYS));
     let by_supplier = async {
         if invoice.supplier.matched == Match::Existing {
-            let text = contact_key(&invoice.supplier.name);
+            let text = search_word(&invoice.supplier.name);
             archive
                 .search_documents(&text, ALL_DATES.0, ALL_DATES.1)
                 .await
@@ -1216,8 +1216,9 @@ pub async fn verify(
     let (vat, info, contacts) = (session.vat(), session.accounting_info(), session.contacts());
     let (option, value) = match &invoice.supplier.code {
         Some(code) => ("Code", code.clone()),
-        // Without the legal form, so `Leverancier BV` finds `Leverancier B.V.`.
-        None => ("Name", contact_key(&invoice.supplier.name)),
+        // One word as written, so `MAY & JUNE` and `Leverancier BV` find
+        // `MAY & JUNE` and `Leverancier B.V.`; matched by contact_key below.
+        None => ("Name", search_word(&invoice.supplier.name)),
     };
     let (codes, scheme, found) = tokio::join!(
         vat.active_vat_codes(target.admin_id),

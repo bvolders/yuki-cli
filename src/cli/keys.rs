@@ -31,6 +31,25 @@ pub fn contact_key(name: &str) -> String {
     }
 }
 
+/// What to ask Yuki's free-text searches for a supplier name: they match a
+/// raw substring of the name, so a [`contact_key`] (`may june` for
+/// `MAY & JUNE`) finds nothing. This is the name's longest word as written
+/// (letters and digits, not a legal form), or the trimmed name when it has
+/// none; the results are then compared by [`contact_key`].
+pub fn search_word(name: &str) -> String {
+    let word = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !LEGAL_FORMS.contains(&w.to_lowercase().as_str()))
+        .fold("", |best, w| {
+            if w.chars().count() > best.chars().count() {
+                w
+            } else {
+                best
+            }
+        });
+    if word.is_empty() { name.trim() } else { word }.to_string()
+}
+
 /// A reference as references are compared: lower case, letters and digits
 /// only, so `F 2026/0042` is `F2026-0042`.
 pub fn reference_key(reference: &str) -> String {
@@ -38,4 +57,25 @@ pub fn reference_key(reference: &str) -> String {
         .chars()
         .filter(|c| c.is_alphanumeric())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_search_word_is_a_raw_substring_of_the_name() {
+        for (name, word) in [
+            ("MAY & JUNE Woudenberg", "Woudenberg"),
+            ("Leverancier B.V.", "Leverancier"),
+            ("D'Ieteren Lease NV", "Ieteren"),
+            ("O'Neill & Co. BVBA", "Neill"),
+            ("Acme, Inc.", "Acme"),
+            ("BV", "BV"),
+        ] {
+            let got = search_word(name);
+            assert_eq!(got, word, "{name}");
+            assert!(name.contains(&got), "{name}: {got}");
+        }
+    }
 }

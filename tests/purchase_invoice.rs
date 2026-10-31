@@ -22,12 +22,43 @@ const VAT_CODES: &str = r#"<VATCodes xmlns="">
 <VATCode><type>11</type><description>Input tax</description></VATCode>
 </VATCodes>"#;
 
-/// Yuki's contacts, whatever is searched: the mock leaves the filtering to
-/// the CLI.
-const CONTACTS: &str = r#"<Contacts xmlns="">
-<Contact ID="c-1"><Code>SUP001</Code><Name>Leverancier BV</Name><Type>Company</Type></Contact>
-<Contact ID="c-2"><Code></Code><Name>Andere NV</Name><Type>Company</Type></Contact>
-</Contacts>"#;
+/// Yuki's contacts: (code, name).
+const CONTACTS: &[(&str, &str)] = &[
+    ("SUP001", "Leverancier BV"),
+    ("", "Andere NV"),
+    ("", "MAY & JUNE Woudenberg"),
+    ("", "D'Ieteren Lease N.V."),
+];
+
+/// `SearchContacts` as Yuki answers it: the contacts whose code is the
+/// value, or whose raw name contains it (any case).
+fn search_contacts(r: &Request) -> String {
+    let value = r
+        .param("searchValue")
+        .replace("&amp;", "&")
+        .replace("&apos;", "'")
+        .to_lowercase();
+    let by_code = r.param("searchOption") == "Code";
+    let found: String = CONTACTS
+        .iter()
+        .enumerate()
+        .filter(|(_, (code, name))| {
+            if by_code {
+                code.to_lowercase() == value
+            } else {
+                name.to_lowercase().contains(&value)
+            }
+        })
+        .map(|(i, (code, name))| {
+            let name = name.replace('&', "&amp;").replace('\'', "&apos;");
+            format!("<Contact ID=\"c-{i}\"><Code>{code}</Code><Name>{name}</Name><Type>Company</Type></Contact>")
+        })
+        .collect();
+    response(
+        "SearchContacts",
+        &format!("<Contacts xmlns=\"\">{found}</Contacts>"),
+    )
+}
 
 const GL_SCHEME: &str = r#"<GLAccounts xmlns="">
 <GLAccount><code>612000</code><description>Hosting</description><type>1</type></GLAccount>
@@ -67,7 +98,7 @@ fn mock(archive: &'static str) -> (String, RequestLog, Process) {
         "Authenticate" => (200, response("Authenticate", "session-1")),
         "AuthenticateClient" => (200, response("AuthenticateClient", "session-2")),
         "SetCurrentDomain" => (200, response("SetCurrentDomain", "")),
-        "SearchContacts" => (200, response("SearchContacts", CONTACTS)),
+        "SearchContacts" => (200, search_contacts(r)),
         "ActiveVATCodesList" => (200, response("ActiveVATCodesList", VAT_CODES)),
         "GetGLAccountScheme" => (200, response("GetGLAccountScheme", GL_SCHEME)),
         "SearchDocuments" => (
@@ -469,7 +500,7 @@ fn an_archive_document_like_it_is_refused_unless_allowed() {
         })
         .collect();
     assert!(
-        searches.contains(&("leverancier".into(), "0001-01-01".into())),
+        searches.contains(&("Leverancier".into(), "0001-01-01".into())),
         "{searches:?}"
     );
     assert!(
@@ -966,4 +997,49 @@ fn a_vat_amount_the_rates_do_not_give_is_refused() {
     ok(&out);
     assert!(stderr(&out).contains("VAT amount not checked"));
     assert!(!actions(&log).iter().any(|a| a == "ProcessPurchaseInvoices"));
+}
+
+#[test]
+fn names_with_ampersands_dots_and_apostrophes_find_their_contact() {
+    let (root, log, _) = mock("");
+    let (home, pdf) = setup(&root, "");
+    for (given, yuki_name, word) in [
+        (
+            "MAY & JUNE Woudenberg",
+            "MAY &amp; JUNE Woudenberg",
+            "Woudenberg",
+        ),
+        ("d'ieteren lease nv", "D&apos;Ieteren Lease N.V.", "Ieteren"),
+        ("Leverancier B.V.", "Leverancier BV", "Leverancier"),
+    ] {
+        let out = book(&home, &pdf, &["--contact", given, "--dry-run"]);
+        ok(&out);
+        let xml = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            xml.contains(&format!("<FullName>{yuki_name}</FullName>")),
+            "{given}: {xml}"
+        );
+        assert!(
+            !xml.contains("ContactType"),
+            "{given} is no new supplier: {xml}"
+        );
+        // Yuki is asked for one word of the name as written, which its
+        // substring search finds, by contact and in the archive.
+        let requests = log.lock().unwrap().clone();
+        let last = |action: &str, param: &str| {
+            requests
+                .iter()
+                .rev()
+                .find(|r| r.action == action && !r.param(param).is_empty())
+                .map(|r| r.param(param).to_string())
+        };
+        // The contact search spells it as given, the archive as Yuki has it.
+        let same = |got: Option<String>| got.is_some_and(|g| g.eq_ignore_ascii_case(word));
+        assert!(same(last("SearchContacts", "searchValue")), "{given}");
+        assert_eq!(
+            last("SearchDocuments", "searchText").as_deref(),
+            Some(word),
+            "{given}"
+        );
+    }
 }
